@@ -6,6 +6,9 @@
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#include <SD.h>
+#include <SPI.h>
+#include "mantis_splash.h"
 
 static const int W = 320, H = 240;
 static const int N_PART = 64;
@@ -169,56 +172,34 @@ static void playStartup() {
 }
 
 // Simple pixel mantis for splash (silhouette)
-static void drawMantisSplash(M5Canvas &c, int ox, int oy, float scale) {
-  auto px = [&](int x, int y, uint16_t col) {
-    int sx = ox + (int)(x * scale), sy = oy + (int)(y * scale);
-    int s = (int)scale;
-    if (s < 1) s = 1;
-    c.fillRect(sx, sy, s, s, col);
-  };
-  uint16_t g1 = rgb565(40, 200, 70);
-  uint16_t g2 = rgb565(20, 140, 50);
-  uint16_t purp = rgb565(120, 40, 200);
-  // body
-  for (int y = 12; y < 36; y++)
-    for (int x = 10; x < 22; x++)
-      if ((x - 16) * (x - 16) + (y - 24) * (y - 24) / 4 < 40) px(x, y, g1);
-  // head
-  for (int y = 4; y < 14; y++)
-    for (int x = 12; x < 20; x++)
-      if ((x - 16) * (x - 16) + (y - 9) * (y - 9) < 20) px(x, y, g1);
-  // eyes
-  px(13, 8, purp); px(14, 8, purp); px(13, 9, purp);
-  px(18, 8, purp); px(19, 8, purp); px(18, 9, purp);
-  // antennae
-  for (int i = 0; i < 8; i++) {
-    px(12 - i / 2, 4 - i, g2);
-    px(20 + i / 2, 4 - i, g2);
-  }
-  // arms folded
-  for (int i = 0; i < 10; i++) {
-    px(8 - i / 3, 14 + i / 2, g2);
-    px(24 + i / 3, 14 + i / 2, g2);
+static void drawMantisBitmap(M5Canvas &c, int ox, int oy) {
+  for (int y = 0; y < MANTIS_H; y++) {
+    for (int x = 0; x < MANTIS_W; x++) {
+      uint16_t col = mantis_splash[y * MANTIS_W + x];
+      if (col == 0) continue; // transparent
+      c.drawPixel(ox + x, oy + y, col);
+    }
   }
 }
 
 static void splash() {
   canvas.fillSprite(rgb565(6, 2, 14));
-  drawMantisSplash(canvas, 100, 40, 3.5f);
+  int ox = (W - MANTIS_W) / 2;
+  int oy = 18;
+  drawMantisBitmap(canvas, ox, oy);
   canvas.setTextSize(2);
   canvas.setTextColor(hsv565(160, 0.85f, 0.95f));
-  canvas.setCursor(95, 175);
+  canvas.setCursor((W - 8 * 12) / 2, oy + MANTIS_H + 8);
   canvas.print("SYNAPSE");
   canvas.setTextSize(1);
   canvas.setTextColor(rgb565(140, 160, 180));
-  canvas.setCursor(70, 200);
+  canvas.setCursor(70, oy + MANTIS_H + 32);
   canvas.print("tilt · touch · make noise");
   canvas.pushSprite(0, 0);
   playStartup();
-  delay(400);
+  delay(500);
 }
 
-// ========== MODES ==========
 static void modeSwarm() {
   // IMU gravity (Core2 landscape: ay ~ left/right, ax ~ toward/away)
   float gx = -g_ay * 0.55f;
@@ -360,10 +341,115 @@ static void modePulse() {
 }
 
 // --- drum synth ---
+
+static const char *DRUM_DIR = "/drums";
+static const char *DRUM_SPEC = "/drums/SAMPLES.txt";
+static const char *PAD_FILE[] = {
+  "/drums/hat_closed.raw",
+  "/drums/hat_open.raw",
+  "/drums/kick.raw",
+  "/drums/snare.raw"
+};
+
+static void ensureDrumFs() {
+  if (!SD.begin(4, SPI, 25000000)) {
+    // Core2 TF slot; fail soft
+    return;
+  }
+  if (!SD.exists(DRUM_DIR)) SD.mkdir(DRUM_DIR);
+  if (!SD.exists(DRUM_SPEC)) {
+    File f = SD.open(DRUM_SPEC, FILE_WRITE);
+    if (f) {
+      f.println("SYNAPSE drum pads — one raw sample per pad");
+      f.println("Format: signed 16-bit mono PCM, 16000 Hz, little-endian");
+      f.println("No WAV header — pure .raw");
+      f.println("");
+      f.println("hat_closed.raw  = closed hi-hat (top-left)");
+      f.println("hat_open.raw    = open hi-hat  (top-right)");
+      f.println("kick.raw        = kick drum    (bottom-left)");
+      f.println("snare.raw       = snare        (bottom-right)");
+      f.println("");
+      f.println("Record in-app (hold pad 3s, B=REC) or copy files here.");
+      f.println("Max length ~0.5s (8000 samples). Longer files are truncated.");
+      f.close();
+    }
+  }
+}
+
+static void loadPadFromSd(int pad) {
+  if (pad < 0 || pad > 3) return;
+  if (!SD.exists(PAD_FILE[pad])) return;
+  File f = SD.open(PAD_FILE[pad], FILE_READ);
+  if (!f) return;
+  size_t bytes = f.size();
+  if (bytes < 4) { f.close(); return; }
+  if (bytes > 16000) bytes = 16000; // ~0.5s @16k stereo-safe
+  int n = (int)(bytes / 2);
+  int16_t *buf = (int16_t *)heap_caps_malloc(n * sizeof(int16_t), MALLOC_CAP_8BIT);
+  if (!buf) buf = (int16_t *)malloc(n * sizeof(int16_t));
+  if (!buf) { f.close(); return; }
+  f.read((uint8_t *)buf, n * 2);
+  f.close();
+  if (g_padSample[pad]) free(g_padSample[pad]);
+  g_padSample[pad] = buf;
+  g_padSampleLen[pad] = n;
+}
+
+static void savePadToSd(int pad) {
+  if (pad < 0 || pad > 3 || !g_padSample[pad] || g_padSampleLen[pad] <= 0) return;
+  ensureDrumFs();
+  if (SD.exists(PAD_FILE[pad])) SD.remove(PAD_FILE[pad]);
+  File f = SD.open(PAD_FILE[pad], FILE_WRITE);
+  if (!f) return;
+  f.write((uint8_t *)g_padSample[pad], g_padSampleLen[pad] * 2);
+  f.close();
+}
+
+static void loadAllPads() {
+  ensureDrumFs();
+  for (int i = 0; i < 4; i++) loadPadFromSd(i);
+}
+
+// Auto-trim leading silence then keep a tight window
+static int autoTrim(int16_t *buf, int n) {
+  if (n < 16) return n;
+  // threshold relative to peak
+  int peak = 0;
+  for (int i = 0; i < n; i++) {
+    int a = buf[i] < 0 ? -buf[i] : buf[i];
+    if (a > peak) peak = a;
+  }
+  int thr = peak / 20;
+  if (thr < 400) thr = 400;
+  int start = 0;
+  while (start < n) {
+    int a = buf[start] < 0 ? -buf[start] : buf[start];
+    if (a >= thr) break;
+    start++;
+  }
+  // back up a few samples for attack
+  start -= 32;
+  if (start < 0) start = 0;
+  if (start > 0) {
+    int keep = n - start;
+    memmove(buf, buf + start, keep * sizeof(int16_t));
+    n = keep;
+  }
+  // trim trailing silence
+  int end = n - 1;
+  while (end > 0) {
+    int a = buf[end] < 0 ? -buf[end] : buf[end];
+    if (a >= thr / 2) break;
+    end--;
+  }
+  end += 48;
+  if (end > n) end = n;
+  return end;
+}
+
 static void drumTone(Pad p) {
   M5.Mic.end();
   delay(5);
-  M5.Speaker.config()->dma_buf_count = 8;
   M5.Speaker.begin();
   M5.Speaker.setVolume(255);
   switch (p) {
@@ -421,33 +507,76 @@ static void playPad(Pad p, bool recordIntoLoop) {
 }
 
 static void recordPadSample(int pad) {
-  // ~0.35s mono 16k
-  const int n = 5600;
-  int16_t *buf = (int16_t *)heap_caps_malloc(n * sizeof(int16_t), MALLOC_CAP_8BIT);
-  if (!buf) buf = (int16_t *)malloc(n * sizeof(int16_t));
+  // ~0.45s capture window @ 16 kHz
+  const int nMax = 7200;
+  int16_t *buf = (int16_t *)heap_caps_malloc(nMax * sizeof(int16_t), MALLOC_CAP_8BIT);
+  if (!buf) buf = (int16_t *)malloc(nMax * sizeof(int16_t));
   if (!buf) return;
+
   M5.Speaker.end();
+  delay(5);
   M5.Mic.begin();
-  hap(80, 30);
-  // record in chunks
+  // countdown flash
+  hap(60, 20);
+  canvas.fillSprite(rgb565(20, 10, 30));
+  canvas.setTextColor(rgb565(255, 220, 80));
+  canvas.setTextSize(2);
+  canvas.setCursor(90, 100);
+  canvas.print("REC in 3...");
+  canvas.pushSprite(0, 0);
+  delay(350);
+  canvas.setCursor(90, 100);
+  canvas.print("REC in 2...");
+  canvas.pushSprite(0, 0);
+  delay(350);
+  canvas.setCursor(90, 100);
+  canvas.print("REC in 1...");
+  canvas.pushSprite(0, 0);
+  delay(300);
+  canvas.fillSprite(rgb565(80, 10, 10));
+  canvas.setCursor(110, 100);
+  canvas.print("RECORD!");
+  canvas.pushSprite(0, 0);
+  hap(120, 30);
+
   int got = 0;
-  while (got < n) {
-    int chunk = min(256, n - got);
+  uint32_t t0 = millis();
+  while (got < nMax && millis() - t0 < 500) {
+    int chunk = nMax - got;
+    if (chunk > 256) chunk = 256;
     if (M5.Mic.record(buf + got, chunk, 16000)) got += chunk;
-    else break;
+    else delay(1);
     hapService();
   }
+
+  int trimmed = autoTrim(buf, got);
+  if (trimmed < 64) {
+    free(buf);
+    canvas.fillSprite(rgb565(40, 10, 10));
+    canvas.setTextSize(1);
+    canvas.setCursor(80, 110);
+    canvas.print("too quiet — try again");
+    canvas.pushSprite(0, 0);
+    delay(600);
+    return;
+  }
+
   if (g_padSample[pad]) free(g_padSample[pad]);
   g_padSample[pad] = buf;
-  g_padSampleLen[pad] = got;
-  hap(150, 50);
-  // confirmation beep
+  g_padSampleLen[pad] = trimmed;
+  savePadToSd(pad);
+
+  hap(160, 50);
   M5.Mic.end();
+  delay(5);
   M5.Speaker.begin();
-  M5.Speaker.tone(1200, 40);
-  delay(50);
+  M5.Speaker.setVolume(200);
+  M5.Speaker.playRaw(g_padSample[pad], g_padSampleLen[pad], 16000, false);
+  delay(80);
   M5.Speaker.end();
 }
+
+
 
 static void serviceLoop() {
   if (!g_loopOn || g_loopN == 0) return;
@@ -698,6 +827,7 @@ void setup() {
   srand((unsigned)esp_random());
   seedParticles();
   splash();
+  loadAllPads();
   M5.Mic.begin();
 }
 
