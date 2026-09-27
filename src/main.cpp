@@ -17,11 +17,14 @@ static const int MIC_N = 128;
 static const int LOOP_MAX = 64;
 
 enum Mode : uint8_t {
-  MODE_SWARM = 0, MODE_EYE, MODE_TUNNEL, MODE_PULSE, MODE_DRUM, MODE_COUNT
+  MODE_SWARM = 0, MODE_EYE, MODE_TUNNEL, MODE_PULSE, MODE_DRUM, MODE_MANTIS, MODE_COUNT
 };
 enum SwarmVar : uint8_t { SV_FLOCK = 0, SV_ORBIT, SV_CHAOS, SV_COUNT };
 enum PulsePat : uint8_t {
   PP_WAVE = 0, PP_MIRROR, PP_STAR, PP_RIBBON, PP_CHAOS, PP_COUNT
+};
+enum TunnelMode : uint8_t {
+  TM_DIVE = 0, TM_RECEDE, TM_FRACTAL, TM_PORTAL, TM_COUNT
 };
 
 struct Particle {
@@ -41,6 +44,11 @@ static int g_trI = 0;
 static Mode g_mode = MODE_SWARM;
 static SwarmVar g_swarmVar = SV_FLOCK;
 static PulsePat g_pulsePat = PP_WAVE;
+static TunnelMode g_tunnelMode = TM_DIVE;
+static int g_portalCombo = 0;
+static float g_portalX = 0, g_portalY = 0;
+static float g_portalZ = 3.f;
+static uint32_t g_portalSpawn = 0;
 static float g_t = 0;
 static float g_level = 0, g_peak = 0;
 static float g_ax = 0, g_ay = 0, g_az = 1;
@@ -52,6 +60,8 @@ static float g_hue = 160;
 static uint32_t g_lastBtn = 0;
 static int16_t g_mic[MIC_N];
 static bool g_eyeTrack = true;
+static bool g_mantisSing = false;
+static uint32_t g_micRestoreAt = 0;
 
 // Eye poke reaction
 static float g_poke = 0;       // 1 = just poked, decays
@@ -61,16 +71,37 @@ static uint32_t g_pokeUntil = 0;
 // --- haptic non-blocking ---
 static uint32_t g_hapUntil = 0;
 static uint8_t g_hapLevel = 0;
+static uint32_t g_kickHapEnd = 0;
+static uint32_t g_kickHapStart = 0;
 static void hap(uint8_t level, uint16_t ms) {
   g_hapLevel = level;
   g_hapUntil = millis() + ms;
   M5.Power.setVibration(level);
 }
 static void hapService() {
-  if (g_hapLevel && millis() >= g_hapUntil) {
+  uint32_t now = millis();
+  // Kick "subwoofer" envelope: deep throb, not a text-message buzz
+  if (g_kickHapEnd && now < g_kickHapEnd) {
+    float u = (float)(now - g_kickHapStart) / (float)(g_kickHapEnd - g_kickHapStart);
+    // 55Hz-ish pulse decaying
+    float env = (1.f - u) * (1.f - u);
+    int phase = ((now / 9) & 1);
+    int lvl = (int)(env * (phase ? 220 : 30));
+    M5.Power.setVibration(lvl);
+    return;
+  }
+  if (g_kickHapEnd && now >= g_kickHapEnd) {
+    g_kickHapEnd = 0;
+    M5.Power.setVibration(0);
+  }
+  if (g_hapLevel && now >= g_hapUntil) {
     M5.Power.setVibration(0);
     g_hapLevel = 0;
   }
+}
+static void kickSubHaptic() {
+  g_kickHapStart = millis();
+  g_kickHapEnd = g_kickHapStart + 140;
 }
 
 // --- drum ---
@@ -181,6 +212,20 @@ static void drawPsyBg() {
     float v = 0.04f + g_peak * 0.1f * (0.5f + 0.5f * sinf(x * 0.05f + g_t * 2.f));
     canvas.drawFastVLine(x + (int)(sinf(g_t + x) * 3), 14, H - 28,
                          hsv565(g_hue + 90.f, 0.5f, v));
+  }
+}
+
+
+static void drawTinyMantis(M5Canvas &c, int cx, int cy) {
+  // ~1/5 scale splash asset centered on (cx,cy)
+  const int sc = 5;
+  int dw = MANTIS_W / sc, dh = MANTIS_H / sc;
+  int ox = cx - dw / 2, oy = cy - dh / 2;
+  for (int y = 0; y < dh; y++) {
+    for (int x = 0; x < dw; x++) {
+      uint16_t col = mantis_splash[(y * sc) * MANTIS_W + (x * sc)];
+      if (col) c.drawPixel(ox + x, oy + y, col);
+    }
   }
 }
 
@@ -301,7 +346,7 @@ static void modeSwarm() {
   drawPsyBg();
   drawTrails();
 
-  float gx = -g_lookX * 0.85f;
+  float gx = g_lookX * 0.85f;
   float gy = g_lookY * 0.85f;
   float pulse = 0.45f + g_level * 1.5f;
   float soundHue = g_hue + g_level * 100.f + g_peak * 40.f;
@@ -384,15 +429,24 @@ static void modeSwarm() {
   auto td = M5.Touch.getDetail();
   if (td.isPressed() && td.y > 16 && td.y < H - 18) {
     int tx = td.x, ty = td.y;
-    uint16_t mc = hsv565(soundHue + 50.f, 0.95f, 1.f);
-    canvas.fillTriangle(tx, ty - 7, tx - 6, ty + 5, tx + 6, ty + 5, mc);
-    for (int i = 0; i < 6; i++)
-      addTrail(tx + (rand() % 9) - 4, ty + (rand() % 9) - 4, mc);
+    drawTinyMantis(canvas, tx, ty);
+    for (int i = 0; i < 8; i++)
+      addTrail(tx + (rand() % 11) - 5, ty + (rand() % 11) - 5,
+               hsv565(soundHue + 40.f, 0.9f, 0.7f));
+    // Strong push: break globs + drag field
     for (int i = 0; i < N_PART; i++) {
       float dx = g_p[i].x - tx, dy = g_p[i].y - ty;
-      if (dx * dx + dy * dy < 3600.f) {
-        g_p[i].vx += dx * 0.02f;
-        g_p[i].vy += dy * 0.02f;
+      float d2 = dx * dx + dy * dy + 0.01f;
+      if (d2 < 10000.f) {
+        // repulsive core (breaks metaballs) + soft attract outer
+        float inv = 1.f / d2;
+        if (d2 < 900.f) {
+          g_p[i].vx += dx * inv * 40.f;
+          g_p[i].vy += dy * inv * 40.f;
+        } else {
+          g_p[i].vx -= dx * 0.012f;
+          g_p[i].vy -= dy * 0.012f;
+        }
       }
     }
   }
@@ -400,135 +454,212 @@ static void modeSwarm() {
 
 // ========== EYE ==========
 static void modeEye() {
-  drawPsyBg();
+  // Subtle bg only — eye is the star; less whole-scene parallax
+  float base = 0.04f + g_level * 0.05f;
+  for (int y = 14; y < H - 14; y += 8) {
+    uint16_t c = hsv565(g_hue + y * 0.3f + g_t * 8.f, 0.4f, base);
+    canvas.drawFastHLine(0, y, W, c);
+  }
 
-  float lookX = g_eyeTrack ? constrain(g_lookX * 100.f, -110.f, 110.f) : 0;
-  float lookY = g_eyeTrack ? constrain(g_lookY * 85.f, -80.f, 80.f) : 0;
+  // Gaze: mostly pupil/iris, small sclera shift
+  float gazeX = g_eyeTrack ? constrain(g_lookX * 28.f, -22.f, 22.f) : 0;
+  float gazeY = g_eyeTrack ? constrain(g_lookY * 22.f, -16.f, 16.f) : 0;
+  float bodyX = g_eyeTrack ? constrain(g_lookX * 12.f, -10.f, 10.f) : 0;
+  float bodyY = g_eyeTrack ? constrain(g_lookY * 10.f, -8.f, 8.f) : 0;
 
-  // poke reaction: pull back + squint
+  float squint = 0.f;
   if (g_poke > 0.05f) {
-    lookX *= (1.f - g_poke * 0.4f);
-    lookY *= (1.f - g_poke * 0.4f);
-    lookY += g_poke * 25.f; // pulls back
-    g_pokeSquint = g_poke;
-    g_poke *= 0.94f;
-  } else {
-    g_pokeSquint *= 0.9f;
+    squint = g_poke;
+    g_poke *= 0.93f;
   }
 
-  int cx = W / 2 + (int)lookX;
-  int cy = H / 2 + (int)lookY;
+  int cx = W / 2 + (int)bodyX;
+  int cy = H / 2 + (int)bodyY;
 
-  // Moire layer — offset lattice vs rings, driven by audio
-  float mo = g_t * 0.7f + g_level * 4.f;
-  for (int i = -4; i <= 4; i++) {
-    for (int j = -3; j <= 3; j++) {
-      float ox = cx + i * 28.f + sinf(mo + j) * 6.f * g_peak;
-      float oy = cy + j * 26.f + cosf(mo * 1.3f + i) * 5.f * g_level;
-      float d = sqrtf((ox - cx) * (ox - cx) + (oy - cy) * (oy - cy));
-      uint16_t c = hsv565(g_hue + d * 0.5f + i * 10.f, 0.45f, 0.06f + g_level * 0.08f);
-      canvas.drawCircle((int)ox, (int)oy, 10 + (int)(g_peak * 6), c);
-    }
+  // True moire: two ring sets, different speed/spacing/center
+  float mo1 = g_t * 0.55f + g_level * 2.f;
+  float mo2 = -g_t * 0.9f + g_peak * 3.f;
+  for (int ring = 12; ring >= 0; ring--) {
+    float d1 = 14.f + ring * 11.f + sinf(mo1 + ring * 0.4f) * 3.f;
+    float d2 = 16.f + ring * 10.5f + cosf(mo2 + ring * 0.5f) * 4.f + g_level * 6.f;
+    uint16_t c1 = hsv565(g_hue + ring * 8.f, 0.5f, 0.08f + ring * 0.015f);
+    uint16_t c2 = hsv565(g_hue + 60.f + ring * 6.f, 0.55f, 0.06f + g_peak * 0.08f);
+    canvas.drawCircle(cx, cy, (int)d1, c1);
+    canvas.drawCircle(cx + (int)(sinf(mo2) * 3), cy + (int)(cosf(mo1) * 2), (int)d2, c2);
   }
 
-  for (int ring = 7; ring >= 0; ring--) {
-    float d = 16.f + ring * 15.f + g_level * 14.f - g_pokeSquint * 10.f;
-    if (d < 4) d = 4;
-    uint16_t c = hsv565(g_hue + ring * 22.f + g_t * 15.f, 0.7f,
-                        0.1f + ring * 0.035f + g_level * 0.15f);
-    canvas.drawCircle(cx, cy, (int)d, c);
+  // Sclera (squint vertically when poked)
+  int erX = 44;
+  int erY = (int)(44 * (1.f - squint * 0.72f));
+  if (erY < 10) erY = 10;
+  // approximate squint with stacked ellipses via scaled circles
+  for (int k = 0; k < erY; k++) {
+    float t = 1.f - (float)k / erY;
+    int w = (int)(erX * sqrtf(t));
+    canvas.drawFastHLine(cx - w, cy - erY / 2 + k, w * 2,
+                         hsv565(g_hue + 180, 0.12f, 0.82f - squint * 0.25f));
   }
 
-  int er = (int)(40 + g_level * 12 - g_pokeSquint * 18);
-  if (er < 12) er = 12;
-  canvas.fillCircle(cx, cy, er, hsv565(g_hue + 180, 0.15f, 0.85f - g_pokeSquint * 0.2f));
-  int ir = (int)(20 + g_peak * 10 - g_pokeSquint * 8);
-  if (ir < 6) ir = 6;
-  canvas.fillCircle(cx, cy, ir, hsv565(g_hue + 40, 0.85f, 0.55f + g_level * 0.3f));
-  int px = cx + (int)(lookX * 0.15f);
-  int py = cy + (int)(lookY * 0.15f);
-  int pr = (int)(9 + g_level * 5 - g_pokeSquint * 4);
-  if (pr < 3) pr = 3;
-  canvas.fillCircle(px, py, pr, rgb565(8, 6, 12));
-  if (g_pokeSquint < 0.5f)
-    canvas.fillCircle(px - 3, py - 3, 3, rgb565(220, 230, 255));
+  // Iris + pupil follow gaze harder
+  int ix = cx + (int)gazeX;
+  int iy = cy + (int)gazeY;
+  int ir = (int)(20 + g_peak * 6 - squint * 10);
+  if (ir < 5) ir = 5;
+  canvas.fillCircle(ix, iy, ir, hsv565(g_hue + 40, 0.9f, 0.5f + g_level * 0.3f));
+  int pr = (int)(9 + g_level * 3 - squint * 6);
+  if (pr < 2) pr = 2;
+  canvas.fillCircle(ix + (int)(gazeX * 0.2f), iy + (int)(gazeY * 0.2f), pr, rgb565(6, 4, 10));
+  if (squint < 0.35f)
+    canvas.fillCircle(ix - 3, iy - 3, 2, rgb565(230, 235, 255));
 
-  // shake-off sparkles near end of poke
-  if (g_poke > 0.15f && g_poke < 0.45f) {
-    for (int i = 0; i < 8; i++) {
-      float a = g_t * 8.f + i * 0.8f;
-      int sx = cx + (int)(cosf(a) * (er + 8 + i * 2));
-      int sy = cy + (int)(sinf(a) * (er + 6));
-      canvas.fillCircle(sx, sy, 2, hsv565(g_hue + i * 30.f, 0.9f, 0.8f));
+  // Pain: red flash rings + tears
+  if (squint > 0.4f) {
+    canvas.drawCircle(cx, cy, erX + 4, rgb565(180, 40, 40));
+    for (int i = 0; i < 5; i++) {
+      canvas.fillCircle(cx - 20 + i * 3, cy + erY / 2 + 4 + i * 2, 2,
+                        hsv565(200, 0.3f, 0.7f));
     }
   }
 
   auto td = M5.Touch.getDetail();
   if (td.wasPressed()) {
     float dx = td.x - cx, dy = td.y - cy;
-    if (dx * dx + dy * dy < (er + 20) * (er + 20)) {
+    if (dx * dx + dy * dy < 55.f * 55.f) {
       g_poke = 1.f;
-      hap(180, 50);
+      hap(200, 60);
     }
   }
 }
 
-// ========== TUNNEL — IMU rabbit hole ==========
 static void modeTunnel() {
   static float z = 0;
-  // forward speed: audio pushes deeper, tilt banks
-  float speed = 0.06f + g_level * 0.22f + g_peak * 0.1f;
+  // Direction: DIVE increases depth into hole; RECEDE reverses
+  float dir = (g_tunnelMode == TM_RECEDE) ? -1.f : 1.f;
+  float speed = (0.07f + g_level * 0.2f + g_peak * 0.08f) * dir;
+  if (g_tunnelMode == TM_FRACTAL) speed *= 0.7f;
   z += speed;
-  float spin = g_t * 0.25f + g_lookX * 2.2f + g_lookY * 0.5f;
-  int cx = W / 2 + (int)(g_lookX * -70.f);
-  int cy = H / 2 + (int)(g_lookY * 55.f);
 
-  // deep backdrop stars that stream past
-  for (int s = 0; s < 24; s++) {
-    float sz = fmodf(z * 1.5f + s * 1.7f, 9.f);
-    float sc = 14.f / (sz + 0.3f);
-    float ang = s * 1.7f + spin * 0.3f;
-    int sx = cx + (int)(cosf(ang) * sc * 8.f);
-    int sy = cy + (int)(sinf(ang) * sc * 7.f);
-    uint16_t c = hsv565(g_hue + s * 15.f, 0.6f, 0.15f + (1.f - sz / 9.f) * 0.5f);
-    canvas.fillCircle(sx, sy, 1 + (int)((1.f - sz / 9.f) * 2), c);
+  // Background parallax layer — uncoupled from tunnel, own tilt/sound map
+  for (int i = 0; i < 30; i++) {
+    float px = fmodf(i * 47.f + g_lookX * 40.f + g_t * 15.f * (1 + (i & 3)), (float)W);
+    float py = fmodf(i * 31.f + g_lookY * 35.f - g_t * 10.f, (float)(H - 28)) + 14.f;
+    float a = 0.05f + g_peak * 0.12f * (0.5f + 0.5f * sinf(i + g_t));
+    canvas.fillCircle((int)px, (int)py, 1 + (i & 1),
+                      hsv565(g_hue + 90.f + i * 9.f, 0.7f, a));
+  }
+  for (int y = 14; y < H - 14; y += 10) {
+    float v = 0.03f + 0.04f * sinf(y * 0.08f + g_t * 0.5f + g_lookY * 2.f)
+            + g_level * 0.03f * sinf(y * 0.2f);
+    canvas.drawFastHLine(0, y, W, hsv565(g_hue + 120.f + y * 0.2f, 0.45f, v));
   }
 
-  for (int ring = 16; ring >= 0; ring--) {
-    float zz = fmodf(z + ring * 0.38f, 8.f);
-    float sc = 12.f / (zz + 0.35f);
-    int rad = (int)(sc * (18.f + g_level * 6.f));
-    // procedural side lobes from mic
-    float lobe = 1.f + g_peak * 0.35f * sinf(ring * 0.7f + g_t * 2.f);
-    uint16_t c = hsv565(g_hue + ring * 12.f + g_t * 25.f + g_level * 40.f,
-                        0.85f, 0.15f + (16 - ring) * 0.025f + g_level * 0.35f);
-    int sides = 5 + (ring % 3); // changing n-gons = fractal-ish
-    for (int k = 0; k < sides; k++) {
-      float a0 = spin + k * (2.f * (float)M_PI / sides) + sinf(z * 0.3f + ring) * 0.15f;
-      float a1 = spin + (k + 1) * (2.f * (float)M_PI / sides) + sinf(z * 0.3f + ring) * 0.15f;
-      float r0 = rad * lobe * (1.f + 0.08f * sinf(a0 * 3.f + g_t));
-      float r1 = rad * lobe * (1.f + 0.08f * sinf(a1 * 3.f + g_t));
-      canvas.drawLine(
-        cx + (int)(cosf(a0) * r0), cy + (int)(sinf(a0) * r0 * 0.85f),
-        cx + (int)(cosf(a1) * r1), cy + (int)(sinf(a1) * r1 * 0.85f), c);
+  float spin = g_t * 0.2f + g_lookX * 2.0f;
+  int cx = W / 2 + (int)(g_lookX * -55.f);
+  int cy = H / 2 + (int)(g_lookY * 45.f);
+
+  if (g_tunnelMode == TM_FRACTAL) {
+    // Cheap mandelbrot-ish escape bands for demo-scene candy
+    for (int iy = 14; iy < H - 14; iy += 3) {
+      for (int ix = 0; ix < W; ix += 3) {
+        float u = ((ix - cx) / 90.f) * (1.2f + g_lookX * 0.3f);
+        float v = ((iy - cy) / 70.f) * (1.2f + g_lookY * 0.3f);
+        // zoom with z
+        float zoom = 0.6f + fmodf(fabsf(z) * 0.15f, 2.5f);
+        u /= zoom; v /= zoom;
+        float zr = u, zi = v;
+        int k;
+        for (k = 0; k < 12; k++) {
+          float zr2 = zr * zr - zi * zi + u;
+          zi = 2.f * zr * zi + v;
+          zr = zr2;
+          if (zr * zr + zi * zi > 4.f) break;
+        }
+        if (k > 2) {
+          canvas.fillRect(ix, iy, 3, 3,
+            hsv565(g_hue + k * 28.f + g_t * 20.f + g_level * 50.f, 0.9f, 0.15f + k * 0.06f));
+        }
+      }
+    }
+  } else {
+    // Rings — dive means outer rings faster toward center (increasing z depth)
+    for (int ring = 16; ring >= 0; ring--) {
+      float zz = fmodf(fabsf(z) + ring * 0.38f, 8.f);
+      // invert depth perception for dive: small z = far
+      float depth = (g_tunnelMode == TM_RECEDE) ? (8.f - zz) : zz;
+      float sc = 12.f / (depth + 0.35f);
+      int rad = (int)(sc * (18.f + g_level * 6.f));
+      float lobe = 1.f + g_peak * 0.3f * sinf(ring * 0.7f + g_t * 2.f);
+      uint16_t c = hsv565(g_hue + ring * 12.f + g_t * 25.f, 0.85f,
+                          0.12f + (16 - ring) * 0.03f + g_level * 0.3f);
+      int sides = 5 + (ring % 3);
+      for (int k = 0; k < sides; k++) {
+        float a0 = spin + k * (2.f * (float)M_PI / sides);
+        float a1 = spin + (k + 1) * (2.f * (float)M_PI / sides);
+        float r0 = rad * lobe, r1 = rad * lobe;
+        canvas.drawLine(
+          cx + (int)(cosf(a0) * r0), cy + (int)(sinf(a0) * r0 * 0.85f),
+          cx + (int)(cosf(a1) * r1), cy + (int)(sinf(a1) * r1 * 0.85f), c);
+      }
     }
   }
-  // vanishing point flare
-  int core = 3 + (int)(g_level * 14);
-  canvas.fillCircle(cx, cy, core, hsv565(g_hue + g_t * 50.f, 0.9f, 0.6f + g_peak * 0.4f));
-  for (int i = 0; i < 6; i++) {
-    float a = spin * 2.f + i * (float)M_PI / 3.f;
-    int len = 6 + (int)(g_level * 30);
-    canvas.drawLine(cx, cy, cx + (int)(cosf(a) * len), cy + (int)(sinf(a) * len),
-                    hsv565(g_hue + 80.f, 1.f, 0.7f));
+
+  // Portal wormhole mode: aim with IMU, keep combo
+  if (g_tunnelMode == TM_PORTAL) {
+    if (millis() - g_portalSpawn > 2200) {
+      g_portalSpawn = millis();
+      g_portalX = (float)((rand() % 160) - 80);
+      g_portalY = (float)((rand() % 100) - 50);
+      g_portalZ = 5.f;
+    }
+    g_portalZ -= 0.08f + g_level * 0.05f;
+    float sc = 80.f / (g_portalZ + 0.5f);
+    int px = W / 2 + (int)(g_portalX + g_lookX * -40.f);
+    int py = H / 2 + (int)(g_portalY + g_lookY * 30.f);
+    int rad = (int)sc;
+    for (int r = 0; r < 4; r++)
+      canvas.drawCircle(px, py, rad - r * 3,
+                        hsv565(280 + r * 20.f + g_t * 30.f, 1.f, 0.5f + g_peak * 0.4f));
+    // crosshair at view center
+    canvas.drawLine(cx - 8, cy, cx + 8, cy, rgb565(255, 255, 100));
+    canvas.drawLine(cx, cy - 8, cx, cy + 8, rgb565(255, 255, 100));
+    // hit test
+    float dx = (float)(px - cx), dy = (float)(py - cy);
+    if (g_portalZ < 1.2f) {
+      if (dx * dx + dy * dy < 28.f * 28.f) {
+        g_portalCombo++;
+        g_portalSpawn = 0;
+        hap(120, 30);
+      } else if (g_portalZ < 0.4f) {
+        g_portalCombo = 0;
+        g_portalSpawn = 0;
+      }
+    }
+    canvas.setTextColor(rgb565(255, 220, 80));
+    canvas.setCursor(8, 20);
+    canvas.printf("COMBO %d", g_portalCombo);
   }
+
+  int core = 3 + (int)(g_level * 12);
+  canvas.fillCircle(cx, cy, core, hsv565(g_hue + g_t * 50.f, 0.9f, 0.55f + g_peak * 0.4f));
 }
 
-// ========== PULSE — cycling patterns ==========
 static void modePulse() {
-  drawPsyBg();
-  int cx = W / 2 + (int)(g_lookX * -25.f);
-  int cy = H / 2 + (int)(g_lookY * 20.f);
+  // Psychedelic oil / ink plasma — own mapping vs foreground wave
+  for (int y = 14; y < H - 14; y += 2) {
+    for (int x = 0; x < W; x += 4) {
+      float u = x * 0.02f + g_lookX * 1.5f;
+      float v = y * 0.025f + g_lookY * 1.2f;
+      float n = sinf(u + g_t * 0.7f) * cosf(v - g_t * 0.5f)
+              + sinf((u + v) * 0.8f + g_level * 3.f)
+              + cosf(u * 1.3f - v + g_peak * 4.f + g_t);
+      float bri = 0.06f + 0.1f * (0.5f + 0.5f * n) + g_level * 0.06f;
+      if (bri > 0.28f) bri = 0.28f;
+      canvas.fillRect(x, y, 4, 2, hsv565(g_hue + n * 40.f + y * 0.3f, 0.75f, bri));
+    }
+  }
+
+  int cx = W / 2 + (int)(g_lookX * -20.f);
+  int cy = H / 2 + (int)(g_lookY * 16.f);
 
   auto sampleR = [&](int i) -> float {
     float s = fabsf((float)g_mic[i % MIC_N]) / 16000.f;
@@ -543,21 +674,21 @@ static void modePulse() {
       if (g_pulsePat == PP_MIRROR) r += sinf(ang * 3.f + g_t) * 10.f * g_peak;
       int x = cx + (int)(cosf(ang) * r);
       int y = cy + (int)(sinf(ang) * r * 0.9f);
-      uint16_t c = hsv565(g_hue + i * 2.f + g_t * 30.f, 0.9f, 0.35f + r / 150.f);
+      uint16_t c = hsv565(g_hue + i * 2.f + g_t * 30.f, 0.9f, 0.4f + r / 150.f);
       if (i > 0) canvas.drawLine(prevx, prevy, x, y, c);
       prevx = x; prevy = y;
     }
   } else if (g_pulsePat == PP_STAR) {
     for (int arm = 0; arm < 8; arm++) {
-      float base = arm * (float)M_PI / 4.f + g_t * 0.4f + g_ay;
+      float base = arm * (float)M_PI / 4.f + g_t * 0.4f + g_lookX;
       int prevx = cx, prevy = cy;
       for (int i = 0; i < 32; i++) {
-        float t = i / 32.f;
-        float r = sampleR(i * 4) * t;
-        float ang = base + t * 0.4f * g_level;
+        float tt = i / 32.f;
+        float r = sampleR(i * 4) * tt;
+        float ang = base + tt * 0.4f * g_level;
         int x = cx + (int)(cosf(ang) * r);
         int y = cy + (int)(sinf(ang) * r * 0.9f);
-        canvas.drawLine(prevx, prevy, x, y, hsv565(g_hue + arm * 40.f + t * 80.f, 0.95f, 0.4f + t * 0.5f));
+        canvas.drawLine(prevx, prevy, x, y, hsv565(g_hue + arm * 40.f + tt * 80.f, 0.95f, 0.4f + tt * 0.5f));
         prevx = x; prevy = y;
       }
     }
@@ -568,35 +699,27 @@ static void modePulse() {
         int mi = (x + layer * 40) % MIC_N;
         float s = fabsf((float)g_mic[mi]) / 14000.f;
         float y = H * 0.5f
-          + sinf(x * 0.03f + g_t * (1.2f + layer * 0.4f) + g_ax)
+          + sinf(x * 0.03f + g_t * (1.2f + layer * 0.4f) + g_lookY)
             * (30.f + g_level * 40.f + s * 50.f)
-          + g_ay * 20.f * (layer - 1);
+          + g_lookX * 18.f * (layer - 1);
         uint16_t c = hsv565(g_hue + layer * 50.f + x * 0.5f, 0.85f, 0.35f + s * 0.5f);
         if (x > 0) canvas.drawLine(prevx, prevy, x, (int)y, c);
         prevx = x; prevy = (int)y;
       }
     }
-  } else { // PP_CHAOS — everything cross-modulated
+  } else {
     for (int i = 0; i < MIC_N; i += 2) {
       float ang = (float)i / MIC_N * 2.f * (float)M_PI * (2.f + g_peak)
-                + g_t * (1.f + g_level) + g_ay * 2.f;
-      float r = sampleR(i) * (0.6f + 0.4f * sinf(g_t * 3.f + i * 0.2f + g_ax * 4.f));
+                + g_t * (1.f + g_level) + g_lookX * 2.f;
+      float r = sampleR(i) * (0.6f + 0.4f * sinf(g_t * 3.f + i * 0.2f + g_lookY * 4.f));
       int x = cx + (int)(cosf(ang) * r);
       int y = cy + (int)(sinf(ang * 1.3f) * r * 0.85f);
       canvas.fillCircle(x, y, 1 + (int)(g_level * 3),
                         hsv565(g_hue + i * 3.f + g_shake * 80.f, 1.f, 0.45f + g_peak * 0.5f));
-      if (i > 0 && (i & 3) == 0) {
-        float ang2 = ang + 0.4f;
-        int x2 = cx + (int)(cosf(ang2) * r * 0.7f);
-        int y2 = cy + (int)(sinf(ang2) * r * 0.7f);
-        canvas.drawLine(x, y, x2, y2, hsv565(g_hue + 90.f, 0.7f, 0.3f));
-      }
     }
   }
-
   int core = 8 + (int)(g_level * 22);
   canvas.fillCircle(cx, cy, core, hsv565(g_hue + g_t * 40.f, 0.8f, 0.5f + g_level * 0.4f));
-  canvas.fillCircle(cx, cy, core / 2, rgb565(10, 5, 20));
 }
 
 // ========== DRUM FS + audio ==========
@@ -696,64 +819,61 @@ static int autoTrim(int16_t *buf, int n) {
   return end;
 }
 
-static void drumTone(Pad p) {
-  M5.Mic.end();
-  delay(5);
-  M5.Speaker.begin();
-  M5.Speaker.setVolume(255);
-  switch (p) {
-    case PAD_KICK:
-      hap(230, 75);
-      M5.Speaker.tone(48, 120);
-      delay(90);
-      M5.Speaker.tone(32, 80);
-      delay(50);
-      break;
-    case PAD_SNARE:
-      hap(100, 28);
-      M5.Speaker.tone(180, 30);
-      delay(25);
-      M5.Speaker.tone(2400, 50);
-      delay(40);
-      break;
-    case PAD_HAT_C:
-      M5.Speaker.tone(7000, 25);
-      delay(20);
-      break;
-    case PAD_HAT_O:
-      M5.Speaker.tone(5000, 70);
-      delay(55);
-      M5.Speaker.tone(3500, 50);
-      delay(40);
-      break;
-  }
-  M5.Speaker.stop();
-  delay(5);
-  M5.Speaker.end();
-}
-
+// Lightweight one-shot: no multi-second delay chains
 static void playPad(Pad p, bool recordIntoLoop) {
-  if (g_padSample[p] && g_padSampleLen[p] > 0) {
-    M5.Mic.end();
-    delay(3);
-    M5.Speaker.begin();
-    M5.Speaker.setVolume(200);
-    M5.Speaker.playRaw(g_padSample[p], g_padSampleLen[p], 16000, false);
-    if (p == PAD_KICK) hap(200, 70);
-    else if (p == PAD_SNARE) hap(90, 25);
-    delay(35);
-    M5.Speaker.end();
+  // Free I2S from mic so speaker can run
+  if (M5.Mic.isEnabled()) M5.Mic.end();
+  if (!M5.Speaker.isEnabled()) M5.Speaker.begin();
+  M5.Speaker.setVolume(220);
+
+  if (g_padSample[p] && g_padSampleLen[p] > 40) {
+    // Mono raw @ 16k — playRaw is DMA; do not delay the whole buffer
+    M5.Speaker.playRaw(g_padSample[p], (size_t)g_padSampleLen[p], 16000, false);
+    if (p == PAD_KICK) kickSubHaptic();
+    else if (p == PAD_SNARE) hap(90, 22);
   } else {
-    drumTone(p);
+    // Synth fallback — short single tones (Speaker queues)
+    switch (p) {
+      case PAD_KICK:
+        M5.Speaker.tone(55, 100);
+        kickSubHaptic();
+        break;
+      case PAD_SNARE:
+        M5.Speaker.tone(200, 25);
+        M5.Speaker.tone(3200, 40);
+        hap(80, 18);
+        break;
+      case PAD_HAT_C:
+        M5.Speaker.tone(9000, 12);
+        break;
+      case PAD_HAT_O:
+        M5.Speaker.tone(7500, 45);
+        break;
+    }
   }
+
   if (recordIntoLoop && g_loopOn && g_loopN < LOOP_MAX) {
-    uint32_t at = millis() - g_loopStart;
-    if (at > g_loopLenMs) at %= g_loopLenMs;
+    uint32_t at = (millis() - g_loopStart) % g_loopLenMs;
     g_loopEv[g_loopN] = (uint8_t)p;
     g_loopAt[g_loopN] = (uint16_t)at;
     g_loopN++;
   }
+  g_micRestoreAt = millis() + 180; // let sample start, then free speaker for mic
 }
+
+static void serviceMicSpeaker() {
+  if (g_micRestoreAt && millis() >= g_micRestoreAt) {
+    g_micRestoreAt = 0;
+    if (g_mode != MODE_DRUM || g_tempoMode) {
+      // non-drum always wants mic
+    }
+    if (g_mode != MODE_DRUM) {
+      M5.Speaker.end();
+      if (!M5.Mic.isEnabled()) M5.Mic.begin();
+    }
+  }
+}
+
 
 static void recordPadSample(int pad) {
   const int nMax = 7200;
@@ -914,8 +1034,64 @@ static void modeDrum() {
   }
 }
 
+
+static void modeMantis() {
+  // Dancing splash mantis — pose from audio + IMU
+  float bounce = g_level * 18.f + g_peak * 10.f;
+  float sway = g_lookX * 25.f;
+  float bob = sinf(g_t * (3.f + g_level * 8.f)) * (6.f + g_level * 14.f);
+  int cx = W / 2 + (int)sway;
+  int cy = H / 2 + (int)(bob - bounce * 0.3f) - 10;
+
+  // reactive floor glow
+  for (int i = 0; i < 5; i++) {
+    int gy = H - 20 - i * 4;
+    canvas.drawFastHLine(40, gy, W - 80,
+      hsv565(g_hue + i * 20.f, 0.7f, 0.05f + g_level * 0.12f));
+  }
+
+  // scale draw with dance squash
+  float squash = 1.f - g_peak * 0.15f;
+  int ox = cx - MANTIS_W / 2;
+  int oy = cy - (int)(MANTIS_H * squash / 2);
+  for (int y = 0; y < MANTIS_H; y++) {
+    int dy = oy + (int)(y * squash);
+    if (dy < 14 || dy >= H - 14) continue;
+    // limb flail via horizontal shear from audio
+    int shear = (int)(sinf(g_t * 5.f + y * 0.08f) * g_level * 8.f);
+    for (int x = 0; x < MANTIS_W; x++) {
+      uint16_t col = mantis_splash[y * MANTIS_W + x];
+      if (!col) continue;
+      int dx = ox + x + shear;
+      if (dx >= 0 && dx < W) canvas.drawPixel(dx, dy, col);
+    }
+  }
+
+  if (g_mantisSing) {
+    // Mic band avatar (lightweight FFT-ish energy bins)
+    const int bins = 16;
+    float band[16];
+    for (int b = 0; b < bins; b++) band[b] = 0;
+    for (int i = 0; i < MIC_N; i++) {
+      int b = i * bins / MIC_N;
+      band[b] += fabsf((float)g_mic[i]);
+    }
+    for (int b = 0; b < bins; b++) {
+      float e = band[b] / (MIC_N / bins) / 8000.f;
+      if (e > 1.2f) e = 1.2f;
+      int h = (int)(e * 50.f);
+      int bx = 20 + b * 18;
+      canvas.fillRect(bx, H - 18 - h, 14, h,
+                      hsv565(g_hue + b * 15.f, 0.9f, 0.4f + e * 0.5f));
+    }
+    // mouth glow
+    canvas.fillCircle(cx, cy + (int)(30 * squash), 4 + (int)(g_level * 8),
+                      hsv565(0, 0.8f, 0.5f + g_peak * 0.5f));
+  }
+}
+
 static void drawChrome() {
-  static const char *names[] = {"SWARM", "EYE", "TUNNEL", "PULSE", "DRUM"};
+  static const char *names[] = {"SWARM", "EYE", "TUNNEL", "PULSE", "DRUM", "MANTIS"};
   canvas.setTextSize(1);
   canvas.setTextColor(hsv565(g_hue, 0.7f, 0.9f));
   canvas.setCursor(4, 2);
@@ -932,14 +1108,19 @@ static void drawChrome() {
     case MODE_EYE:
       canvas.printf("[B] track:%s", g_eyeTrack ? "ON" : "off");
       break;
-    case MODE_TUNNEL:
-      canvas.print("[B] dive");
+    case MODE_TUNNEL: {
+      const char *tm[] = {"dive", "recede", "fractal", "portal"};
+      canvas.printf("[B] %s", tm[g_tunnelMode]);
       break;
+    }
     case MODE_PULSE: {
       const char *pp[] = {"wave", "mirror", "star", "ribbon", "chaos"};
       canvas.printf("[B] %s", pp[g_pulsePat]);
       break;
     }
+    case MODE_MANTIS:
+      canvas.printf("[B] %s", g_mantisSing ? "sing" : "dance");
+      break;
     case MODE_DRUM: {
       if (g_tempoMode) canvas.print("[B] set tempo");
       else {
@@ -992,11 +1173,16 @@ static void btnBShort() {
       hap(90, 20);
       break;
     case MODE_TUNNEL:
-      // nudge deeper
+      g_tunnelMode = (TunnelMode)((g_tunnelMode + 1) % TM_COUNT);
+      g_portalCombo = 0;
       hap(100, 25);
       break;
     case MODE_PULSE:
       g_pulsePat = (PulsePat)((g_pulsePat + 1) % PP_COUNT);
+      hap(90, 20);
+      break;
+    case MODE_MANTIS:
+      g_mantisSing = !g_mantisSing;
       hap(90, 20);
       break;
     case MODE_DRUM: {
@@ -1148,6 +1334,7 @@ void setup() {
 
 void loop() {
   handleInput();
+  serviceMicSpeaker();
 
   if (g_mode != MODE_DRUM) {
     sampleAudio();
@@ -1169,6 +1356,7 @@ void loop() {
     case MODE_TUNNEL: modeTunnel(); break;
     case MODE_PULSE:  modePulse(); break;
     case MODE_DRUM:   modeDrum(); break;
+    case MODE_MANTIS: modeMantis(); break;
     default: break;
   }
   drawChrome();
