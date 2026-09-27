@@ -1,4 +1,4 @@
-# SYNAPSE — a small green bug in a glass panel
+# SYNAPSE — a small green god in a glass panel
 
 Psychedelic praying-mantis fidget toy, calm physics room and dancing / singing mantis puppet for the **M5Stack Core2**.
 Everything listens (mic spectrum, beats, voice), everything feels (IMU tilt, shake, touch, haptics).
@@ -28,6 +28,7 @@ Everything listens (mic spectrum, beats, voice), everything feels (IMU tilt, sha
 (centre, colour). Their interference is the hypnosis. Curved lids blink, squint and startle at loud sounds.
 Poke it and it flinches, squeals, goes bloodshot and **squirts tears**; hit the pupil for extra outrage.
 Shake: random iris colour and a dizzy eye-roll that recovers. B: gaze tracking on / off.
+**Long-press B** changes the eye: basic → cat (a slit that opens with sound) → dragon (molten iris, knife slit).
 
 **TUNNEL** — B cycles four sub-modes:
 * **dive** — fly down a tube generated from the live spectrum (each depth slice is a moment of sound; beats become
@@ -45,13 +46,20 @@ synesthesia (the spectrum sculpts a flow field; quiet is deep and slow, loud is 
 **CALM** — the physics room. Everything still listens, but through a slow, soft energy follower so sound nudges
 rather than shoves. Gravity eases in; haptics are feather-light. **B** changes room, **long-press** (hold still ~0.6 s)
 changes the room's variant:
-* **flow** — a glowing liquid you pour by tilting and stir with a finger; moving liquid glows, still liquid rests.
+* **flow** — a sealed chamber seen through a window: the liquid settles wherever is really down (lying flat, it
+  spreads into a sheet on the far glass); stir it with a finger; moving liquid glows, still liquid rests.
   Sound thins it and tints it. Long-press: neon → honey → mercury (surface tension you can see).
-* **splash** — a pool. Tap the water to splash it; tap above it to drop water from your fingertip. Long-press: gentle rain.
+* **splash** — looking down into a koi pool: ripples refract the mosaic floor and the fish, and throw caustics and
+  glints. Tilt sloshes the whole pool, tap drops a splash (the koi scatter), drag leaves a wake, hold a finger still
+  and the koi come to feed. Long-press: gentle rain.
 * **sand** — sand art between glass panes. Turn it over and watch the layers stream through the water into new
   landscapes; fingertip pushes grains aside; a sound lets a bubble go. Long-press: a new sand picture.
 * **waves** — a wave-machine tank with a paper boat. Tilt to slosh, drag through the surface, hum to raise the swell.
-  The sky is the room's sound: clouds gather, rain falls and rings the water, loud hits in a storm throw lightning.
+  **Storms:** sustained sound and a turbulent sea (your hands, sloshing, big swells) build a storm; the storm
+  whips the sea up in return with gusts and bigger waves, darkens and lowers the clouds, and brings driving rain.
+  Lightning strikes at a distance: close strikes show a bolt and hit with an instant crack, far ones flash in the
+  clouds; either way the thunder arrives later the further away it was, and rolls through the motor.
+  Go quiet and the storm slowly passes.
   Long-press: night, with moon glitter and bioluminescent crests.
 * **aquarium** — blacklight pebbles that pulse with the bass, plankton you can stir, a pulsing jellyfish, fish that
   wander, dart from taps and loud sounds and come to look at a held finger, bubbles that wobble, merge and pop.
@@ -61,6 +69,7 @@ changes the room's variant:
 dancing beat-locked moves chosen by energy. Tap its head to pet it (happy eyes, blush, hearts). Idle, it breathes,
 looks around and waves. **B: sing** — close-up, holding a mic, mouth lip-syncing your voice (open with loudness,
 wide on bright sounds), notes floating out.
+**B** cycles dance → sing → **echo**: say something and the mantis says it back as a chipmunk, a monster or backwards.
 
 ## Drums moved
 
@@ -70,9 +79,52 @@ the per-pixel effects render on both CPU cores.
 
 ## Portal flights
 
-Fly the ether and steer through the hoops that appear in the distance. Thread **three in a row** (the dots at the
+Fly the ether and steer through the hoops that appear in the distance (tilt, drag, or hold a finger where you
+want to go; the reticle leans with your steering, and lining up close to a hoop gets a gentle assist). Thread **three in a row** (the dots at the
 top fill up; a miss resets the chain) and a portal appears far ahead. The next dimension is already visible inside
 it: fly into it and you're there, no loading screen. Speed follows the music; tilt or touch to steer.
+
+## Garden
+
+Two gardens that grow from how you spend your time in Synapse (there are no numbers - the growth is the feedback).
+**B** switches between them. They keep growing while the Core2 is off if its clock is set.
+
+* **crystals** - quartz grows from quiet, amethyst from sound, bismuth from play (rooms, portals, hoops), fluorite
+  from motion, opal from care. Dust settles over real time and slows them: swipe to brush it off. Hold the mist
+  bottle to tend them. Tap a crystal and it rings.
+* **succulents** - five plants, a zen sand bed to rake with a finger and a little rock waterfall. The soil dries over
+  a few real days: tap it to water (not too much - they like it dry-ish). Drag a fallen leaf away. Hold the pool to
+  refill the waterfall. Healthy plants grow, sprout pups and eventually bloom. The light follows the time of day.
+
+## Meditate
+
+A mantis meditation you feel more than see. First it teaches its five haptic words, one at a time in your hand
+(breathe in, breathe out, well done, your heartbeat, we're finishing - tap for the next, B to skip). Then:
+"lie down somewhere quiet and place me flat on your chest". It begins by itself when it feels you breathing:
+it mirrors your breath, then slowly lengthens it (only while you follow), goes silent to listen for your heartbeat
+through your chest (it echoes it back only if it genuinely found it), and closes with three slow pulses and
+singing-bowl bells. The screen dims while you rest. Lifting the Core2 pauses it; **B** ends it gently.
+
+## Rooms
+
+A separate mode (after MANTIS): small physical puzzles with no instructions. The header names the room; the
+"next" label over **B** stays grey until you've solved it. Every visit starts at Mantis NRG, and after the last
+room it loops back there.
+
+| room | what it wants |
+|---|---|
+| nrg | shake the Mantis NRG soda until it blows (the pressure is hidden - it calms down if you stop). Pop the foam. |
+| breeze | blow on the pinwheel |
+| arcade | mash the big red button until the mantis on the TV strikes |
+| wrap | pop every bubble (roll a finger across) |
+| clap | clap along with the mantis - three in time |
+| seed | tip the Core2 to pour the watering can |
+| shade | drag the cloud off the sun |
+| align | tip to slide the rows into line; hold level to lock each one |
+| knock | knock on the door - knocking on the Core2's case works too |
+| globe | shake the snow globe, then hold it perfectly still |
+| hum | hum a steady note at the crystal glass |
+| hush | be quiet until the firefly lands |
 
 ## Haptics
 
@@ -85,18 +137,24 @@ The vibration motor is played, not switched: a small mixer shapes taps with soft
 * **Dive** - scraping the tube wall is gritty and lasts exactly as long as you scrape.
 * **Fractal** - a rebirth swells and vanishes.
 * **Calm** - the flowing liquid has weight when it sloshes, big swells meeting the glass press softly, and
-  lightning brings rolling distant thunder.
+  storm lightning brings a crack (if it's close) and thunder that arrives after its delay and rolls.
 * **Calibration** - a heartbeat that quickens as the ring closes, the motor goes completely still while the gyro
   calibrates (so it can't disturb the measurement), then two soft pulses: done.
 
-## Calibrate the tilt (do this once)
+## Tilt and steering
 
-Lay the Core2 flat and still, press and **hold a finger still in the middle of the screen**. After 2 seconds a
-ring closes in on your finger; then it shows **"hold still & flat - calibrating"** for about a second.
-This runs M5Unified's own gyro offset calibration (its documented method: still on a desk) and saves it to NVS,
-and it records your neutral pose for flying (dive, recede, fractal, portal steer from that pose, with a deadzone,
-so holding the Core2 at a natural angle no longer keeps pushing one way). Gaze, parallax, swarm chaos and the
-calm room's gravity use the real direction of gravity, so rotating the Core2 always pours the liquid to the bottom.
+Everything that uses gravity (the calm room's liquids, sand, bubbles, swarm chaos) follows real gravity:
+tip the Core2 and things slide to the side that is really down.
+
+The flying modes (dive, recede, fractal, portal) steer by how far you **rotate the Core2 away from the way you're
+holding it**: tip a little, steer a little; tip more, steer more - even past 90 degrees - and it keeps steering for as
+long as you hold the tilt. Each time you enter a flying mode it centres on your grip as soon as you hold still for a
+moment ("centered"). To re-centre any time, hold a finger still in the middle of the screen: after 2 s a ring closes
+in, then it takes your current grip as centre ("hold it how you like - calibrating"; this also runs M5Unified's gyro
+offset calibration and saves both).
+
+Touch works as a fallback in every flying mode: drag to move (grab the space and pull it), and in the portal you can
+also hold a finger where you want to fly.
 
 The microphone learns the room's background level at boot (and again whenever the mantis starts singing), so
 quiet rooms stay calm and sustained music keeps everything moving.

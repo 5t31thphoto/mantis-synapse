@@ -26,6 +26,18 @@ static float s_calAcc = 0, s_calMin = 1e9f, s_loudRef = 1200.f, s_calCap = 1000.
 static int16_t *s_sfx = nullptr; static int s_sfxLen = 0;
 static uint32_t s_sfxRate = SR, s_sfxUntil = 0;
 static bool s_sfxPending = false;
+// ---- general speaker playback (bells, echo) + speaker hold (meditation) ----
+static const int16_t *s_pbBuf = nullptr; static int s_pbLen = 0; static uint32_t s_pbRate = SR; static uint8_t s_pbVol = 150;
+static bool s_pbPending = false, s_hold = false;
+static int16_t *s_bell[3] = {nullptr, nullptr, nullptr}; static int s_bellLen = 0;
+// ---- echo / yakback ----
+static bool s_echoOn = false;
+static int16_t *s_echo = nullptr, *s_echoOut = nullptr;
+static const int ECHO_MAX = SR * 4;
+static int s_echoN = 0, s_echoFxI = 0, s_echoState = 0;     // 0 listening, 1 recording, 2 playing
+static uint32_t s_echoQuietAt = 0, s_echoPlayAt = 0, s_echoPlayMs = 0;
+static float s_echoRate = 1.f;
+static uint8_t s_env[256];
 
 bool speakerLive() { return s_spk; }
 static inline float clampf_(float v, float a, float b) { return v < a ? a : (v > b ? b : v); }
@@ -141,6 +153,18 @@ static void micBlock(float dt) {
   float z = clampf_((float)zc / (MIC_REC * 0.35f), 0.f, 1.f);
   zcr = zcr * 0.6f + z * 0.4f;
   analyze(scope, true, dt);
+  if (s_echoOn && s_echo) {
+    uint32_t now = millis();
+    if (s_echoState == 0 && level > 0.14f) { s_echoState = 1; s_echoN = 0; }
+    if (s_echoState == 1) {
+      int n = MIC_REC; if (s_echoN + n > ECHO_MAX) n = ECHO_MAX - s_echoN;
+      for (int i = 0; i < n; i++) s_echo[s_echoN + i] = (int16_t)clampf_((s_micBuf[i] - dc) * 2.f, -32000.f, 32000.f);
+      s_echoN += n;
+      if (level > 0.08f) s_echoQuietAt = now;
+      if ((now - s_echoQuietAt > 650 && s_echoN > SR / 3) || s_echoN >= ECHO_MAX) s_echoState = 3;   // done talking: play it back
+      if (now - s_echoQuietAt > 650 && s_echoN <= SR / 3) s_echoState = 0;                          // just a noise
+    }
+  }
 }
 
 
@@ -166,7 +190,34 @@ static void toMic() {
   s_mic = true; s_micBusy = false;
 }
 
-void begin() { fftInit(); synthSfx(); toMic(); }
+static void synthBells() {
+  s_bellLen = SR * 3;
+  static const float F[3] = {220.f, 293.66f, 392.f};                  // A3, D4, G4: a soft open fifth family
+  for (int b = 0; b < 3; b++) {
+    s_bell[b] = (int16_t *)heap_caps_malloc(s_bellLen * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_bell[b]) continue;
+    for (int i = 0; i < s_bellLen; i++) {
+      float t = (float)i / SR, f = F[b];
+      float v = sinf(6.2831853f * f * t) * expf(-t * 0.9f) * 0.55f
+              + sinf(6.2831853f * f * 2.76f * t) * expf(-t * 1.8f) * 0.25f * (0.8f + 0.2f * sinf(t * 7.f))   // singing-bowl beating
+              + sinf(6.2831853f * f * 5.4f * t) * expf(-t * 3.5f) * 0.12f;
+      float att = t < 0.004f ? t / 0.004f : 1.f;
+      s_bell[b][i] = (int16_t)(v * att * 20000.f);
+    }
+  }
+}
+void begin() {
+  fftInit(); synthSfx(); synthBells();
+  s_echo = (int16_t *)heap_caps_malloc(ECHO_MAX * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  s_echoOut = (int16_t *)heap_caps_malloc(ECHO_MAX * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  toMic();
+}
+void playBuf(const int16_t *d, int n, uint32_t rate, uint8_t vol) { s_pbBuf = d; s_pbLen = n; s_pbRate = rate; s_pbVol = vol; s_pbPending = true; }
+void bell(int which, uint8_t vol) { if (s_bell[which % 3]) playBuf(s_bell[which % 3], s_bellLen, SR, vol); }
+void speakerHold(bool on) { s_hold = on; if (!on && s_spk) s_sfxUntil = millis(); }
+void echo(bool on) { s_echoOn = on; s_echoState = 0; }
+int echoState() { return s_echoState == 3 ? 2 : s_echoState; }
+int echoFx() { return s_echoFxI; }
 void calibrateAmbient(float cap) { s_calN = CAL_BLOCKS; s_calAcc = 0; s_calMin = 1e9f; s_calCap = cap; }
 bool calibrating() { return s_calN > 0; }
 
@@ -186,7 +237,36 @@ void service(float dt) {
     s_spk = true;
     M5.Speaker.playRaw(s_sfx, (size_t)s_sfxLen, s_sfxRate, false, 1, 0, true);
   }
-  if (s_spk && now > s_sfxUntil) toMic();
+  if (s_echoState == 3 && s_echoOut) {                          // build the playback: chipmunk / monster / backwards
+    s_echoFxI = (s_echoFxI + 1) % 3;
+    int n = s_echoN;
+    for (int i = 0; i < n; i++) s_echoOut[i] = s_echoFxI == 2 ? s_echo[n - 1 - i] : s_echo[i];
+    s_echoRate = s_echoFxI == 0 ? 1.6f : (s_echoFxI == 1 ? 0.66f : 1.2f);
+    for (int k = 0; k < 256; k++) {                             // envelope for the mantis's lips
+      int a = k * n / 256, b = (k + 1) * n / 256, pk = 0;
+      for (int i = a; i < b; i += 4) { int v = abs(s_echoOut[i]); if (v > pk) pk = v; }
+      s_env[k] = (uint8_t)(pk >> 7);
+    }
+    s_echoPlayMs = (uint32_t)(n * 1000.f / (SR * s_echoRate));
+    playBuf(s_echoOut, n, (uint32_t)(SR * s_echoRate), 200);
+    s_echoPlayAt = now; s_echoState = 2;
+  }
+  if (s_pbPending) {
+    s_pbPending = false;
+    if (s_mic) { M5.Mic.end(); s_mic = false; s_micBusy = false; }
+    if (!M5.Speaker.isEnabled()) M5.Speaker.begin();
+    M5.Speaker.setVolume(s_pbVol);
+    s_spk = true;
+    M5.Speaker.playRaw(s_pbBuf, (size_t)s_pbLen, s_pbRate, false, 1, 0, true);
+    uint32_t ms = (uint32_t)(s_pbLen * 1000.f / s_pbRate) + 80;
+    s_sfxUntil = now + ms;
+  }
+  if (s_echoState == 2) {                                       // lip-sync to the playback
+    uint32_t e = now - s_echoPlayAt;
+    int k = s_echoPlayMs ? (int)(e * 256 / s_echoPlayMs) : 256;
+    if (k < 256) level = s_env[k] / 180.f; else { s_echoState = 0; level = 0; }
+  }
+  if (s_spk && now > s_sfxUntil && !s_hold) toMic();
   onset = 0;
   if (s_mic) {
     if (!s_micBusy) { M5.Mic.record(s_micBuf, MIC_REC, SR); s_micBusy = true; s_micAt = now; }
@@ -195,7 +275,7 @@ void service(float dt) {
       M5.Mic.record(s_micBuf, MIC_REC, SR);
       s_micAt = now;
     }
-  } else { level *= 0.9f; }
+  } else if (s_echoState != 2) { level *= 0.9f; }
   // calm energy: slow attack, slower release, compressed (for the physics room)
   float c = sqrtf(clampf_(level, 0.f, 1.2f));
   calm += (c - calm) * clampf_(dt * (c > calm ? 1.5f : 0.6f), 0.f, 1.f);

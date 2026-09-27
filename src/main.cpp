@@ -8,6 +8,7 @@
 #include "audio.h"
 #include "fx.h"
 #include "wire.h"
+#include "stats.h"
 #ifndef HOST
 #include <Preferences.h>
 #endif
@@ -20,6 +21,8 @@ float g_t = 0, g_dt = 0.033f, g_hue = 160;
 float g_level = 0, g_peak = 0;
 float g_lookX = 0, g_lookY = 0;
 float g_gravX = 0, g_gravY = 0;        // downhill direction in screen space (1 = 1 g)
+float g_gravZ = 1, g_jolt = 0;          // |gravity into the screen| (1 = lying flat), instantaneous jolt (g)
+float g_gyroX = 0, g_gyroY = 0, g_gyroZ = 0;
 int16_t g_mic[MIC_N];
 
 static float g_ax = 0, g_ay = 0, g_az = 1, g_gx = 0, g_gy = 0, g_gz = 0;
@@ -27,7 +30,7 @@ static float g_shake = 0;
 static uint32_t g_shakeAt = 0;
 bool g_shakeKick = false;                  // one-frame shake event
 
-enum Mode : uint8_t { MODE_SWARM = 0, MODE_EYE, MODE_TUNNEL, MODE_PULSE, MODE_CALM, MODE_MANTIS, MODE_COUNT };
+enum Mode : uint8_t { MODE_SWARM = 0, MODE_EYE, MODE_TUNNEL, MODE_PULSE, MODE_CALM, MODE_MANTIS, MODE_ROOMS, MODE_GARDEN, MODE_MEDITATE, MODE_COUNT };
 enum SwarmVar : uint8_t { SV_FLOCK = 0, SV_ORBIT, SV_CHAOS, SV_COUNT };
 enum TunnelMode : uint8_t { TM_DIVE = 0, TM_RECEDE, TM_FRACTAL, TM_PORTAL, TM_COUNT };
 static const int PP_COUNT = 5;
@@ -37,6 +40,7 @@ static TunnelMode g_tunnelMode = TM_DIVE;
 static int g_pulsePat = 0;
 static bool g_eyeTrack = true;
 static bool g_mantisSing = false;
+static uint8_t g_mantisMode = 0;              // 0 dance, 1 sing, 2 echo (yakback)
 
 // ---------------- haptics: an expressive little mixer for the vibration motor ----------------
 // The Core2 motor is an ERM whose strength follows setVibration(0..255), so we shape it:
@@ -58,8 +62,11 @@ static const HapKey G_THUNDER[] = {{50, 160}, {150, 120}, {80, 170}, {210, 90}, 
 static const HapKey G_SETTLE[]  = {{120, 40}, {0, 90}, {170, 55}, {0, 160}};                                    // two soft pulses: done
 static const HapKey G_REBIRTH[] = {{30, 250}, {140, 350}, {230, 200}, {0, 30}};                                 // swell, then gone
 static const HapKey G_PAIN[]    = {{255, 30}, {120, 60}, {190, 40}, {60, 140}, {0, 160}};                       // flinch + throb
-static const HapKey *const GEST[] = {G_THREAD, G_CHAIN, G_MISS, G_THUNDER, G_SETTLE, G_REBIRTH, G_PAIN};
-static const int GEST_N[] = {4, 7, 5, 7, 4, 4, 5};
+static const HapKey G_LUBDUB[]  = {{175, 45}, {30, 90}, {125, 40}, {0, 220}};                                  // lub-dub
+static const HapKey G_THREE[]   = {{140, 350}, {0, 450}, {140, 350}, {0, 450}, {140, 350}, {0, 300}};               // three slow pulses
+static const HapKey G_CRACK[]   = {{255, 16}, {150, 26}, {235, 20}, {90, 40}, {0, 50}};                         // a close lightning crack
+static const HapKey *const GEST[] = {G_THREAD, G_CHAIN, G_MISS, G_THUNDER, G_SETTLE, G_REBIRTH, G_PAIN, G_CRACK, G_LUBDUB, G_THREE};
+static const int GEST_N[] = {4, 7, 5, 7, 4, 4, 5, 5, 4, 6};
 
 static void vib(uint8_t v) {
   uint32_t now = millis();
@@ -177,19 +184,34 @@ static float s_calS[3]; static int s_calN = 0;
 static void btnBShort();
 static void eyePoke(int x, int y);
 static uint32_t s_bDown = 0;
+static bool s_bLong = false;
+static uint8_t s_eyeStyle = 0;                 // 0 basic, 1 cat, 2 dragon (long-press B in EYE)
 static uint32_t s_touchDown = 0;
 static int s_touchX0 = 0, s_touchY0 = 0;
 static bool s_longFired = false;
 static bool s_centreTouch = false;
 
 static void pollInput() {
+  if (g_mode == MODE_MEDITATE) {                          // ~250 Hz motion sampling for breath + heart
+    static uint32_t lastUs = 0;
+    uint32_t us = micros();
+    if (us - lastUs >= 4000 && M5.Imu.update()) {
+      auto d = M5.Imu.getImuData();
+      float dts = lastUs ? (us - lastUs) / 1e6f : 0.004f; if (dts > 0.05f) dts = 0.05f;
+      lastUs = us;
+      medSample(d.accel.x, d.accel.y, d.accel.z, dts);
+    }
+  }
   M5.update();
   hapService();
   uint32_t now = millis();
   if (M5.BtnA.wasPressed()) nextMode(-1);
   if (M5.BtnC.wasPressed()) nextMode(1);
-  if (M5.BtnB.wasPressed()) s_bDown = now;
-  if (M5.BtnB.wasReleased() && s_bDown) { btnBShort(); s_bDown = 0; }
+  if (M5.BtnB.wasPressed()) { s_bDown = now; s_bLong = false; }
+  if (M5.BtnB.isPressed() && s_bDown && !s_bLong && g_mode == MODE_EYE && now - s_bDown > 650) {
+    s_bLong = true; s_eyeStyle = (uint8_t)((s_eyeStyle + 1) % 3); hapGesture(HG_SETTLE);
+  }
+  if (M5.BtnB.wasReleased() && s_bDown) { if (!s_bLong) btnBShort(); s_bDown = 0; }
 
   auto td = M5.Touch.getDetail();
   bool inStage = td.y >= 14 && td.y < H - 14;
@@ -198,10 +220,13 @@ static void pollInput() {
     else if (inStage) {
       g_tapLatch = true; g_tapX = td.x; g_tapY = td.y;
       s_touchDown = now; s_touchX0 = td.x; s_touchY0 = td.y; s_longFired = false;
-      s_centreTouch = (td.x - W / 2) * (td.x - W / 2) + (td.y - H / 2) * (td.y - H / 2) < 52 * 52;
+      s_centreTouch = g_mode == MODE_TUNNEL && (td.x - W / 2) * (td.x - W / 2) + (td.y - H / 2) * (td.y - H / 2) < 52 * 52;   // re-centre: flying modes only
       if (g_mode == MODE_EYE) eyePoke(td.x, td.y);
       else if (g_mode == MODE_MANTIS) mantisTap(td.x, td.y);
       else if (g_mode == MODE_CALM) calmTouch(td.x, td.y, true);
+      else if (g_mode == MODE_ROOMS) roomsTouch(td.x, td.y);
+      else if (g_mode == MODE_GARDEN) gardenTouch(td.x, td.y);
+      else if (g_mode == MODE_MEDITATE) medTouch(td.x, td.y);
     }
   } else if (td.isPressed() && inStage && s_touchDown) {
     if (abs(td.x - s_touchX0) + abs(td.y - s_touchY0) > 14) { s_touchDown = 0; if (s_cal == CAL_RING) s_cal = CAL_IDLE; }   // a drag
@@ -213,7 +238,7 @@ static void pollInput() {
       }
       // hold still near the centre: after 2 s a ring closes in on the finger, then we calibrate
       if (s_centreTouch && s_cal == CAL_IDLE && held > 2000) { s_cal = CAL_RING; s_calT = now; s_calX = td.x; s_calY = td.y; }
-      if (s_cal == CAL_RING && now - s_calT > 1200) { s_cal = CAL_RUN; s_calT = now; s_calN = 0; s_calS[0] = s_calS[1] = 0; hapCut(1150); }   // motor off: it would shake the gyro
+      if (s_cal == CAL_RING && now - s_calT > 1200) { s_cal = CAL_RUN; s_calT = now; s_calN = 0; s_calS[0] = s_calS[1] = s_calS[2] = 0; hapCut(1150); }   // motor off: it would shake the gyro
     }
   }
   if (td.wasReleased() && s_touchDown && s_centreTouch && s_cal == CAL_IDLE && g_mode == MODE_CALM) {
@@ -228,18 +253,37 @@ static void pollInput() {
 // g_flyX/Y: steering for flight modes, measured from the neutral pose captured during calibration,
 // with a deadzone, so holding the Core2 at your natural angle no longer keeps pushing one way.
 float g_flyX = 0, g_flyY = 0;
-static float s_neutX = 0, s_neutY = 0;
+// Flight steering = how far you've ROTATED the Core2 away from the pose you hold it in.
+// Reference pose = the gravity direction while you hold it naturally (captured by the centre-hold gesture,
+// and automatically each time you enter a flight mode once you're still). The steering vector is the true
+// rotation from that pose: axis = ref x now, angle = atan2(|ref x now|, ref . now). It grows the more you
+// tip - past 90 degrees too - and stays put while you hold the tilt. Near a flat pose it is exactly the
+// flat-pose mapping (ref=(0,0,1): steer = (-gx, gy)), the same axes as gravity and gaze.
+static float s_ref[3] = {0.f, 0.f, 1.f};
+static float s_gN[3] = {0.f, 0.f, 1.f};
+static bool s_autoCap = false;
+static float s_stillT = 0;
+static uint32_t s_centeredAt = 0;
 static void loadCal() {
 #ifndef HOST
   Preferences p;
-  if (p.begin("synapse", true)) { s_neutX = p.getFloat("nx", 0.f); s_neutY = p.getFloat("ny", 0.f); p.end(); }
+  if (p.begin("synapse", true)) { s_ref[0] = p.getFloat("rx", 0.f); s_ref[1] = p.getFloat("ry", 0.f); s_ref[2] = p.getFloat("rz", 1.f); p.end(); }
 #endif
 }
 static void saveCal() {
 #ifndef HOST
   Preferences p;
-  if (p.begin("synapse", false)) { p.putFloat("nx", s_neutX); p.putFloat("ny", s_neutY); p.end(); }
+  if (p.begin("synapse", false)) { p.putFloat("rx", s_ref[0]); p.putFloat("ry", s_ref[1]); p.putFloat("rz", s_ref[2]); p.end(); }
 #endif
+}
+static void capturePose() { s_ref[0] = s_gN[0]; s_ref[1] = s_gN[1]; s_ref[2] = s_gN[2]; s_centeredAt = millis(); }
+void flightPoseSoon() { s_autoCap = true; s_stillT = 0; }        // called when a flight mode starts
+static inline float shapeSteer(float v) {                    // 3 deg deadzone, 1.0 at ~34 deg, growing faster beyond
+  float a = fabsf(v) - 0.05f;
+  if (a <= 0) return 0;
+  float s = a / 0.55f;
+  float o = s * (0.55f + 0.45f * fminf(s, 2.5f));
+  return copysignf(fminf(o, 3.f), v);
 }
 static inline float softDz(float v, float dz) { return v > dz ? v - dz : (v < -dz ? v + dz : 0.f); }
 static void sampleImu() {
@@ -248,18 +292,44 @@ static void sampleImu() {
   float ax = d.accel.x, ay = d.accel.y, az = d.accel.z;
   g_ax = g_ax * 0.7f + ax * 0.3f; g_ay = g_ay * 0.7f + ay * 0.3f; g_az = g_az * 0.7f + az * 0.3f;
   g_gx = d.gyro.x; g_gy = d.gyro.y; g_gz = d.gyro.z;
-  g_gravX = -g_ay; g_gravY = g_ax;
-  float tx = -g_ay, ty = g_ax;
-  if (s_cal == CAL_RUN) { s_calS[0] += tx; s_calS[1] += ty; s_calN++; }
+  // accelerometer -> screen, consistent with the gyro half below (IMU X = screen right, Y = screen up):
+  g_gravX = -g_ax; g_gravY = g_ay; g_gravZ = fabsf(g_az);
+  g_gyroX = g_gx; g_gyroY = g_gy; g_gyroZ = g_gz;
+  float tx = -g_ax, ty = g_ay;
+  if (s_cal == CAL_RUN) s_calN++;
   if (fabsf(tx) < 0.08f) tx = 0;
   if (fabsf(ty) < 0.08f) ty = 0;
   if (fabsf(g_gx) + fabsf(g_gy) > 8.f) { g_lookX += g_gy * 0.0025f; g_lookY += g_gx * 0.0025f; }
   float k = (fabsf(tx) + fabsf(ty) < 0.15f) ? 0.22f : 0.12f;
   g_lookX += (tx - g_lookX) * k; g_lookY += (ty - g_lookY) * k;
   g_lookX = clampf(g_lookX, -1.1f, 1.1f); g_lookY = clampf(g_lookY, -1.1f, 1.1f);
-  g_flyX = clampf(softDz(g_lookX - s_neutX, 0.06f) * 1.3f, -1.1f, 1.1f);
-  g_flyY = clampf(softDz(g_lookY - s_neutY, 0.06f) * 1.3f, -1.1f, 1.1f);
   float mag = sqrtf(ax * ax + ay * ay + az * az);
+  g_jolt = fabsf(mag - 1.f);
+  if (mag > 0.3f && fabsf(mag - 1.f) < 0.45f) {                // unit gravity, shakes rejected
+    for (int i = 0; i < 3; i++) s_gN[i] += ((i == 0 ? ax : (i == 1 ? ay : az)) / mag - s_gN[i]) * 0.35f;
+    float n = sqrtf(s_gN[0] * s_gN[0] + s_gN[1] * s_gN[1] + s_gN[2] * s_gN[2]) + 1e-6f;
+    s_gN[0] /= n; s_gN[1] /= n; s_gN[2] /= n;
+  }
+  if (s_cal == CAL_RUN) { s_calS[0] += s_gN[0]; s_calS[1] += s_gN[1]; s_calS[2] += s_gN[2]; }
+  if (s_autoCap) {                                               // entering a flight mode: centre on how you're holding it
+    float gyr = fabsf(g_gx) + fabsf(g_gy) + fabsf(g_gz);
+    s_stillT = gyr < 30.f ? s_stillT + g_dt : 0.f;
+    if (s_stillT > 0.35f) { capturePose(); s_autoCap = false; }
+  }
+  {
+    float cx = s_ref[1] * s_gN[2] - s_ref[2] * s_gN[1], cy = s_ref[2] * s_gN[0] - s_ref[0] * s_gN[2], cz = s_ref[0] * s_gN[1] - s_ref[1] * s_gN[0];
+    float sn = sqrtf(cx * cx + cy * cy + cz * cz), cs = s_ref[0] * s_gN[0] + s_ref[1] * s_gN[1] + s_ref[2] * s_gN[2];
+    float ang = atan2f(sn, cs), k = sn > 1e-5f ? ang / sn : 1.f;
+    float rx = cx * k, ry = cy * k, rz = cz * k;                    // rotation vector (device frame)
+    // Split it the way a person means it, whatever the grip: "right edge dropped" = rotation about the
+    // horizontal forward axis F; "top tipped away" = rotation about the horizontal right axis Xh.
+    // Flat grip: F = screen-up. Held upright in front of you: F = screen normal (a steering-wheel turn).
+    float hx = 1.f - s_ref[0] * s_ref[0], hy = -s_ref[0] * s_ref[1], hz = -s_ref[0] * s_ref[2];
+    float hn = sqrtf(hx * hx + hy * hy + hz * hz) + 1e-6f; hx /= hn; hy /= hn; hz /= hn;
+    float fx_ = s_ref[1] * hz - s_ref[2] * hy, fy_ = s_ref[2] * hx - s_ref[0] * hz, fz_ = s_ref[0] * hy - s_ref[1] * hx;
+    g_flyX = shapeSteer(-(rx * fx_ + ry * fy_ + rz * fz_));
+    g_flyY = shapeSteer(-(rx * hx + ry * hy + rz * hz));
+  }
   g_shake = g_shake * 0.8f + fabsf(mag - 1.f) * 0.2f;
   if (g_shake > 0.5f && millis() - g_shakeAt > 350) {
     g_shakeAt = millis(); g_shakeKick = true;
@@ -280,13 +350,21 @@ static void calService() {
   if (s_cal == CAL_RUN && now - s_calT > 1200) {
     M5.Imu.setCalibration(0, 0, 0); calOn = false;
     M5.Imu.saveOffsetToNVS();
-    if (s_calN >= 8) { s_neutX = s_calS[0] / s_calN; s_neutY = s_calS[1] / s_calN; saveCal(); }
-    g_lookX = -g_ay; g_lookY = g_ax;
+    if (s_calN >= 8) {
+      float x = s_calS[0], y = s_calS[1], z = s_calS[2], n = sqrtf(x * x + y * y + z * z) + 1e-6f;
+      s_ref[0] = x / n; s_ref[1] = y / n; s_ref[2] = z / n; s_centeredAt = millis(); saveCal();
+    }
+    g_lookX = -g_ax; g_lookY = g_ay;
     s_cal = CAL_DONE; s_calT = now; hapGesture(HG_SETTLE);
   } else if (s_cal == CAL_DONE && now - s_calT > 900) s_cal = CAL_IDLE;
 }
 static void drawCal() {
   uint32_t now = millis();
+  if (g_mode == MODE_TUNNEL && s_centeredAt && now - s_centeredAt < 900 && s_cal == CAL_IDLE) {
+    float u = (now - s_centeredAt) / 900.f;
+    canvas.drawCircle(160, 120, 14 + (int)(u * 30.f), wire::LIME);
+    canvas.setTextColor(wire::LIME); canvas.setCursor(160 - 24, 146); canvas.print("centered");
+  }
   if (s_cal == CAL_RING) {
     float u = clampf((now - s_calT) / 1200.f, 0.f, 1.f), r = 64.f * (1.f - u) * (1.f - u * 0.3f);
     canvas.drawCircle(s_calX, s_calY, (int)r + 2, wire::PLUM);
@@ -303,7 +381,7 @@ static void drawCal() {
     canvas.drawRoundRect(60, 96, 200, 48, 10, wire::TEAL);
     canvas.drawRoundRect(61, 97, 198, 46, 9, wire::PLUM);
     canvas.setTextSize(1); canvas.setTextColor(wire::LIME);
-    const char *t = run ? "hold still & flat - calibrating" : "calibrated";
+    const char *t = run ? "hold it how you like - calibrating" : "centered on your grip";
     canvas.setCursor(160 - (int)strlen(t) * 3, 108); canvas.print(t);
     float u = run ? clampf((now - s_calT) / 1200.f, 0.f, 1.f) : 1.f;
     canvas.fillRect(80, 126, (int)(160 * u), 4, wire::TEAL);
@@ -358,6 +436,127 @@ static void drawTinyMantis(int cx, int cy) {
       if (c) canvas.drawPixel(ox + x, oy + y, c);
     }
 }
+// ---- CHAOS: jelly globs under real gravity. They merge (weakly) into bigger globs, burst into
+//      droplets when you shake, flow around, avoid your finger, and never settle into a dead heap. ----
+struct Jelly { float x, y, vx, vy, m, hue, wob; bool live; };
+static const int NJ = 70;
+static Jelly s_j[NJ];
+static bool s_jInit = false;
+static inline float jR(float m) { return 4.f + sqrtf(m) * 3.2f; }
+static int jSpawn(float x, float y, float vx, float vy, float m, float hue) {
+  for (int i = 0; i < NJ; i++) if (!s_j[i].live) { s_j[i] = {x, y, vx, vy, m, hue, (esp_random() % 628) / 100.f, true}; return i; }
+  return -1;
+}
+static void chaosJelly() {
+  float dt = fminf(g_dt, 0.05f);
+  if (!s_jInit) {
+    s_jInit = true;
+    for (int i = 0; i < 26; i++) jSpawn(30.f + (esp_random() % 260), 30.f + (esp_random() % 170), 0, 0, 1.f + (esp_random() % 30) / 10.f, (float)(esp_random() % 360));
+  }
+  float soundHue = g_hue + g_level * 100.f + aud::centroid * 90.f;
+  // shake: globs burst into droplets of random sizes, flung apart
+  if (g_shakeKick) {
+    for (int i = 0; i < NJ; i++) {
+      Jelly &b = s_j[i];
+      if (!b.live) continue;
+      float a0 = (esp_random() % 628) / 100.f, sp = 160.f + (esp_random() % 220);
+      if (b.m > 1.6f) {
+        int pieces = 2 + (int)(esp_random() % 4);
+        float left = b.m;
+        for (int k = 0; k < pieces && left > 0.4f; k++) {
+          float share = k == pieces - 1 ? left : left * (0.2f + (esp_random() % 50) / 100.f);
+          float a = a0 + k * 6.2831853f / pieces + ((int)(esp_random() % 60) - 30) / 100.f;
+          if (k == 0) { b.m = share; b.vx += cosf(a) * sp; b.vy += sinf(a) * sp; }
+          else jSpawn(b.x + cosf(a) * 4.f, b.y + sinf(a) * 4.f, b.vx + cosf(a) * sp, b.vy + sinf(a) * sp, share, b.hue + k * 25.f);
+          left -= share;
+        }
+      } else { b.vx += cosf(a0) * sp; b.vy += sinf(a0) * sp; }
+    }
+  }
+  // pairs: squishy contact (no stacking), weak cohesion nearby, gentle merging when they meet slowly
+  for (int i = 0; i < NJ; i++) {
+    Jelly &a = s_j[i];
+    if (!a.live) continue;
+    float ra = jR(a.m);
+    for (int k = i + 1; k < NJ; k++) {
+      Jelly &b = s_j[k];
+      if (!b.live) continue;
+      float dx = b.x - a.x, dy = b.y - a.y, d2 = dx * dx + dy * dy, rr = ra + jR(b.m);
+      if (d2 > (rr + 16.f) * (rr + 16.f) || d2 < 0.01f) continue;
+      float d = sqrtf(d2), nx = dx / d, ny = dy / d;
+      if (d < rr) {
+        float rv = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
+        if (fabsf(rv) < 45.f && a.m + b.m < 14.f && (esp_random() % 1000) < 6) {       // merge (weak tendency)
+          float M = a.m + b.m;
+          a.x = (a.x * a.m + b.x * b.m) / M; a.y = (a.y * a.m + b.y * b.m) / M;
+          a.vx = (a.vx * a.m + b.vx * b.m) / M; a.vy = (a.vy * a.m + b.vy * b.m) / M;
+          a.m = M; a.wob += 1.5f; b.live = false; ra = jR(a.m);
+          continue;
+        }
+        float push = (rr - d) * 9.f;                                          // jelly pressure
+        a.vx -= nx * push * dt * 60.f * b.m / (a.m + b.m); a.vy -= ny * push * dt * 60.f * b.m / (a.m + b.m);
+        b.vx += nx * push * dt * 60.f * a.m / (a.m + b.m); b.vy += ny * push * dt * 60.f * a.m / (a.m + b.m);
+      } else {
+        float pull = 26.f * dt;                                                // weak cohesion
+        a.vx += nx * pull; a.vy += ny * pull; b.vx -= nx * pull; b.vy -= ny * pull;
+      }
+    }
+  }
+  // forces, motion, walls
+  auto td = M5.Touch.getDetail();
+  bool touching = td.isPressed() && td.y > 16 && td.y < H - 18;
+  float G = 330.f;
+  for (int i = 0; i < NJ; i++) {
+    Jelly &b = s_j[i];
+    if (!b.live) continue;
+    b.vx += g_gravX * G * dt; b.vy += g_gravY * G * dt;
+    float st = 34.f + g_level * 110.f + aud::onset * 140.f;                     // the room's sound keeps them stirring
+    if (aud::onset > 0.35f && (esp_random() % 3) == 0) { b.vx += ((int)(esp_random() % 200) - 100) * aud::onset; b.vy -= (60 + esp_random() % 120) * aud::onset; }   // hops on the beat
+    if (b.m > 6.f && (esp_random() % 1000) < (int)(dt * 150.f)) {            // big globs sometimes pinch off a droplet
+      float part = b.m * (0.25f + (esp_random() % 30) / 100.f), a = (esp_random() % 628) / 100.f;
+      if (jSpawn(b.x + cosf(a) * jR(b.m), b.y + sinf(a) * jR(b.m), b.vx + cosf(a) * 90.f, b.vy + sinf(a) * 90.f, part, b.hue + 30.f) >= 0) b.m -= part;
+    }
+    b.vx += sinf(g_t * 1.3f + b.y * 0.03f + i) * st * dt; b.vy += cosf(g_t * 1.1f + b.x * 0.03f) * st * dt;
+    if (touching) {
+      float dx = b.x - td.x, dy = b.y - td.y, d2 = dx * dx + dy * dy + 1.f;
+      if (d2 < 60.f * 60.f) { float d = sqrtf(d2); b.vx += dx / d * 900.f * dt; b.vy += dy / d * 900.f * dt; }
+    }
+    float drag = 1.f - 1.4f * dt; b.vx *= drag; b.vy *= drag;
+    b.x += b.vx * dt; b.y += b.vy * dt;
+    float r = jR(b.m);
+    if (b.x < r) { b.x = r; b.vx = fabsf(b.vx) * 0.45f; }
+    if (b.x > W - r) { b.x = W - r; b.vx = -fabsf(b.vx) * 0.45f; }
+    if (b.y < 15 + r) { b.y = 15 + r; b.vy = fabsf(b.vy) * 0.45f; }
+    if (b.y > H - 15 - r) { b.y = H - 15 - r; b.vy = -fabsf(b.vy) * 0.45f; }
+    b.wob = fmaxf(0.f, b.wob - dt * 2.f);
+  }
+  // draw: liquid bridges first (metaball look), then glossy jelly bodies
+  for (int i = 0; i < NJ; i++) {
+    if (!s_j[i].live) continue;
+    for (int k = i + 1; k < NJ; k++) {
+      if (!s_j[k].live) continue;
+      float dx = s_j[k].x - s_j[i].x, dy = s_j[k].y - s_j[i].y, d = sqrtf(dx * dx + dy * dy);
+      float ri = jR(s_j[i].m), rk = jR(s_j[k].m);
+      if (d < (ri + rk) * 1.15f) {
+        float br = fminf(ri, rk) * (1.15f - d / (ri + rk)) * 1.6f;
+        if (br > 1.5f) canvas.fillCircle((int)((s_j[i].x * rk + s_j[k].x * ri) / (ri + rk)), (int)((s_j[i].y * rk + s_j[k].y * ri) / (ri + rk)), (int)br,
+                                         hsv565(soundHue + s_j[i].hue * 0.3f, 0.75f, 0.55f + g_level * 0.3f));
+      }
+    }
+  }
+  for (int i = 0; i < NJ; i++) {
+    Jelly &b = s_j[i];
+    if (!b.live) continue;
+    float r = jR(b.m) * (1.f + aud::bass * 0.12f + 0.08f * b.wob * sinf(g_t * 20.f));
+    float h = soundHue + b.hue * 0.3f;
+    canvas.fillCircle((int)b.x, (int)b.y, (int)r + 1, hsv565(h + 20.f, 0.9f, 0.3f));
+    canvas.fillCircle((int)b.x, (int)b.y, (int)r, hsv565(h, 0.75f, 0.55f + g_level * 0.3f));
+    canvas.fillCircle((int)(b.x - r * 0.2f), (int)(b.y - r * 0.2f), (int)(r * 0.62f), hsv565(h - 10.f, 0.55f, 0.8f + g_level * 0.2f));
+    canvas.fillCircle((int)(b.x - r * 0.4f), (int)(b.y - r * 0.45f), (int)fmaxf(1.f, r * 0.18f), rgb565(255, 255, 255));
+  }
+  if (touching) drawTinyMantis(td.x, td.y);
+}
+
 static void modeSwarm() {
   canvas.fillSprite(rgb565(8, 4, 16));
   drawPsyBg();
@@ -369,7 +568,7 @@ static void modeSwarm() {
     t.life = (uint8_t)(t.life * 0.88f);
   }
   float gx = 0, gy = 0;
-  if (g_swarmVar == SV_CHAOS) { gx = g_lookX * 0.85f; gy = g_lookY * 0.85f; }
+  if (g_swarmVar == SV_CHAOS) { chaosJelly(); return; }
   if (g_shakeKick) {                                    // shake: the swarm bursts apart
     for (int i = 0; i < N_PART; i++) {
       float a = (esp_random() % 6283) / 1000.f, s = 6.f + (esp_random() % 800) / 100.f;
@@ -452,6 +651,49 @@ static float s_irisHue = 110.f, s_gzX = 0, s_gzY = 0, s_startle = 0, s_angry = 0
 static int s_pokeX = 0, s_pokeY = 0;
 static uint32_t s_pokeAt = 0;
 static const int ERX = 62, ERY = 44;
+
+// ---- cat & dragon irises (long-press B). The basic eye above is untouched. ----
+static void eyeIrisStyled(float ix, float iy) {
+  float slitK = 1.f - clampf(g_level * 1.4f + aud::bass * 0.6f, 0.f, 1.f);   // sound opens the slit, quiet narrows it
+  if (s_eyeStyle == 1) {                                                     // CAT: big amber-green iris, vertical slit
+    int ir = (int)(ERY - 2 + g_peak * 3.f);
+    float h0 = 95.f + sinf(g_t * 0.2f) * 10.f;
+    canvas.fillCircle((int)ix, (int)iy, ir + 2, rgb565(20, 30, 8));
+    for (int k = 0; k < 5; k++)
+      canvas.fillCircle((int)ix, (int)iy, ir - k * (ir / 6), hsv565(h0 - k * 14.f, 0.9f - k * 0.05f, 0.45f + k * 0.12f + g_level * 0.1f));
+    for (int k = 0; k < 36; k++) {                                          // fine fibres
+      float a = k * 0.1745f + g_t * 0.05f;
+      canvas.drawLine((int)(ix + cosf(a) * ir * 0.35f), (int)(iy + sinf(a) * ir * 0.35f), (int)(ix + cosf(a) * (ir - 2)), (int)(iy + sinf(a) * (ir - 2)),
+                      hsv565(h0 + (k % 3) * 8.f, 0.7f, (k & 1) ? 0.85f : 0.5f));
+    }
+    int pw = (int)(3 + (1.f - slitK) * 15.f - s_pain * 2.f), ph = (int)(ir * 0.92f);
+    if (pw < 2) pw = 2;
+    canvas.fillEllipse((int)ix, (int)iy, pw + 2, ph + 1, hsv565(150.f, 0.8f, 0.25f + (1.f - slitK) * 0.3f));   // tapetum glow
+    canvas.fillEllipse((int)ix, (int)iy, pw, ph, rgb565(4, 4, 6));
+    canvas.fillCircle((int)ix - ir / 3, (int)iy - ir / 3, 5, rgb565(255, 255, 255));
+    canvas.fillCircle((int)ix + ir / 3, (int)iy + ir / 4, 2, rgb565(230, 240, 255));
+  } else {                                                                   // DRAGON: molten iris, knife slit, scales
+    int ir = ERY + 4;
+    float fl = 0.5f + 0.5f * sinf(g_t * 9.f) * aud::onset;
+    canvas.fillCircle((int)ix, (int)iy, ir + 2, rgb565(40, 4, 0));
+    for (int k = 0; k < 6; k++)
+      canvas.fillCircle((int)ix, (int)iy, ir - k * (ir / 7), hsv565(8.f + k * 9.f + g_level * 10.f, 1.f - k * 0.06f, 0.35f + k * 0.12f + fl * 0.1f));
+    for (int k = 0; k < 28; k++) {                                          // flame streaks licking outward
+      float a = k * 0.2244f + sinf(g_t * 2.f + k) * 0.05f, fl2 = 0.55f + 0.45f * sinf(g_t * 5.f + k * 1.7f);
+      canvas.drawLine((int)(ix + cosf(a) * 7.f), (int)(iy + sinf(a) * 7.f), (int)(ix + cosf(a) * (ir - 3) * fl2), (int)(iy + sinf(a) * (ir - 3) * fl2),
+                      hsv565(30.f + (k & 1) * 15.f, 0.9f, 1.f));
+    }
+    for (int k = 0; k < 18; k++) {                                          // scale ring
+      float a = k * 0.349f;
+      canvas.drawCircle((int)(ix + cosf(a) * (ir - 1)), (int)(iy + sinf(a) * (ir - 1)), 4, rgb565(90, 20, 4));
+    }
+    float pw = 1.5f + (1.f - slitK) * 5.f - s_pain, ph = ir * 0.95f;
+    if (pw < 1.f) pw = 1.f;
+    canvas.fillTriangle((int)(ix - pw), (int)iy, (int)(ix + pw), (int)iy, (int)ix, (int)(iy - ph), rgb565(2, 0, 0));
+    canvas.fillTriangle((int)(ix - pw), (int)iy, (int)(ix + pw), (int)iy, (int)ix, (int)(iy + ph), rgb565(2, 0, 0));
+    canvas.fillCircle((int)ix - ir / 3, (int)iy - ir / 3, 4, rgb565(255, 240, 200));
+  }
+}
 
 static void spawnTear(float x, float y, float vx, float vy, uint8_t kind) {
   for (auto &t : s_tears) if (t.life <= 0) { t = {x, y, vx, vy, 1.f, kind}; return; }
@@ -574,6 +816,8 @@ static void modeEye() {
       x0 = x1; y0 = y1; r = nr;
     }
   }
+  if (s_eyeStyle != 0) eyeIrisStyled(cx + s_gzX, cy + s_gzY);
+  else {
   // iris with striations, pupil dilates with sound, pinpoints with pain
   float ix = cx + s_gzX, iy = cy + s_gzY;
   int ir = (int)(25 + g_peak * 4.f - s_pain * 3.f);
@@ -592,6 +836,7 @@ static void modeEye() {
   canvas.fillCircle((int)(ix + s_gzX * 0.15f), (int)(iy + s_gzY * 0.15f), pr, rgb565(6, 4, 10));
   canvas.fillCircle((int)ix - 8, (int)iy - 9, 4, rgb565(255, 255, 255));
   canvas.fillCircle((int)ix + 7, (int)iy + 6, 2, rgb565(230, 240, 255));
+  }
 
   // eyelids: arcs that follow the eyeball's curvature; angry slant after pokes
   int lashC = rgb565(15, 8, 20);
@@ -700,8 +945,8 @@ static void tunnelRender(bool dive) {
       fillSlice(s_sl[(s_zi + 255) & 255], pathX(z) + aud::bass * 0.25f * sinf(z * 0.3f), pathY(z));
     }
     // steer: tilt (and drag) moves the camera inside the tube
-    s_camX += (g_flyX * 1.5f + dragX * 8.f) * dt * (1.f + g_level);
-    s_camY += (g_flyY * 1.2f + dragY * 8.f) * dt * (1.f + g_level);
+    s_camX += (g_flyX * 1.9f + dragX * 8.f) * dt * (1.f + g_level * 0.5f);
+    s_camY += (g_flyY * 1.6f + dragY * 8.f) * dt * (1.f + g_level * 0.5f);
     float nx = s_sl[(s_zi + 6) & 255].ox / 50.f, ny = s_sl[(s_zi + 6) & 255].oy / 50.f;
     if (fabsf(g_flyX) + fabsf(g_flyY) < 0.05f) {            // hands level: drift gently back to the middle of the tube
       s_camX += (nx - s_camX) * clampf(dt * 0.5f, 0, 1); s_camY += (ny - s_camY) * clampf(dt * 0.5f, 0, 1);
@@ -715,8 +960,8 @@ static void tunnelRender(bool dive) {
   } else {
     s_tz -= speed * dt;
     int zi = (int)floorf(s_tz);
-    s_bendX += (g_flyX * 1.4f + dragX * 10.f + sinf(g_t * 3.f) * aud::bass * 0.8f) * dt;
-    s_bendY += (g_flyY * 1.1f + dragY * 10.f + cosf(g_t * 2.3f) * aud::mid * 0.6f) * dt;
+    s_bendX += (g_flyX * 1.8f + dragX * 10.f + sinf(g_t * 3.f) * aud::bass * 0.8f) * dt;
+    s_bendY += (g_flyY * 1.5f + dragY * 10.f + cosf(g_t * 2.3f) * aud::mid * 0.6f) * dt;
     s_bendX = clampf(s_bendX, -2.4f, 2.4f); s_bendY = clampf(s_bendY, -2.4f, 2.4f);
     while (s_zi > zi) { s_zi--; fillSlice(s_sl[(s_zi + 2) & 255], s_bendX, s_bendY); }
     s_camX += (s_bendX - s_camX) * clampf(dt * 8.f, 0, 1);
@@ -821,11 +1066,14 @@ static void fractalRender() {
 
   // steer with tilt, rotate with twist, breathe zoom with bass
   float c = cosf(s_frot), s = sinf(s_frot);
-  s_fx += (c * g_flyX - s * g_flyY) * s_fs * 70.f * dt;
-  s_fy += (s * g_flyX + c * g_flyY) * s_fs * 70.f * dt;
+  s_fx += (c * g_flyX - s * g_flyY) * s_fs * 140.f * dt;
+  s_fy += (s * g_flyX + c * g_flyY) * s_fs * 140.f * dt;
+  bool piloting = fabsf(g_flyX) + fabsf(g_flyY) > 0.06f || ptx >= 0;
   s_frot += (g_gz * 0.004f + 0.05f) * dt;
   s_fzoomDir = -1.f;                                   // always diving
-  s_fs *= expf(s_fzoomDir * dt * (0.22f + g_level * 0.5f));
+  static float s_edgeLast = 1000.f;
+  float zoomK = clampf(s_edgeLast / 900.f, 0.12f, 1.f);        // sparse view: hover while the camera finds structure
+  s_fs *= expf(s_fzoomDir * dt * (0.22f + g_level * 0.5f) * zoomK);
   s_fx = clampf(s_fx, -1.8f, 1.8f); s_fy = clampf(s_fy, -1.4f, 1.4f);
   float sc = s_fs * (1.f - aud::bass * 0.12f);
 
@@ -868,14 +1116,24 @@ static void fractalRender() {
   fx::parallel(rows_);
   float detX = detXa[0] + detXa[1], detY = detYa[0] + detYa[1];
   int detN = detNa[0] + detNa[1], inN = inNa[0] + inNa[1], loN = loNa[0] + loNa[1];
-  // demo trick: the camera is attracted to where the detail is, so exploring never sinks into a void
-  if (detN > 30) {
-    float mx = detX / detN - 80.f, my = detY / detN - 60.f;
-    s_fx += (ux * mx + vx * my) * dt * 0.6f; s_fy += (uy * mx + vy * my) * dt * 0.6f;
+  // how much is actually VISIBLE: count edges on the frame (a flat field can sit at any escape depth)
+  int edgeN = 0; float edgeX = 0, edgeY = 0;
+  for (int y = 1; y < fx::LH - 1; y += 2) {
+    const uint8_t *r = fx::buf + y * fx::LW;
+    for (int x = 1; x < fx::LW - 1; x += 2) {
+      int d = abs((int)r[x] - (int)r[x + 1]) + abs((int)r[x] - (int)r[x + fx::LW]);
+      if (d > 10) { edgeN++; edgeX += x; edgeY += y; }
+    }
+  }
+  s_edgeLast = (float)edgeN;
+  // demo trick: the camera is drawn to where the structure is, so exploring never sinks into a void
+  if (edgeN > 40 && !piloting) {                       // only when you let go of the controls
+    float mx = edgeX / edgeN - 80.f, my = edgeY / edgeN - 60.f;
+    s_fx += (ux * mx + vx * my) * dt * 0.9f; s_fy += (uy * mx + vy * my) * dt * 0.9f;
   }
   // too deep for float precision, or lost in a void: the dive loops into a new world
-  s_empty = (inN > 16000 || loN > 16000 || detN < 60) ? s_empty + dt : fmaxf(0.f, s_empty - dt);
-  if (s_fs < 3e-6f || s_empty > 1.2f) {
+  s_empty = (edgeN < 260 || inN > 15000) ? s_empty + dt : fmaxf(0.f, s_empty - dt * 0.5f);
+  if (s_fs < 3e-6f || s_empty > 0.6f) {
     memcpy(fx::back, fx::buf, fx::LW * fx::LH);
     s_preset = (s_preset + 1 + (esp_random() % 3)) % 8;
     s_crP = s_cr0 = PRESETS[s_preset][0]; s_ciP = s_ci0 = PRESETS[s_preset][1]; s_cTr = 1.f;
@@ -946,11 +1204,31 @@ static void portalRender() {
   float speed = 0.45f + aud::bass * 1.3f + g_level * 0.6f + aud::onset * 0.8f;
   auto td = M5.Touch.getDetail();
   float steerX = g_flyX, steerY = g_flyY;
-  if (td.isPressed() && td.y > 14 && td.y < H - 14) { steerX = (td.x - 160) / 90.f; steerY = (td.y - 120) / 70.f; }
+  static int pdx = -1, pdy = -1;
+  static float s_svx = 0, s_svy = 0;                             // ship velocity (world units / s)
+  if (td.isPressed() && td.y > 14 && td.y < H - 14) {
+    steerX += (td.x - 160) / 80.f; steerY += (td.y - 120) / 60.f;   // hold: fly toward your finger
+    if (pdx >= 0) { s_pcx -= (td.x - pdx) * 0.006f; s_pcy -= (td.y - pdy) * 0.006f; }   // drag: grab the space and pull it
+    pdx = td.x; pdy = td.y;
+  } else pdx = -1;
 #ifdef PORTAL_AUTOPILOT
   { float ax_ = s_portal ? s_ptx - s_pcx : s_hx - s_pcx, ay_ = s_portal ? s_pty - s_pcy : s_hy - s_pcy; steerX = clampf(ax_ * 3.f, -1.f, 1.f); steerY = clampf(ay_ * 3.f, -1.f, 1.f); }
 #endif
-  s_pcx += steerX * dt * 0.9f; s_pcy += steerY * dt * 0.9f;
+#ifdef PORTAL_TILTPILOT
+  {   // test pilot: tilts the DEVICE toward what it sees, like a person would (goes through the real IMU path)
+    extern m5_imu_data_t g_mockImu;
+    float ox_ = s_portal ? s_ptx - s_pcx : s_hx - s_pcx, oy_ = s_portal ? s_pty - s_pcy : s_hy - s_pcy;
+    float rx = clampf(ox_ * 1.2f, -TP_MAX, TP_MAX), ry = clampf(oy_ * 1.2f, -TP_MAX, TP_MAX);   // max tilt (radians)
+    g_mockImu.accel = {-sinf(rx), sinf(ry), cosf(rx) * cosf(ry)};
+  }
+#endif
+  s_svx += (clampf(steerX, -3.f, 3.f) * 0.75f - s_svx) * clampf(dt * 5.f, 0.f, 1.f);
+  s_svy += (clampf(steerY, -3.f, 3.f) * 0.75f - s_svy) * clampf(dt * 5.f, 0.f, 1.f);
+  s_pcx += s_svx * dt; s_pcy += s_svy * dt;
+  if (s_hoopAlive && s_hz < 1.4f) {                              // close to a hoop and nearly lined up: a gentle nudge
+    float ox = s_hx - s_pcx, oy = s_hy - s_pcy;
+    if (ox * ox + oy * oy < 0.3f * 0.3f) { s_pcx += ox * dt * 1.2f; s_pcy += oy * dt * 1.2f; }
+  }
 
   // ---- this dimension: feedback streaks + nebula + stars ----
   fx::swap();
@@ -1006,8 +1284,8 @@ static void portalRender() {
     float ox = s_hx - s_pcx, oy = s_hy - s_pcy;
     if (s_hz < 0.18f) {
       bool in = ox * ox + oy * oy < 0.34f * 0.34f;
-      if (in) { s_hoopN++; s_hoopFlash = 1.f; hapGesture(s_hoopN >= 3 ? HG_CHAIN : HG_THREAD); } else { s_hoopN = 0; hapGesture(HG_MISS); }
-#ifdef PORTAL_AUTOPILOT
+      if (in) { s_hoopN++; s_hoopFlash = 1.f; hapGesture(s_hoopN >= 3 ? HG_CHAIN : HG_THREAD); stats::event(stats::EV_HOOP); } else { s_hoopN = 0; hapGesture(HG_MISS); }
+#if defined(PORTAL_AUTOPILOT) || defined(PORTAL_TILTPILOT)
       printf("t=%.1f hoop %s (off %.2f,%.2f) chain=%d\n", millis() / 1000.f, in ? "THREAD" : "miss", ox, oy, s_hoopN);
 #endif
       s_hoopAlive = false; s_hoopNext = millis() + 900;
@@ -1028,7 +1306,7 @@ static void portalRender() {
   if (s_portal) {
     s_ptz -= dt * (0.30f + speed * 0.18f);
     float ox = s_ptx - s_pcx, oy = s_pty - s_pcy;
-    if (s_ptz < 1.6f) { s_pcx += ox * dt * 0.8f; s_pcy += oy * dt * 0.8f; }       // gentle aim assist
+    if (s_ptz < 2.0f && ox * ox + oy * oy < 0.6f * 0.6f) { s_pcx += ox * dt * 1.2f; s_pcy += oy * dt * 1.2f; }   // aim assist once it's close
     float px = 80.f + ox / s_ptz * 30.f, py = 60.f + oy / s_ptz * 30.f;          // lores
     float r = 13.f / s_ptz * (1.f + aud::bass * 0.12f);
     bool aligned = ox * ox + oy * oy < 0.45f * 0.45f;
@@ -1054,7 +1332,8 @@ static void portalRender() {
         memcpy(s_dimP, s_nextP, sizeof(s_dimP)); rollDim(s_nextP); s_dim++;
         s_emerge = 0.f; s_hoopN = 0; s_portal = false; s_hoopNext = millis() + 2500;
         hapCut(350);                                                     // ...and then: silence. we're through.
-#ifdef PORTAL_AUTOPILOT
+        stats::event(stats::EV_PORTAL);
+#if defined(PORTAL_AUTOPILOT) || defined(PORTAL_TILTPILOT)
         printf("t=%.1f THROUGH PORTAL -> dim %d\n", millis() / 1000.f, s_dim);
 #endif
       } else { s_ptz = 4.2f; s_ptx = s_pcx + ((int)(esp_random() % 120) - 60) / 100.f; s_pty = s_pcy; hapGesture(HG_MISS); }
@@ -1081,7 +1360,12 @@ static void portalRender() {
   }
 
   // ---- HUD: aim point, hoop chain, dimension ----
-  canvas.drawCircle(160, 120, 6, rgb565(255, 255, 220));
+  {
+    int rx = 160 + (int)(s_svx * 22.f), ry = 120 + (int)(s_svy * 22.f);   // the ship leans where you steer
+    canvas.drawLine(160, 120, rx, ry, wire::TEAL);
+    canvas.drawCircle(rx, ry, 6, rgb565(255, 255, 220));
+    canvas.drawCircle(160, 120, 2, wire::PLUM);
+  }
   float tx = 0, ty = 0; bool target = false;
   if (s_portal) { tx = s_ptx - s_pcx; ty = s_pty - s_pcy; target = true; }
   else if (s_hoopAlive) { tx = s_hx - s_pcx; ty = s_hy - s_pcy; target = true; }
@@ -1328,14 +1612,14 @@ static void modePulse() {
 //  chrome, modes, buttons
 // ============================================================
 static void drawChrome() {
-  static const char *names[] = {"swarm", "eye", "tunnel", "pulse", "calm", "mantis"};
+  static const char *names[] = {"swarm", "eye", "tunnel", "pulse", "calm", "mantis", "rooms", "garden", "meditate"};
   canvas.fillRect(0, 0, W, 13, rgb565(3, 10, 12));
   canvas.fillRect(0, H - 13, W, 13, rgb565(3, 10, 12));
   canvas.drawFastHLine(0, 13, W, wire::PLUM); canvas.drawFastHLine(0, H - 14, W, wire::PLUM);
   canvas.drawFastHLine(0, 13, (int)(W * clampf(g_level, 0.f, 1.f)), wire::LIME);            // live mic meter
   canvas.setTextSize(1);
   canvas.setTextColor(wire::LIME); canvas.setCursor(8, 3); canvas.print("synapse");
-  canvas.setTextColor(rgb565(40, 190, 180)); canvas.setCursor(64, 3); canvas.print(names[g_mode]);
+  canvas.setTextColor(rgb565(40, 190, 180)); canvas.setCursor(64, 3); canvas.print(g_mode == MODE_ROOMS ? roomsName() : (g_mode == MODE_GARDEN ? gardenName() : names[g_mode]));
   int orb = 2 + (int)(g_level * 5.f + g_peak * 3.f);
   if (orb > 6) orb = 6;
   canvas.fillCircle(W - 12, 6, orb + 1, wire::PLUM);
@@ -1347,33 +1631,51 @@ static void drawChrome() {
     case MODE_EYE: bl = g_eyeTrack ? "gaze" : "stare"; break;
     case MODE_TUNNEL: { static const char *v[] = {"dive", "recede", "fractal", "portal"}; bl = v[g_tunnelMode]; break; }
     case MODE_PULSE: { static const char *v[] = {"bloom", "kaleido", "star", "phase", "synesthesia"}; bl = v[g_pulsePat]; break; }
-    case MODE_MANTIS: bl = g_mantisSing ? "sing" : "dance"; break;
+    case MODE_MANTIS: bl = g_mantisMode == 2 ? "echo" : (g_mantisSing ? "sing" : "dance"); break;
+    case MODE_GARDEN: bl = "switch"; break;
+    case MODE_MEDITATE: bl = "begin / end"; break;
     case MODE_CALM: bl = calmName(); break;
+    case MODE_ROOMS: bl = "next"; break;
     default: break;
   }
   canvas.setTextColor(hsv565(g_hue, 0.35f, 0.55f));
   canvas.setCursor(10, H - 10); canvas.print("<");
-  canvas.setTextColor(wire::LIME);
+  canvas.setTextColor(g_mode == MODE_ROOMS && !roomsSolved() ? rgb565(55, 60, 70) : wire::LIME);   // greyed until solved
   canvas.setCursor(W / 2 - (int)strlen(bl) * 3, H - 10); canvas.print(bl);
   canvas.setTextColor(hsv565(g_hue, 0.35f, 0.55f));
   canvas.setCursor(W - 16, H - 10); canvas.print(">");
 }
 
 static void nextMode(int dir) {
+  if (g_mode == MODE_MEDITATE) medLeave();
+  if (g_mode == MODE_MANTIS) aud::echo(false);
   int m = ((int)g_mode + dir + MODE_COUNT) % MODE_COUNT;
   g_mode = (Mode)m;
   fx::clear(0);
   hap(100, 25);
+  if (g_mode == MODE_TUNNEL) flightPoseSoon();
+  if (g_mode == MODE_ROOMS) roomsEnter();                 // always starts back at Mantis NRG
+  if (g_mode == MODE_MEDITATE) medEnter();
+  if (g_mode == MODE_MANTIS && g_mantisMode == 2) aud::echo(true);
+  stats::save();
 }
 
 static void btnBShort() {
   switch (g_mode) {
     case MODE_SWARM: g_swarmVar = (SwarmVar)((g_swarmVar + 1) % SV_COUNT); break;
     case MODE_EYE: g_eyeTrack = !g_eyeTrack; break;
-    case MODE_TUNNEL: g_tunnelMode = (TunnelMode)((g_tunnelMode + 1) % TM_COUNT); fx::clear(0); break;
+    case MODE_TUNNEL: g_tunnelMode = (TunnelMode)((g_tunnelMode + 1) % TM_COUNT); fx::clear(0); flightPoseSoon(); break;
     case MODE_PULSE: g_pulsePat = (g_pulsePat + 1) % PP_COUNT; break;
-    case MODE_MANTIS: g_mantisSing = !g_mantisSing; if (g_mantisSing) aud::calibrateAmbient(3000.f); break;
+    case MODE_MANTIS:
+      g_mantisMode = (uint8_t)((g_mantisMode + 1) % 3);
+      g_mantisSing = g_mantisMode != 0;
+      aud::echo(g_mantisMode == 2);
+      if (g_mantisMode == 1) aud::calibrateAmbient(3000.f);
+      break;
+    case MODE_GARDEN: gardenNext(); break;
+    case MODE_MEDITATE: medButton(); break;
     case MODE_CALM: calmNext(); break;
+    case MODE_ROOMS: if (roomsSolved()) { roomsNext(); stats::event(stats::EV_ROOM); hapGesture(HG_THREAD); } else hap(35, 12); break;
     default: break;
   }
   hap(90, 20);
@@ -1426,6 +1728,9 @@ void setup() {
   fx::begin();
   mantisBegin();
   calmBegin();
+  roomsBegin();
+  stats::begin();
+  gardenBegin();
   seedParticles();
   aud::begin();
   if (s_double) {
@@ -1446,6 +1751,7 @@ void loop() {
   aud::service(g_dt);
   sampleImu();
   calService();
+  stats::tick(g_dt, g_mode == MODE_CALM || g_mode == MODE_GARDEN || g_mode == MODE_MEDITATE);
   g_level = aud::level; g_peak = aud::peak;
   for (int i = 0; i < MIC_N; i++) g_mic[i] = aud::scope[i * 2];
 
@@ -1459,12 +1765,20 @@ void loop() {
     case MODE_PULSE: modePulse(); break;
     case MODE_CALM: calmDraw(); break;
     case MODE_MANTIS: mantisDraw(g_mantisSing); break;
+    case MODE_ROOMS: roomsDraw(); break;
+    case MODE_GARDEN: gardenDraw(); break;
+    case MODE_MEDITATE: medDraw(); break;
     default: break;
   }
   g_shakeKick = false;
   drawChrome();
   drawCal();
-  if (g_mode == MODE_MANTIS && g_mantisSing && aud::calibrating()) {
+  if (g_mode == MODE_MANTIS && g_mantisMode == 2) {
+    int st = aud::echoState();
+    if (st == 1) { canvas.fillCircle(W / 2 - 40, 24, 4, rgb565(255, 60, 60)); canvas.setTextColor(rgb565(255, 120, 120)); canvas.setCursor(W / 2 - 32, 20); canvas.print("hearing you"); }
+    else if (st == 0) { canvas.setTextColor(rgb565(120, 130, 140)); canvas.setCursor(W / 2 - 42, 20); canvas.print("say something..."); }
+  }
+  if (g_mode == MODE_MANTIS && g_mantisMode == 1 && aud::calibrating()) {
     canvas.setTextColor(wire::LIME); canvas.setCursor(W / 2 - 51, 20); canvas.print("listening to the room");
   }
   present();

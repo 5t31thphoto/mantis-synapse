@@ -22,15 +22,18 @@ extern float g_level, g_peak;          // 0..~1.5 audio energy (mic OR drum loop
 extern float g_lookX, g_lookY;         // tilt, -1.1..1.1
 extern int16_t g_mic[MIC_N];           // scope for PULSE
 extern bool g_shakeKick;
-extern float g_flyX, g_flyY;           // flight steering: tilt from the calibrated neutral, deadzoned
-extern float g_gravX, g_gravY;         // gravity in screen space (downhill)               // true for one frame after a shake
+extern float g_flyX, g_flyY;           // flight steering: rotation away from your held pose (grows with tilt)
+void flightPoseSoon();                 // centre flight steering on the current grip once still
+extern float g_gravX, g_gravY;
+extern float g_gravZ, g_jolt;           // gravity into the screen (1 = flat), instantaneous jolt in g
+extern float g_gyroX, g_gyroY, g_gyroZ; // deg/s         // gravity in screen space (downhill)               // true for one frame after a shake
 
 // ---- haptics (main thread only; non-blocking) ----
 void hap(uint8_t level, uint16_t ms);
 void kickSubHaptic();
 void hapRumble(float amount, float rateHz, float grit);   // continuous layer; call every frame while it should play
 void hapGesture(uint8_t id);                              // designed envelopes:
-enum : uint8_t { HG_THREAD = 0, HG_CHAIN, HG_MISS, HG_THUNDER, HG_SETTLE, HG_REBIRTH, HG_PAIN };
+enum : uint8_t { HG_THREAD = 0, HG_CHAIN, HG_MISS, HG_THUNDER, HG_SETTLE, HG_REBIRTH, HG_PAIN, HG_CRACK, HG_LUBDUB, HG_THREE };
 void hapCut(uint16_t quietMs);                            // instant silence, held for quietMs
 
 // ---- colour helpers ----
@@ -65,3 +68,24 @@ void calmNext();                       // B: next room
 void calmLongPress();                  // long-press: this room's variant
 void calmTouch(int x, int y, bool down);
 const char *calmName();
+// rooms.cpp — the puzzle rooms (always start at Mantis NRG)
+void roomsBegin();
+void roomsEnter();
+void roomsDraw();
+void roomsTouch(int x, int y);
+bool roomsSolved();
+void roomsNext();
+const char *roomsName();
+// garden.cpp — crystal + succulent gardens (grow from the hidden stats)
+void gardenBegin();
+void gardenDraw();
+void gardenNext();
+void gardenTouch(int x, int y);
+const char *gardenName();
+// meditate.cpp — the mantis meditation
+void medEnter();
+void medLeave();
+void medDraw();
+void medButton();
+void medTouch(int x, int y);
+void medSample(float ax, float ay, float az, float dt);

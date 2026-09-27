@@ -22,4 +22,10 @@ bool speakerLive();                    // true only while an sfx is sounding
 void sfx(float pitch);                 // comic squeak
 void calibrateAmbient(float cap = 1000.f);   // listen ~0.9 s to learn the room's noise floor (capped)
 bool calibrating();
+void playBuf(const int16_t *d, int n, uint32_t rate, uint8_t vol);   // borrow the speaker for a buffer
+void bell(int which, uint8_t vol);     // singing-bowl bells 0..2
+void speakerHold(bool on);             // keep the speaker (mic off) - meditation
+void echo(bool on);                    // yakback: records when you talk, plays you back funny
+int echoState();                       // 0 listening, 1 recording, 2 playing
+int echoFx();                          // 0 chipmunk, 1 monster, 2 backwards
 }
