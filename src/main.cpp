@@ -194,26 +194,24 @@ static void drawTrails() {
 
 // Soft reactive backdrop — plasma / moire wash (not a full-screen storm)
 static void drawPsyBg() {
-  float base = 0.06f + g_level * 0.08f + g_peak * 0.04f;
-  // horizontal reactive bands
-  for (int y = 14; y < H - 14; y += 6) {
-    float wiggle = sinf(y * 0.04f + g_t * 1.2f + g_ax) * 0.5f
-                 + cosf(y * 0.07f - g_t * 0.8f + g_ay * 2.f) * 0.5f;
-    float v = base + wiggle * 0.05f + g_level * 0.04f * sinf(y * 0.1f + g_t * 3.f);
-    if (v < 0.02f) v = 0.02f;
-    if (v > 0.22f) v = 0.22f;
-    uint16_t c = hsv565(g_hue + y * 0.4f + g_t * 12.f, 0.55f, v);
-    canvas.drawFastHLine(0, y, W, c);
-    if ((y & 15) == 0)
-      canvas.drawFastHLine(0, y + 1, W, hsv565(g_hue + 40.f + y * 0.2f, 0.4f, v * 0.7f));
-  }
-  // sparse vertical shimmer from mid energy
-  for (int x = 0; x < W; x += 20) {
-    float v = 0.04f + g_peak * 0.1f * (0.5f + 0.5f * sinf(x * 0.05f + g_t * 2.f));
-    canvas.drawFastVLine(x + (int)(sinf(g_t + x) * 3), 14, H - 28,
-                         hsv565(g_hue + 90.f, 0.5f, v));
+  // Dense swirling plasma — not a sparse grid
+  float t1 = g_t * 1.1f + g_lookX * 1.8f;
+  float t2 = g_t * 0.85f - g_lookY * 1.6f;
+  float boil = 1.f + g_level * 2.5f + g_peak * 1.5f;
+  for (int y = 14; y < H - 14; y += 2) {
+    for (int x = 0; x < W; x += 3) {
+      float u = x * 0.028f + t1;
+      float v = y * 0.032f + t2;
+      float n = sinf(u * boil + sinf(v * 1.4f + g_t))
+              + cosf(v * 1.2f - u * 0.8f + g_peak * 4.f)
+              + sinf((u + v) * 0.55f - g_t * 0.6f + g_lookX);
+      float bri = 0.07f + 0.14f * (0.5f + 0.5f * n) + g_level * 0.1f;
+      if (bri > 0.38f) bri = 0.38f;
+      canvas.fillRect(x, y, 3, 2, hsv565(g_hue + n * 50.f + y * 0.25f + g_t * 10.f, 0.75f, bri));
+    }
   }
 }
+
 
 
 static void drawTinyMantis(M5Canvas &c, int cx, int cy) {
@@ -547,118 +545,126 @@ static void modeEye() {
 
 static void modeTunnel() {
   static float z = 0;
-  float speed = 0.09f + g_level * 0.18f + g_peak * 0.06f;
+  static float fcx = -0.743643887037151f; // interesting mandelbrot point
+  static float fcy = 0.131825904205312f;
+  float speed = 0.1f + g_level * 0.2f + g_peak * 0.08f;
 
-  // DIVE: move forward into tunnel (rings expand outward from center)
-  // RECEDE: reverse (rings shrink inward)
-  // FRACTAL / PORTAL: use dive-style motion under the effect
+  // Dive forward vs recede: opposite z
   if (g_tunnelMode == TM_RECEDE) z -= speed;
   else z += speed;
 
-  // Soft starfield parallax — NOT full-screen horizontal bars
-  for (int i = 0; i < 40; i++) {
-    float sx = fmodf(i * 73.1f + g_lookX * 50.f + g_t * (8.f + (i % 5)), (float)W);
-    float sy = fmodf(i * 51.7f + g_lookY * 40.f + 14.f, (float)(H - 28)) + 14.f;
-    float bri = 0.08f + 0.1f * (0.5f + 0.5f * sinf(i + g_t * 0.7f)) + g_peak * 0.08f;
-    canvas.fillCircle((int)sx, (int)sy, 1, hsv565(g_hue + 100.f + i * 7.f, 0.55f, bri));
-  }
-
-  float spin = g_t * 0.2f + g_lookX * 1.8f;
-  int cx = W / 2 + (int)(g_lookX * -50.f);
-  int cy = H / 2 + (int)(g_lookY * 40.f);
+  float spin = g_t * 0.25f + g_lookX * 1.6f;
+  int cx = W / 2 + (int)(g_lookX * -45.f);
+  int cy = H / 2 + (int)(g_lookY * 38.f);
 
   if (g_tunnelMode == TM_FRACTAL) {
-    // Continuous zoom mandelbrot — detail scales with z, does not "reset"
-    float zoom = expf(fmodf(z * 0.15f, 4.f)); // smooth zoom in
-    float panX = g_lookX * 0.35f - 0.5f;
-    float panY = g_lookY * 0.25f;
-    for (int iy = 16; iy < H - 16; iy += 2) {
+    // REAL fractal dive: continuous log-zoom into the set; IMU steers the target
+    fcx += g_lookX * 0.00015f / (1.f + z * 0.01f);
+    fcy += g_lookY * 0.00012f / (1.f + z * 0.01f);
+    // zoom grows — you fall INTO detail
+    float zoom = expf(z * 0.12f);
+    // audio perturbs palette and slight zoom pulse
+    zoom *= 1.f + g_level * 0.08f;
+
+    for (int iy = 14; iy < H - 14; iy += 2) {
       for (int ix = 0; ix < W; ix += 2) {
-        float u = (ix - W * 0.5f) / (W * 0.25f * zoom) + panX;
-        float v = (iy - H * 0.5f) / (H * 0.25f * zoom) + panY;
-        float zr = 0, zi = 0;
+        // map pixel → complex plane around (fcx,fcy)
+        float u = (ix - W * 0.5f) / (0.35f * W * zoom) + fcx;
+        float v = (iy - H * 0.5f) / (0.35f * H * zoom) + fcy;
+        float zr = 0.f, zi = 0.f;
         int k;
-        for (k = 0; k < 18; k++) {
+        const int maxIt = 24;
+        for (k = 0; k < maxIt; k++) {
           float zr2 = zr * zr - zi * zi + u;
           zi = 2.f * zr * zi + v;
           zr = zr2;
           if (zr * zr + zi * zi > 4.f) break;
         }
-        if (k > 1) {
-          canvas.fillRect(ix, iy, 2, 2,
-            hsv565(g_hue + k * 18.f + z * 8.f + g_level * 40.f, 0.95f, 0.12f + k * 0.045f));
+        if (k >= maxIt) {
+          canvas.fillRect(ix, iy, 2, 2, rgb565(0, 0, 0));
+        } else {
+          // smooth-ish color by escape iteration — bands move as you dive
+          float mu = (float)k + 1.f - logf(logf(sqrtf(zr * zr + zi * zi) + 1e-6f)) / logf(2.f);
+          float hue = g_hue + mu * 12.f + z * 3.f + g_level * 30.f;
+          float bri = 0.2f + 0.55f * (k / (float)maxIt) + g_peak * 0.15f;
+          canvas.fillRect(ix, iy, 2, 2, hsv565(hue, 0.9f, bri));
         }
       }
     }
-  } else if (g_tunnelMode != TM_PORTAL) {
-    // Classic tunnel rings
-    // depth 0 = at camera (huge), depth max = far (tiny)
-    // As z increases (dive), a fixed ring's depth decreases → grows → DIVE IN
-    const float period = 10.f;
-    for (int ring = 0; ring < 18; ring++) {
-      float depth = fmodf(z + ring * (period / 18.f), period);
-      if (depth < 0.05f) depth = 0.05f;
-      // dive: small depth = near = large radius
-      float rad = (140.f + g_level * 30.f) / depth;
-      float lobe = 1.f + g_peak * 0.25f * sinf(ring + g_t * 2.f);
+    // crosshair for "steering" the dive
+    canvas.drawLine(cx - 6, cy, cx + 6, cy, rgb565(255, 255, 180));
+    canvas.drawLine(cx, cy - 6, cx, cy + 6, rgb565(255, 255, 180));
+  } else {
+    // Psychedelic corridor walls behind the tube
+    drawPsyBg();
+
+    // Perspective tunnel: depth 0 = near (large), depth high = far (small)
+    // As z increases (dive), each ring's depth falls → radius grows → walls
+    // rush outward = flying INTO the tunnel.
+    const float period = 12.f;
+    int rings = 20;
+    for (int ring = 0; ring < rings; ring++) {
+      float depth = fmodf(z * 1.1f + ring * (period / rings), period);
+      if (depth < 0.12f) depth = 0.12f;
+      float rad = (160.f + g_level * 40.f) / depth;
+      float lobe = 1.f + g_peak * 0.3f * sinf(ring * 0.8f + g_t * 2.5f);
       rad *= lobe;
-      uint16_t c = hsv565(g_hue + ring * 14.f + g_t * 20.f, 0.9f,
-                          0.15f + (1.f - depth / period) * 0.5f + g_level * 0.2f);
-      int sides = 6;
+      // strip width for solid wall feel
+      float rad2 = (160.f + g_level * 40.f) / (depth + period / rings);
+      uint16_t c = hsv565(g_hue + ring * 11.f + g_t * 18.f + depth * 8.f,
+                          0.85f, 0.18f + (1.f - depth / period) * 0.55f);
+      int sides = 8;
       for (int k = 0; k < sides; k++) {
         float a0 = spin + k * (2.f * (float)M_PI / sides);
         float a1 = spin + (k + 1) * (2.f * (float)M_PI / sides);
-        canvas.drawLine(
-          cx + (int)(cosf(a0) * rad), cy + (int)(sinf(a0) * rad * 0.82f),
-          cx + (int)(cosf(a1) * rad), cy + (int)(sinf(a1) * rad * 0.82f), c);
+        int x0 = cx + (int)(cosf(a0) * rad);
+        int y0 = cy + (int)(sinf(a0) * rad * 0.8f);
+        int x1 = cx + (int)(cosf(a1) * rad);
+        int y1 = cy + (int)(sinf(a1) * rad * 0.8f);
+        canvas.drawLine(x0, y0, x1, y1, c);
+        // rib to next depth for tube volume
+        float a = a0;
+        int x2 = cx + (int)(cosf(a) * rad2 * lobe);
+        int y2 = cy + (int)(sinf(a) * rad2 * lobe * 0.8f);
+        canvas.drawLine(x0, y0, x2, y2, hsv565(g_hue + 40.f + ring * 5.f, 0.7f, 0.12f + g_level * 0.2f));
       }
     }
-  }
 
-  if (g_tunnelMode == TM_PORTAL) {
-    // Still show faint dive rings under portals
-    const float period = 10.f;
-    for (int ring = 0; ring < 12; ring++) {
-      float depth = fmodf(z + ring * (period / 12.f), period);
-      if (depth < 0.08f) depth = 0.08f;
-      float rad = 100.f / depth;
-      uint16_t c = hsv565(g_hue + ring * 10.f, 0.5f, 0.1f + g_level * 0.15f);
-      canvas.drawCircle(cx, cy, (int)rad, c);
-    }
-    if (millis() - g_portalSpawn > 2200) {
-      g_portalSpawn = millis();
-      g_portalX = (float)((rand() % 160) - 80);
-      g_portalY = (float)((rand() % 100) - 50);
-      g_portalZ = 5.f;
-    }
-    g_portalZ -= 0.09f + g_level * 0.05f;
-    float sc = 80.f / (g_portalZ + 0.5f);
-    int px = W / 2 + (int)(g_portalX + g_lookX * -40.f);
-    int py = H / 2 + (int)(g_portalY + g_lookY * 30.f);
-    int rad = (int)sc;
-    for (int r = 0; r < 4; r++)
-      canvas.drawCircle(px, py, rad - r * 3,
-                        hsv565(280 + r * 20.f + g_t * 30.f, 1.f, 0.5f + g_peak * 0.4f));
-    canvas.drawLine(cx - 8, cy, cx + 8, cy, rgb565(255, 255, 100));
-    canvas.drawLine(cx, cy - 8, cx, cy + 8, rgb565(255, 255, 100));
-    float dx = (float)(px - cx), dy = (float)(py - cy);
-    if (g_portalZ < 1.2f) {
-      if (dx * dx + dy * dy < 28.f * 28.f) {
-        g_portalCombo++;
-        g_portalSpawn = 0;
-        hap(120, 30);
-      } else if (g_portalZ < 0.4f) {
-        g_portalCombo = 0;
-        g_portalSpawn = 0;
+    if (g_tunnelMode == TM_PORTAL) {
+      if (millis() - g_portalSpawn > 2000) {
+        g_portalSpawn = millis();
+        g_portalX = (float)((rand() % 140) - 70);
+        g_portalY = (float)((rand() % 90) - 45);
+        g_portalZ = 5.5f;
       }
+      g_portalZ -= 0.1f + g_level * 0.05f;
+      float sc = 90.f / (g_portalZ + 0.4f);
+      int px = cx + (int)(g_portalX * 0.5f);
+      int py = cy + (int)(g_portalY * 0.5f);
+      for (int r = 0; r < 5; r++)
+        canvas.drawCircle(px, py, (int)sc - r * 3,
+                          hsv565(300 + r * 15.f + g_t * 40.f, 1.f, 0.55f + g_peak * 0.35f));
+      canvas.drawLine(cx - 8, cy, cx + 8, cy, rgb565(255, 255, 120));
+      canvas.drawLine(cx, cy - 8, cx, cy + 8, rgb565(255, 255, 120));
+      float dx = (float)(px - cx), dy = (float)(py - cy);
+      if (g_portalZ < 1.3f) {
+        if (dx * dx + dy * dy < 30.f * 30.f) {
+          g_portalCombo++;
+          g_portalSpawn = 0;
+          hap(130, 35);
+        } else if (g_portalZ < 0.35f) {
+          g_portalCombo = 0;
+          g_portalSpawn = 0;
+        }
+      }
+      canvas.setTextColor(rgb565(255, 220, 90));
+      canvas.setCursor(8, 18);
+      canvas.printf("COMBO %d", g_portalCombo);
     }
-    canvas.setTextColor(rgb565(255, 220, 80));
-    canvas.setCursor(8, 20);
-    canvas.printf("COMBO %d", g_portalCombo);
-  }
 
-  canvas.fillCircle(cx, cy, 2 + (int)(g_level * 8),
-                    hsv565(g_hue + g_t * 40.f, 0.9f, 0.5f + g_peak * 0.4f));
+    canvas.fillCircle(cx, cy, 2 + (int)(g_level * 10),
+                      hsv565(g_hue + g_t * 50.f, 1.f, 0.55f + g_peak * 0.4f));
+  }
 }
 
 static void modePulse() {
@@ -1163,20 +1169,9 @@ static void modeMantis() {
       }
     }
 
-    // Side spectrum ears — optional small bars beside head (avatar style)
-    for (int b = 0; b < 6; b++) {
-      float e = 0;
-      int i0 = b * MIC_N / 6, i1 = (b + 1) * MIC_N / 6;
-      for (int i = i0; i < i1; i++) e += fabsf((float)g_mic[i]);
-      e /= (i1 - i0) * 7000.f;
-      if (e > 1.2f) e = 1.2f;
-      int bh = (int)(e * 28.f);
-      int by = (int)headY - bh / 2;
-      canvas.fillRect(cx - 48 - b * 3, by, 2, bh, hsv565(g_hue + b * 20.f, 0.8f, 0.4f + e * 0.4f));
-      canvas.fillRect(cx + 46 + b * 3, by, 2, bh, hsv565(g_hue + b * 20.f, 0.8f, 0.4f + e * 0.4f));
-    }
   }
 }
+
 
 static void drawChrome() {
   static const char *names[] = {"SWARM", "EYE", "TUNNEL", "PULSE", "DRUM", "MANTIS"};
