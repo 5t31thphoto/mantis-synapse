@@ -1,5 +1,5 @@
 // ============================================================
-//  SYNAPSE — mantis psychedelic fidget for M5Stack Core2
+//  SYNAPSE v3 — mantis psychedelic fidget for M5Stack Core2
 //  Mic + IMU + touch + haptic via M5Unified. Double-buffered.
 // ============================================================
 #include <M5Unified.h>
@@ -11,35 +11,52 @@
 #include "mantis_splash.h"
 
 static const int W = 320, H = 240;
-static const int N_PART = 64;
+static const int N_PART = 72;
+static const int N_TRAIL = 96;
 static const int MIC_N = 128;
-static const int LOOP_MAX = 48;
+static const int LOOP_MAX = 64;
 
 enum Mode : uint8_t {
   MODE_SWARM = 0, MODE_EYE, MODE_TUNNEL, MODE_PULSE, MODE_DRUM, MODE_COUNT
 };
-
 enum SwarmVar : uint8_t { SV_FLOCK = 0, SV_ORBIT, SV_CHAOS, SV_COUNT };
+enum PulsePat : uint8_t {
+  PP_WAVE = 0, PP_MIRROR, PP_STAR, PP_RIBBON, PP_CHAOS, PP_COUNT
+};
 
 struct Particle {
   float x, y, vx, vy;
   float hue;
 };
+struct Trail {
+  int16_t x, y;
+  uint16_t c;
+  uint8_t life;
+};
 
 static M5Canvas canvas(&M5.Display);
 static Particle g_p[N_PART];
+static Trail g_tr[N_TRAIL];
+static int g_trI = 0;
 static Mode g_mode = MODE_SWARM;
 static SwarmVar g_swarmVar = SV_FLOCK;
+static PulsePat g_pulsePat = PP_WAVE;
 static float g_t = 0;
 static float g_level = 0, g_peak = 0;
 static float g_ax = 0, g_ay = 0, g_az = 1;
+static float g_gx = 0, g_gy = 0, g_gz = 0;
+static float g_lookX = 0, g_lookY = 0;  // integrated view (accel+gyro)
+static bool g_imuOk = false;
 static float g_shake = 0;
 static float g_hue = 160;
 static uint32_t g_lastBtn = 0;
 static int16_t g_mic[MIC_N];
 static bool g_eyeTrack = true;
-static bool g_tunnelWarp = true;
-static bool g_pulseMirror = true;
+
+// Eye poke reaction
+static float g_poke = 0;       // 1 = just poked, decays
+static float g_pokeSquint = 0;
+static uint32_t g_pokeUntil = 0;
 
 // --- haptic non-blocking ---
 static uint32_t g_hapUntil = 0;
@@ -56,7 +73,7 @@ static void hapService() {
   }
 }
 
-// --- drum machine ---
+// --- drum ---
 enum Pad : uint8_t { PAD_HAT_C = 0, PAD_HAT_O, PAD_KICK, PAD_SNARE };
 static const char *PAD_NAME[] = {"CH", "OH", "KICK", "SNR"};
 static int16_t *g_padSample[4] = {nullptr, nullptr, nullptr, nullptr};
@@ -65,13 +82,26 @@ static bool g_padArmed[4] = {false, false, false, false};
 static uint32_t g_padHoldStart = 0;
 static int g_padHoldId = -1;
 static bool g_loopOn = false;
-static uint8_t g_loopEv[LOOP_MAX];   // pad id
-static uint16_t g_loopAt[LOOP_MAX];  // ms from loop start
+static uint8_t g_loopEv[LOOP_MAX];
+static uint16_t g_loopAt[LOOP_MAX];
 static int g_loopN = 0;
 static uint32_t g_loopStart = 0;
-static uint32_t g_loopLenMs = 2000;
+static uint32_t g_loopLenMs = 8000; // 4 bars @ 120bpm default
 static int g_loopPlayI = 0;
-static float g_loopPulse = 0; // 0..1 visual
+static float g_loopPulse = 0;
+static float g_bpm = 120.f;
+static bool g_tempoMode = false;
+static uint32_t g_tempoTaps[8];
+static int g_tempoTapN = 0;
+static uint32_t g_btnBDown = 0;
+static bool g_btnBLong = false;
+
+static const char *DRUM_DIR = "/drums";
+static const char *DRUM_SPEC = "/drums/SAMPLES.txt";
+static const char *PAD_FILE[] = {
+  "/drums/hat_closed.raw", "/drums/hat_open.raw",
+  "/drums/kick.raw", "/drums/snare.raw"
+};
 
 static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
   return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
@@ -90,13 +120,67 @@ static uint16_t hsv565(float h, float s, float v) {
   return rgb565((uint8_t)((r + m) * 255), (uint8_t)((g + m) * 255), (uint8_t)((b + m) * 255));
 }
 
+static void recomputeLoopLen() {
+  // 4 bars of 4/4: 16 beats
+  float ms = (60000.f / g_bpm) * 16.f;
+  if (ms < 2000.f) ms = 2000.f;
+  if (ms > 32000.f) ms = 32000.f;
+  g_loopLenMs = (uint32_t)ms;
+}
+
 static void seedParticles() {
   for (int i = 0; i < N_PART; i++) {
     g_p[i].x = (float)(rand() % W);
-    g_p[i].y = (float)(rand() % H);
+    g_p[i].y = (float)(14 + rand() % (H - 30));
     g_p[i].vx = ((rand() % 100) - 50) * 0.03f;
     g_p[i].vy = ((rand() % 100) - 50) * 0.03f;
     g_p[i].hue = g_hue + (rand() % 60) - 30;
+  }
+  memset(g_tr, 0, sizeof(g_tr));
+}
+
+static void addTrail(int x, int y, uint16_t c) {
+  g_tr[g_trI].x = (int16_t)x;
+  g_tr[g_trI].y = (int16_t)y;
+  g_tr[g_trI].c = c;
+  g_tr[g_trI].life = 40;
+  g_trI = (g_trI + 1) % N_TRAIL;
+}
+
+static void drawTrails() {
+  for (int i = 0; i < N_TRAIL; i++) {
+    if (g_tr[i].life < 2) continue;
+    uint8_t L = g_tr[i].life;
+    int r = 1 + (L >> 4);
+    // afterglow: dim by redrawing smaller
+    canvas.fillCircle(g_tr[i].x, g_tr[i].y, r, g_tr[i].c);
+    if (L > 20)
+      canvas.fillCircle(g_tr[i].x, g_tr[i].y, r + 1,
+                        hsv565(g_hue + L, 0.4f, 0.08f + L * 0.004f));
+    g_tr[i].life = (uint8_t)(L * 0.88f);
+  }
+}
+
+// Soft reactive backdrop — plasma / moire wash (not a full-screen storm)
+static void drawPsyBg() {
+  float base = 0.06f + g_level * 0.08f + g_peak * 0.04f;
+  // horizontal reactive bands
+  for (int y = 14; y < H - 14; y += 6) {
+    float wiggle = sinf(y * 0.04f + g_t * 1.2f + g_ax) * 0.5f
+                 + cosf(y * 0.07f - g_t * 0.8f + g_ay * 2.f) * 0.5f;
+    float v = base + wiggle * 0.05f + g_level * 0.04f * sinf(y * 0.1f + g_t * 3.f);
+    if (v < 0.02f) v = 0.02f;
+    if (v > 0.22f) v = 0.22f;
+    uint16_t c = hsv565(g_hue + y * 0.4f + g_t * 12.f, 0.55f, v);
+    canvas.drawFastHLine(0, y, W, c);
+    if ((y & 15) == 0)
+      canvas.drawFastHLine(0, y + 1, W, hsv565(g_hue + 40.f + y * 0.2f, 0.4f, v * 0.7f));
+  }
+  // sparse vertical shimmer from mid energy
+  for (int x = 0; x < W; x += 20) {
+    float v = 0.04f + g_peak * 0.1f * (0.5f + 0.5f * sinf(x * 0.05f + g_t * 2.f));
+    canvas.drawFastVLine(x + (int)(sinf(g_t + x) * 3), 14, H - 28,
+                         hsv565(g_hue + 90.f, 0.5f, v));
   }
 }
 
@@ -116,54 +200,72 @@ static void sampleAudio() {
   if (lvl > 1.5f) lvl = 1.5f;
   g_level = g_level * 0.75f + lvl * 0.25f;
   g_peak = g_peak * 0.8f + (peak / 22000.f) * 0.2f;
-  if (g_level > 0.65f) hap(70, 25);
+  if (g_level > 0.7f) hap(55, 20);
 }
 
+// Board-agnostic Core2 IMU via M5Unified (no chip names)
 static void sampleImu() {
-  // M5Unified: update() is required or accel stays stale/zero
-  auto mask = M5.Imu.update();
-  float ax = 0, ay = 0, az = 1;
-  if (mask) {
-    auto d = M5.Imu.getImuData();
-    ax = d.accel.x;
-    ay = d.accel.y;
-    az = d.accel.z;
-  } else {
-    // fallback path also forces a read
-    M5.Imu.getAccel(&ax, &ay, &az);
-  }
-  // light smooth — keep responsive to tilt
-  g_ax = g_ax * 0.65f + ax * 0.35f;
-  g_ay = g_ay * 0.65f + ay * 0.35f;
-  g_az = g_az * 0.65f + az * 0.35f;
-  float mag = sqrtf(ax * ax + ay * ay + az * az);
+  // Official M5Unified pattern (Imu.ino): update() then getImuData().
+  // Works across Core2 revisions — library picks the sensor.
+  auto imu_update = M5.Imu.update();
+  if (!imu_update) return;
+
+  auto data = M5.Imu.getImuData();
+  g_imuOk = true;
+
+  // Accel (g). Light smooth so tilt is still snappy.
+  g_ax = g_ax * 0.5f + data.accel.x * 0.5f;
+  g_ay = g_ay * 0.5f + data.accel.y * 0.5f;
+  g_az = g_az * 0.5f + data.accel.z * 0.5f;
+
+  g_gx = data.gyro.x; // deg/s
+  g_gy = data.gyro.y;
+  g_gz = data.gyro.z;
+
+  // Integrate gyro for responsive look; spring toward accel tilt.
+  // Display is landscape (rotation 1): map board tilt → screen X/Y.
+  const float dt = 0.033f;
+  g_lookX += g_gy * dt * 0.08f;
+  g_lookY += g_gx * dt * 0.08f;
+  // Accel targets (board frame → screen after rot 1)
+  float targetX = -g_ay;  // left/right tilt
+  float targetY =  g_ax;  // forward/back
+  g_lookX = g_lookX * 0.92f + targetX * 0.08f;
+  g_lookY = g_lookY * 0.92f + targetY * 0.08f;
+  // clamp
+  if (g_lookX > 1.2f) g_lookX = 1.2f;
+  if (g_lookX < -1.2f) g_lookX = -1.2f;
+  if (g_lookY > 1.2f) g_lookY = 1.2f;
+  if (g_lookY < -1.2f) g_lookY = -1.2f;
+
+  float mag = sqrtf(data.accel.x * data.accel.x + data.accel.y * data.accel.y + data.accel.z * data.accel.z);
   float sh = fabsf(mag - 1.0f);
   g_shake = g_shake * 0.8f + sh * 0.2f;
   if (g_shake > 0.5f) {
-    g_hue += 20.f;
+    g_hue += 18.f;
     if (g_hue >= 360.f) g_hue -= 360.f;
-    hap(150, 35);
+    hap(140, 30);
     for (int i = 0; i < N_PART; i++) {
-      g_p[i].vx += ((rand() % 100) - 50) * 0.08f;
-      g_p[i].vy += ((rand() % 100) - 50) * 0.08f;
+      g_p[i].vx += ((rand() % 100) - 50) * 0.07f;
+      g_p[i].vy += ((rand() % 100) - 50) * 0.07f;
     }
   }
 }
 
-// --- startup jingle ---
+
 static void playStartup() {
   M5.Mic.end();
   M5.Speaker.begin();
   M5.Speaker.setVolume(180);
   const int seq[][2] = {
-    {523, 60}, {659, 60}, {784, 60}, {1047, 120}, {0, 40},
-    {784, 50}, {1047, 160}
+    {523, 55}, {659, 55}, {784, 55}, {1047, 110}, {0, 35},
+    {784, 45}, {1047, 150}
   };
   for (unsigned i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
     if (seq[i][0] == 0) delay(seq[i][1]);
     else {
       M5.Speaker.tone(seq[i][0], seq[i][1]);
-      delay(seq[i][1] + 15);
+      delay(seq[i][1] + 12);
     }
   }
   M5.Speaker.stop();
@@ -171,22 +273,16 @@ static void playStartup() {
   M5.Mic.begin();
 }
 
-// Simple pixel mantis for splash (silhouette)
-static void drawMantisBitmap(M5Canvas &c, int ox, int oy) {
-  for (int y = 0; y < MANTIS_H; y++) {
-    for (int x = 0; x < MANTIS_W; x++) {
-      uint16_t col = mantis_splash[y * MANTIS_W + x];
-      if (col == 0) continue; // transparent
-      c.drawPixel(ox + x, oy + y, col);
-    }
-  }
-}
-
 static void splash() {
   canvas.fillSprite(rgb565(6, 2, 14));
   int ox = (W - MANTIS_W) / 2;
   int oy = 18;
-  drawMantisBitmap(canvas, ox, oy);
+  for (int y = 0; y < MANTIS_H; y++) {
+    for (int x = 0; x < MANTIS_W; x++) {
+      uint16_t col = mantis_splash[y * MANTIS_W + x];
+      if (col) canvas.drawPixel(ox + x, oy + y, col);
+    }
+  }
   canvas.setTextSize(2);
   canvas.setTextColor(hsv565(160, 0.85f, 0.95f));
   canvas.setCursor((W - 8 * 12) / 2, oy + MANTIS_H + 8);
@@ -197,24 +293,47 @@ static void splash() {
   canvas.print("tilt · touch · make noise");
   canvas.pushSprite(0, 0);
   playStartup();
-  delay(500);
+  delay(450);
 }
 
+// ========== SWARM ==========
 static void modeSwarm() {
-  // IMU gravity (Core2 landscape: ay ~ left/right, ax ~ toward/away)
-  float gx = -g_ay * 0.55f;
-  float gy = g_ax * 0.55f;
+  drawPsyBg();
+  drawTrails();
+
+  float gx = -g_lookX * 0.85f;
+  float gy = g_lookY * 0.85f;
   float pulse = 0.45f + g_level * 1.5f;
-  // sound-reactive hue offset for all particles
   float soundHue = g_hue + g_level * 100.f + g_peak * 40.f;
+
+  // metaball-ish pairs: when close, draw a bridging blob
+  for (int i = 0; i < N_PART; i++) {
+    for (int j = i + 1; j < N_PART; j += 3) {
+      float dx = g_p[i].x - g_p[j].x;
+      float dy = g_p[i].y - g_p[j].y;
+      float d2 = dx * dx + dy * dy;
+      if (d2 < 500.f && d2 > 1.f) {
+        float mx = (g_p[i].x + g_p[j].x) * 0.5f;
+        float my = (g_p[i].y + g_p[j].y) * 0.5f;
+        float t = 1.f - d2 / 500.f;
+        int br = 2 + (int)(t * 8.f * (0.5f + g_level));
+        uint16_t bc = hsv565(soundHue + i + j, 0.75f, 0.25f + t * 0.45f);
+        canvas.fillCircle((int)mx, (int)my, br, bc);
+        // mild cohesion pull
+        g_p[i].vx -= dx * 0.0015f * t;
+        g_p[i].vy -= dy * 0.0015f * t;
+        g_p[j].vx += dx * 0.0015f * t;
+        g_p[j].vy += dy * 0.0015f * t;
+      }
+    }
+  }
 
   for (int i = 0; i < N_PART; i++) {
     Particle &p = g_p[i];
-    float cx = W * 0.5f + sinf(g_t * 0.6f + i * 0.1f) * 20.f * g_peak;
-    float cy = H * 0.5f + cosf(g_t * 0.5f) * 15.f * g_level;
+    float cx = W * 0.5f + sinf(g_t * 0.6f + i * 0.1f) * 22.f * g_peak;
+    float cy = H * 0.5f + cosf(g_t * 0.5f) * 16.f * g_level;
 
     if (g_swarmVar == SV_FLOCK) {
-      // soft attractor + separation = fluid blob flock
       float dx = cx - p.x, dy = cy - p.y;
       p.vx += dx * 0.0022f * pulse + gx;
       p.vy += dy * 0.0022f * pulse + gy;
@@ -238,10 +357,8 @@ static void modeSwarm() {
       p.vx *= 0.95f;
       p.vy *= 0.95f;
     } else {
-      // CHAOS — fluid gravity field from IMU only + mild swirl
       p.vx += gx * 1.2f + sinf(g_t * 2.f + p.y * 0.05f) * 0.15f * (0.3f + g_level);
       p.vy += gy * 1.2f + cosf(g_t * 1.7f + p.x * 0.05f) * 0.15f * (0.3f + g_level);
-      // viscosity
       p.vx *= 0.92f;
       p.vy *= 0.92f;
     }
@@ -253,13 +370,15 @@ static void modeSwarm() {
     if (p.y < 16) { p.y = 16; p.vy *= -0.6f; }
     if (p.y > H - 18) { p.y = H - 18; p.vy *= -0.6f; }
 
-    // blob radius + sound-reactive color
     float h = soundHue + p.hue * 0.3f + i * 2.f;
     float v = 0.4f + g_level * 0.5f + g_peak * 0.15f;
     int r = 3 + (int)(g_level * 6.f) + (i & 1);
-    canvas.fillCircle((int)p.x, (int)p.y, r, hsv565(h, 0.8f, v));
+    uint16_t col = hsv565(h, 0.8f, v);
+    canvas.fillCircle((int)p.x, (int)p.y, r, col);
     if (r > 4)
-      canvas.fillCircle((int)p.x - 1, (int)p.y - 1, r / 2, hsv565(h + 20.f, 0.5f, fminf(1.f, v + 0.2f)));
+      canvas.fillCircle((int)p.x - 1, (int)p.y - 1, r / 2,
+                        hsv565(h + 20.f, 0.5f, fminf(1.f, v + 0.2f)));
+    if ((i & 1) == 0) addTrail((int)p.x, (int)p.y, col);
   }
 
   auto td = M5.Touch.getDetail();
@@ -267,6 +386,8 @@ static void modeSwarm() {
     int tx = td.x, ty = td.y;
     uint16_t mc = hsv565(soundHue + 50.f, 0.95f, 1.f);
     canvas.fillTriangle(tx, ty - 7, tx - 6, ty + 5, tx + 6, ty + 5, mc);
+    for (int i = 0; i < 6; i++)
+      addTrail(tx + (rand() % 9) - 4, ty + (rand() % 9) - 4, mc);
     for (int i = 0; i < N_PART; i++) {
       float dx = g_p[i].x - tx, dy = g_p[i].y - ty;
       if (dx * dx + dy * dy < 3600.f) {
@@ -277,85 +398,210 @@ static void modeSwarm() {
   }
 }
 
-static void modeEyeFixed() {
-  // Strong mapping so tilt is obvious on screen
-  float lookX = g_eyeTrack ? constrain(-g_ay * 120.f, -100.f, 100.f) : 0;
-  float lookY = g_eyeTrack ? constrain(g_ax * 100.f, -70.f, 70.f) : 0;
+// ========== EYE ==========
+static void modeEye() {
+  drawPsyBg();
+
+  float lookX = g_eyeTrack ? constrain(g_lookX * 100.f, -110.f, 110.f) : 0;
+  float lookY = g_eyeTrack ? constrain(g_lookY * 85.f, -80.f, 80.f) : 0;
+
+  // poke reaction: pull back + squint
+  if (g_poke > 0.05f) {
+    lookX *= (1.f - g_poke * 0.4f);
+    lookY *= (1.f - g_poke * 0.4f);
+    lookY += g_poke * 25.f; // pulls back
+    g_pokeSquint = g_poke;
+    g_poke *= 0.94f;
+  } else {
+    g_pokeSquint *= 0.9f;
+  }
+
   int cx = W / 2 + (int)lookX;
   int cy = H / 2 + (int)lookY;
-  for (int ring = 6; ring >= 0; ring--) {
-    float d = 18.f + ring * 16.f + g_level * 12.f;
-    uint16_t c = hsv565(g_hue + ring * 25.f + g_t * 15.f, 0.7f, 0.12f + ring * 0.04f + g_level * 0.15f);
+
+  // Moire layer — offset lattice vs rings, driven by audio
+  float mo = g_t * 0.7f + g_level * 4.f;
+  for (int i = -4; i <= 4; i++) {
+    for (int j = -3; j <= 3; j++) {
+      float ox = cx + i * 28.f + sinf(mo + j) * 6.f * g_peak;
+      float oy = cy + j * 26.f + cosf(mo * 1.3f + i) * 5.f * g_level;
+      float d = sqrtf((ox - cx) * (ox - cx) + (oy - cy) * (oy - cy));
+      uint16_t c = hsv565(g_hue + d * 0.5f + i * 10.f, 0.45f, 0.06f + g_level * 0.08f);
+      canvas.drawCircle((int)ox, (int)oy, 10 + (int)(g_peak * 6), c);
+    }
+  }
+
+  for (int ring = 7; ring >= 0; ring--) {
+    float d = 16.f + ring * 15.f + g_level * 14.f - g_pokeSquint * 10.f;
+    if (d < 4) d = 4;
+    uint16_t c = hsv565(g_hue + ring * 22.f + g_t * 15.f, 0.7f,
+                        0.1f + ring * 0.035f + g_level * 0.15f);
     canvas.drawCircle(cx, cy, (int)d, c);
   }
-  int er = 42 + (int)(g_level * 10);
-  canvas.fillCircle(cx, cy, er, hsv565(g_hue + 180, 0.15f, 0.85f));
-  int ir = 22 + (int)(g_peak * 8);
+
+  int er = (int)(40 + g_level * 12 - g_pokeSquint * 18);
+  if (er < 12) er = 12;
+  canvas.fillCircle(cx, cy, er, hsv565(g_hue + 180, 0.15f, 0.85f - g_pokeSquint * 0.2f));
+  int ir = (int)(20 + g_peak * 10 - g_pokeSquint * 8);
+  if (ir < 6) ir = 6;
   canvas.fillCircle(cx, cy, ir, hsv565(g_hue + 40, 0.85f, 0.55f + g_level * 0.3f));
   int px = cx + (int)(lookX * 0.15f);
   int py = cy + (int)(lookY * 0.15f);
-  int pr = 10 + (int)(g_level * 5.f);
+  int pr = (int)(9 + g_level * 5 - g_pokeSquint * 4);
+  if (pr < 3) pr = 3;
   canvas.fillCircle(px, py, pr, rgb565(8, 6, 12));
-  canvas.fillCircle(px - 3, py - 3, 3, rgb565(220, 230, 255));
-}
+  if (g_pokeSquint < 0.5f)
+    canvas.fillCircle(px - 3, py - 3, 3, rgb565(220, 230, 255));
 
-static void modeTunnel() {
-  static float z = 0;
-  z += 0.07f + g_level * 0.2f;
-  float spin = g_t * 0.35f + (g_tunnelWarp ? g_ay * 1.6f : 0) + g_ax * 0.3f;
-  int cx = W / 2 + (int)(g_ay * -55.f);
-  int cy = H / 2 + (int)(g_ax * 45.f);
-  for (int ring = 14; ring >= 0; ring--) {
-    float zz = fmodf(z + ring * 0.4f, 7.f);
-    float sc = 10.f / (zz + 0.5f);
-    int rad = (int)(sc * 20.f);
-    uint16_t c = hsv565(g_hue + ring * 14.f + g_t * 20.f, 0.9f, 0.2f + g_level * 0.45f);
-    for (int k = 0; k < 6; k++) {
-      float a0 = spin + k * (float)M_PI / 3.f;
-      float a1 = spin + (k + 1) * (float)M_PI / 3.f;
-      canvas.drawLine(
-        cx + (int)(cosf(a0) * rad), cy + (int)(sinf(a0) * rad * 0.85f),
-        cx + (int)(cosf(a1) * rad), cy + (int)(sinf(a1) * rad * 0.85f), c);
+  // shake-off sparkles near end of poke
+  if (g_poke > 0.15f && g_poke < 0.45f) {
+    for (int i = 0; i < 8; i++) {
+      float a = g_t * 8.f + i * 0.8f;
+      int sx = cx + (int)(cosf(a) * (er + 8 + i * 2));
+      int sy = cy + (int)(sinf(a) * (er + 6));
+      canvas.fillCircle(sx, sy, 2, hsv565(g_hue + i * 30.f, 0.9f, 0.8f));
+    }
+  }
+
+  auto td = M5.Touch.getDetail();
+  if (td.wasPressed()) {
+    float dx = td.x - cx, dy = td.y - cy;
+    if (dx * dx + dy * dy < (er + 20) * (er + 20)) {
+      g_poke = 1.f;
+      hap(180, 50);
     }
   }
 }
 
-static void modePulse() {
-  // true mic waveform ring — not a fixed trefoil
-  int cx = W / 2, cy = H / 2;
-  int prevx = cx, prevy = cy;
-  for (int i = 0; i < MIC_N; i++) {
-    float ang = (float)i / MIC_N * 2.f * (float)M_PI + g_t * 0.5f;
-    float sample = fabsf((float)g_mic[i]) / 16000.f;
-    float r = 28.f + sample * 70.f + g_level * 25.f;
-    if (g_pulseMirror) r += sinf(ang * 3.f + g_t) * 8.f * g_peak;
-    int x = cx + (int)(cosf(ang) * r);
-    int y = cy + (int)(sinf(ang) * r * 0.9f);
-    uint16_t c = hsv565(g_hue + i * 2.f + g_t * 30.f, 0.9f, 0.35f + sample);
-    if (i > 0) canvas.drawLine(prevx, prevy, x, y, c);
-    prevx = x;
-    prevy = y;
+// ========== TUNNEL — IMU rabbit hole ==========
+static void modeTunnel() {
+  static float z = 0;
+  // forward speed: audio pushes deeper, tilt banks
+  float speed = 0.06f + g_level * 0.22f + g_peak * 0.1f;
+  z += speed;
+  float spin = g_t * 0.25f + g_lookX * 2.2f + g_lookY * 0.5f;
+  int cx = W / 2 + (int)(g_lookX * -70.f);
+  int cy = H / 2 + (int)(g_lookY * 55.f);
+
+  // deep backdrop stars that stream past
+  for (int s = 0; s < 24; s++) {
+    float sz = fmodf(z * 1.5f + s * 1.7f, 9.f);
+    float sc = 14.f / (sz + 0.3f);
+    float ang = s * 1.7f + spin * 0.3f;
+    int sx = cx + (int)(cosf(ang) * sc * 8.f);
+    int sy = cy + (int)(sinf(ang) * sc * 7.f);
+    uint16_t c = hsv565(g_hue + s * 15.f, 0.6f, 0.15f + (1.f - sz / 9.f) * 0.5f);
+    canvas.fillCircle(sx, sy, 1 + (int)((1.f - sz / 9.f) * 2), c);
   }
-  int core = 8 + (int)(g_level * 20);
-  canvas.fillCircle(cx, cy, core, hsv565(g_hue + g_t * 40.f, 0.8f, 0.5f + g_level * 0.4f));
+
+  for (int ring = 16; ring >= 0; ring--) {
+    float zz = fmodf(z + ring * 0.38f, 8.f);
+    float sc = 12.f / (zz + 0.35f);
+    int rad = (int)(sc * (18.f + g_level * 6.f));
+    // procedural side lobes from mic
+    float lobe = 1.f + g_peak * 0.35f * sinf(ring * 0.7f + g_t * 2.f);
+    uint16_t c = hsv565(g_hue + ring * 12.f + g_t * 25.f + g_level * 40.f,
+                        0.85f, 0.15f + (16 - ring) * 0.025f + g_level * 0.35f);
+    int sides = 5 + (ring % 3); // changing n-gons = fractal-ish
+    for (int k = 0; k < sides; k++) {
+      float a0 = spin + k * (2.f * (float)M_PI / sides) + sinf(z * 0.3f + ring) * 0.15f;
+      float a1 = spin + (k + 1) * (2.f * (float)M_PI / sides) + sinf(z * 0.3f + ring) * 0.15f;
+      float r0 = rad * lobe * (1.f + 0.08f * sinf(a0 * 3.f + g_t));
+      float r1 = rad * lobe * (1.f + 0.08f * sinf(a1 * 3.f + g_t));
+      canvas.drawLine(
+        cx + (int)(cosf(a0) * r0), cy + (int)(sinf(a0) * r0 * 0.85f),
+        cx + (int)(cosf(a1) * r1), cy + (int)(sinf(a1) * r1 * 0.85f), c);
+    }
+  }
+  // vanishing point flare
+  int core = 3 + (int)(g_level * 14);
+  canvas.fillCircle(cx, cy, core, hsv565(g_hue + g_t * 50.f, 0.9f, 0.6f + g_peak * 0.4f));
+  for (int i = 0; i < 6; i++) {
+    float a = spin * 2.f + i * (float)M_PI / 3.f;
+    int len = 6 + (int)(g_level * 30);
+    canvas.drawLine(cx, cy, cx + (int)(cosf(a) * len), cy + (int)(sinf(a) * len),
+                    hsv565(g_hue + 80.f, 1.f, 0.7f));
+  }
 }
 
-// --- drum synth ---
+// ========== PULSE — cycling patterns ==========
+static void modePulse() {
+  drawPsyBg();
+  int cx = W / 2 + (int)(g_lookX * -25.f);
+  int cy = H / 2 + (int)(g_lookY * 20.f);
 
-static const char *DRUM_DIR = "/drums";
-static const char *DRUM_SPEC = "/drums/SAMPLES.txt";
-static const char *PAD_FILE[] = {
-  "/drums/hat_closed.raw",
-  "/drums/hat_open.raw",
-  "/drums/kick.raw",
-  "/drums/snare.raw"
-};
+  auto sampleR = [&](int i) -> float {
+    float s = fabsf((float)g_mic[i % MIC_N]) / 16000.f;
+    return 26.f + s * 75.f + g_level * 28.f;
+  };
 
-static void ensureDrumFs() {
-  if (!SD.begin(4, SPI, 25000000)) {
-    // Core2 TF slot; fail soft
-    return;
+  if (g_pulsePat == PP_WAVE || g_pulsePat == PP_MIRROR) {
+    int prevx = cx, prevy = cy;
+    for (int i = 0; i < MIC_N; i++) {
+      float ang = (float)i / MIC_N * 2.f * (float)M_PI + g_t * 0.5f;
+      float r = sampleR(i);
+      if (g_pulsePat == PP_MIRROR) r += sinf(ang * 3.f + g_t) * 10.f * g_peak;
+      int x = cx + (int)(cosf(ang) * r);
+      int y = cy + (int)(sinf(ang) * r * 0.9f);
+      uint16_t c = hsv565(g_hue + i * 2.f + g_t * 30.f, 0.9f, 0.35f + r / 150.f);
+      if (i > 0) canvas.drawLine(prevx, prevy, x, y, c);
+      prevx = x; prevy = y;
+    }
+  } else if (g_pulsePat == PP_STAR) {
+    for (int arm = 0; arm < 8; arm++) {
+      float base = arm * (float)M_PI / 4.f + g_t * 0.4f + g_ay;
+      int prevx = cx, prevy = cy;
+      for (int i = 0; i < 32; i++) {
+        float t = i / 32.f;
+        float r = sampleR(i * 4) * t;
+        float ang = base + t * 0.4f * g_level;
+        int x = cx + (int)(cosf(ang) * r);
+        int y = cy + (int)(sinf(ang) * r * 0.9f);
+        canvas.drawLine(prevx, prevy, x, y, hsv565(g_hue + arm * 40.f + t * 80.f, 0.95f, 0.4f + t * 0.5f));
+        prevx = x; prevy = y;
+      }
+    }
+  } else if (g_pulsePat == PP_RIBBON) {
+    for (int layer = 0; layer < 3; layer++) {
+      int prevx = 0, prevy = H / 2;
+      for (int x = 0; x < W; x += 2) {
+        int mi = (x + layer * 40) % MIC_N;
+        float s = fabsf((float)g_mic[mi]) / 14000.f;
+        float y = H * 0.5f
+          + sinf(x * 0.03f + g_t * (1.2f + layer * 0.4f) + g_ax)
+            * (30.f + g_level * 40.f + s * 50.f)
+          + g_ay * 20.f * (layer - 1);
+        uint16_t c = hsv565(g_hue + layer * 50.f + x * 0.5f, 0.85f, 0.35f + s * 0.5f);
+        if (x > 0) canvas.drawLine(prevx, prevy, x, (int)y, c);
+        prevx = x; prevy = (int)y;
+      }
+    }
+  } else { // PP_CHAOS — everything cross-modulated
+    for (int i = 0; i < MIC_N; i += 2) {
+      float ang = (float)i / MIC_N * 2.f * (float)M_PI * (2.f + g_peak)
+                + g_t * (1.f + g_level) + g_ay * 2.f;
+      float r = sampleR(i) * (0.6f + 0.4f * sinf(g_t * 3.f + i * 0.2f + g_ax * 4.f));
+      int x = cx + (int)(cosf(ang) * r);
+      int y = cy + (int)(sinf(ang * 1.3f) * r * 0.85f);
+      canvas.fillCircle(x, y, 1 + (int)(g_level * 3),
+                        hsv565(g_hue + i * 3.f + g_shake * 80.f, 1.f, 0.45f + g_peak * 0.5f));
+      if (i > 0 && (i & 3) == 0) {
+        float ang2 = ang + 0.4f;
+        int x2 = cx + (int)(cosf(ang2) * r * 0.7f);
+        int y2 = cy + (int)(sinf(ang2) * r * 0.7f);
+        canvas.drawLine(x, y, x2, y2, hsv565(g_hue + 90.f, 0.7f, 0.3f));
+      }
+    }
   }
+
+  int core = 8 + (int)(g_level * 22);
+  canvas.fillCircle(cx, cy, core, hsv565(g_hue + g_t * 40.f, 0.8f, 0.5f + g_level * 0.4f));
+  canvas.fillCircle(cx, cy, core / 2, rgb565(10, 5, 20));
+}
+
+// ========== DRUM FS + audio ==========
+static void ensureDrumFs() {
+  if (!SD.begin(4, SPI, 25000000)) return;
   if (!SD.exists(DRUM_DIR)) SD.mkdir(DRUM_DIR);
   if (!SD.exists(DRUM_SPEC)) {
     File f = SD.open(DRUM_SPEC, FILE_WRITE);
@@ -369,21 +615,19 @@ static void ensureDrumFs() {
       f.println("kick.raw        = kick drum    (bottom-left)");
       f.println("snare.raw       = snare        (bottom-right)");
       f.println("");
-      f.println("Record in-app (hold pad 3s, B=REC) or copy files here.");
-      f.println("Max length ~0.5s (8000 samples). Longer files are truncated.");
+      f.println("Record in-app or copy files here. Max ~0.5s.");
       f.close();
     }
   }
 }
 
 static void loadPadFromSd(int pad) {
-  if (pad < 0 || pad > 3) return;
-  if (!SD.exists(PAD_FILE[pad])) return;
+  if (pad < 0 || pad > 3 || !SD.exists(PAD_FILE[pad])) return;
   File f = SD.open(PAD_FILE[pad], FILE_READ);
   if (!f) return;
   size_t bytes = f.size();
   if (bytes < 4) { f.close(); return; }
-  if (bytes > 16000) bytes = 16000; // ~0.5s @16k stereo-safe
+  if (bytes > 16000) bytes = 16000;
   int n = (int)(bytes / 2);
   int16_t *buf = (int16_t *)heap_caps_malloc(n * sizeof(int16_t), MALLOC_CAP_8BIT);
   if (!buf) buf = (int16_t *)malloc(n * sizeof(int16_t));
@@ -405,15 +649,22 @@ static void savePadToSd(int pad) {
   f.close();
 }
 
+static void clearPadSample(int pad) {
+  if (pad < 0 || pad > 3) return;
+  if (g_padSample[pad]) { free(g_padSample[pad]); g_padSample[pad] = nullptr; }
+  g_padSampleLen[pad] = 0;
+  ensureDrumFs();
+  if (SD.exists(PAD_FILE[pad])) SD.remove(PAD_FILE[pad]);
+  hap(80, 40);
+}
+
 static void loadAllPads() {
   ensureDrumFs();
   for (int i = 0; i < 4; i++) loadPadFromSd(i);
 }
 
-// Auto-trim leading silence then keep a tight window
 static int autoTrim(int16_t *buf, int n) {
   if (n < 16) return n;
-  // threshold relative to peak
   int peak = 0;
   for (int i = 0; i < n; i++) {
     int a = buf[i] < 0 ? -buf[i] : buf[i];
@@ -427,7 +678,6 @@ static int autoTrim(int16_t *buf, int n) {
     if (a >= thr) break;
     start++;
   }
-  // back up a few samples for attack
   start -= 32;
   if (start < 0) start = 0;
   if (start > 0) {
@@ -435,7 +685,6 @@ static int autoTrim(int16_t *buf, int n) {
     memmove(buf, buf + start, keep * sizeof(int16_t));
     n = keep;
   }
-  // trim trailing silence
   int end = n - 1;
   while (end > 0) {
     int a = buf[end] < 0 ? -buf[end] : buf[end];
@@ -484,15 +733,15 @@ static void drumTone(Pad p) {
 }
 
 static void playPad(Pad p, bool recordIntoLoop) {
-  // play custom sample if present
   if (g_padSample[p] && g_padSampleLen[p] > 0) {
     M5.Mic.end();
+    delay(3);
     M5.Speaker.begin();
     M5.Speaker.setVolume(200);
     M5.Speaker.playRaw(g_padSample[p], g_padSampleLen[p], 16000, false);
     if (p == PAD_KICK) hap(200, 70);
     else if (p == PAD_SNARE) hap(90, 25);
-    delay(40);
+    delay(35);
     M5.Speaker.end();
   } else {
     drumTone(p);
@@ -507,7 +756,6 @@ static void playPad(Pad p, bool recordIntoLoop) {
 }
 
 static void recordPadSample(int pad) {
-  // ~0.45s capture window @ 16 kHz
   const int nMax = 7200;
   int16_t *buf = (int16_t *)heap_caps_malloc(nMax * sizeof(int16_t), MALLOC_CAP_8BIT);
   if (!buf) buf = (int16_t *)malloc(nMax * sizeof(int16_t));
@@ -516,7 +764,6 @@ static void recordPadSample(int pad) {
   M5.Speaker.end();
   delay(5);
   M5.Mic.begin();
-  // countdown flash
   hap(60, 20);
   canvas.fillSprite(rgb565(20, 10, 30));
   canvas.setTextColor(rgb565(255, 220, 80));
@@ -576,34 +823,17 @@ static void recordPadSample(int pad) {
   M5.Speaker.end();
 }
 
-
-
 static void serviceLoop() {
   if (!g_loopOn || g_loopN == 0) return;
   uint32_t elapsed = (millis() - g_loopStart) % g_loopLenMs;
   g_loopPulse = (float)elapsed / (float)g_loopLenMs;
-  // play any events near current time (simple scan)
   static uint32_t lastE = 0;
-  if (elapsed < lastE) {
-    // wrapped
-    g_loopPlayI = 0;
-  }
+  if (elapsed < lastE) g_loopPlayI = 0;
   lastE = elapsed;
   while (g_loopPlayI < g_loopN && g_loopAt[g_loopPlayI] <= elapsed + 15) {
     if (g_loopAt[g_loopPlayI] + 30 >= elapsed) {
-      // fire without re-recording into loop
       Pad p = (Pad)g_loopEv[g_loopPlayI];
-      if (g_padSample[p] && g_padSampleLen[p] > 0) {
-        M5.Mic.end();
-        M5.Speaker.begin();
-        M5.Speaker.setVolume(180);
-        M5.Speaker.playRaw(g_padSample[p], g_padSampleLen[p], 16000, false);
-        if (p == PAD_KICK) hap(180, 60);
-        delay(20);
-        M5.Speaker.end();
-      } else {
-        drumTone(p);
-      }
+      playPad(p, false);
     }
     g_loopPlayI++;
   }
@@ -613,13 +843,18 @@ static void serviceLoop() {
 static void modeDrum() {
   canvas.fillSprite(rgb565(10, 8, 18));
 
-  // Loop visual: bright pulse + 3 dimmer pulses in the pad background zones
-  float phase = g_loopOn ? g_loopPulse : -1.f;
+  float phase = -1.f;
+  if (g_tempoMode) {
+    // blink to current BPM
+    float beatMs = 60000.f / g_bpm;
+    phase = fmodf((float)millis(), beatMs) / beatMs;
+  } else if (g_loopOn) {
+    phase = g_loopPulse;
+  }
+
   const uint16_t baseCols[4] = {
-    rgb565(0, 160, 150),
-    rgb565(180, 30, 160),
-    rgb565(70, 200, 35),
-    rgb565(35, 70, 150)
+    rgb565(0, 160, 150), rgb565(180, 30, 160),
+    rgb565(70, 200, 35), rgb565(35, 70, 150)
   };
   const int pw = W / 2, ph = (H - 20) / 2;
 
@@ -627,21 +862,25 @@ static void modeDrum() {
     int px = (i % 2) * pw;
     int py = 12 + (i / 2) * ph;
     float boost = 0.f;
-    if (g_loopOn && phase >= 0.f) {
-      // 4 beats across the loop; map each pad to a beat slot for visible backflow
-      float beat = fmodf(phase * 4.f, 4.f);
-      float d = fabsf(beat - (float)i);
-      if (d > 2.f) d = 4.f - d;
-      // beat 0 = bright, others dimmer when their slot hits
-      float hit = 1.f - d;
-      if (hit < 0) hit = 0;
-      boost = (i == 0) ? hit * 0.55f : hit * 0.28f;
-      // also global downbeat flash on all pads faintly
-      float down = 1.f - fabsf(phase - 0.f) * 8.f;
-      if (down < 0) down = 0;
-      boost = fmaxf(boost, down * 0.2f);
+    if (phase >= 0.f) {
+      if (g_tempoMode) {
+        // all pads pulse together in tempo edit
+        float d = phase;
+        if (d > 0.5f) d = 1.f - d;
+        boost = (1.f - d * 2.f) * 0.5f;
+        if (boost < 0) boost = 0;
+      } else {
+        float beat = fmodf(phase * 4.f, 4.f);
+        float d = fabsf(beat - (float)i);
+        if (d > 2.f) d = 4.f - d;
+        float hit = 1.f - d;
+        if (hit < 0) hit = 0;
+        boost = (i == 0) ? hit * 0.55f : hit * 0.28f;
+        float down = 1.f - fabsf(phase) * 8.f;
+        if (down < 0) down = 0;
+        boost = fmaxf(boost, down * 0.2f);
+      }
     }
-    // brighten base color
     uint8_t r = ((baseCols[i] >> 11) & 0x1F) << 3;
     uint8_t g = ((baseCols[i] >> 5) & 0x3F) << 2;
     uint8_t b = (baseCols[i] & 0x1F) << 3;
@@ -652,20 +891,26 @@ static void modeDrum() {
     if (g_padArmed[i] && ((millis() / 200) & 1))
       c = rgb565(255, 255, 120);
     canvas.fillRoundRect(px + 4, py + 4, pw - 8, ph - 8, 10, c);
-    // soft inner glow when loop pulse hits
-    if (boost > 0.15f) {
+    if (boost > 0.15f)
       canvas.drawRoundRect(px + 8, py + 8, pw - 16, ph - 16, 8,
                            rgb565(255, 255, (uint8_t)(180 + boost * 75)));
-    }
     canvas.setTextColor(rgb565(15, 12, 25));
     canvas.setTextSize(2);
     canvas.setCursor(px + pw / 2 - 24, py + ph / 2 - 8);
     canvas.print(PAD_NAME[i]);
+    canvas.setTextSize(1);
     if (g_padSample[i]) {
-      canvas.setTextSize(1);
       canvas.setCursor(px + 12, py + ph - 22);
       canvas.print("SMP");
     }
+  }
+
+  if (g_tempoMode) {
+    canvas.fillRoundRect(60, 100, 200, 36, 6, rgb565(30, 20, 50));
+    canvas.setTextColor(rgb565(255, 220, 100));
+    canvas.setTextSize(1);
+    canvas.setCursor(75, 112);
+    canvas.printf("TEMPO  %.0f BPM  tap pads  B=ok", g_bpm);
   }
 }
 
@@ -676,7 +921,6 @@ static void drawChrome() {
   canvas.setCursor(4, 2);
   canvas.printf("SYNAPSE  %s", names[g_mode]);
 
-  // B-button hint
   canvas.setCursor(100, 2);
   canvas.setTextColor(rgb565(160, 150, 180));
   switch (g_mode) {
@@ -689,14 +933,19 @@ static void drawChrome() {
       canvas.printf("[B] track:%s", g_eyeTrack ? "ON" : "off");
       break;
     case MODE_TUNNEL:
-      canvas.printf("[B] warp:%s", g_tunnelWarp ? "ON" : "off");
+      canvas.print("[B] dive");
       break;
-    case MODE_PULSE:
-      canvas.printf("[B] mirror:%s", g_pulseMirror ? "ON" : "off");
+    case MODE_PULSE: {
+      const char *pp[] = {"wave", "mirror", "star", "ribbon", "chaos"};
+      canvas.printf("[B] %s", pp[g_pulsePat]);
       break;
+    }
     case MODE_DRUM: {
-      bool anyArm = g_padArmed[0] || g_padArmed[1] || g_padArmed[2] || g_padArmed[3];
-      canvas.printf("[B] %s", anyArm ? "REC" : (g_loopOn ? "STOP" : "LOOP"));
+      if (g_tempoMode) canvas.print("[B] set tempo");
+      else {
+        bool anyArm = g_padArmed[0] || g_padArmed[1] || g_padArmed[2] || g_padArmed[3];
+        canvas.printf("[B] %s", anyArm ? "REC" : (g_loopOn ? "STOP" : "LOOP"));
+      }
       break;
     }
     default: break;
@@ -710,8 +959,11 @@ static void drawChrome() {
   canvas.setTextColor(rgb565(90, 100, 120));
   canvas.setCursor(8, H - 11);
   canvas.print("< mode");
-  canvas.setCursor(120, H - 11);
-  canvas.printf("tilt %.1f %.1f", g_ax, g_ay);
+  canvas.setCursor(90, H - 11);
+  if (g_imuOk)
+    canvas.printf("imu %.2f %.2f", g_lookX, g_lookY);
+  else
+    canvas.print("imu --");
   canvas.setCursor(250, H - 11);
   canvas.print("mode >");
 }
@@ -721,6 +973,7 @@ static void nextMode(int dir) {
   if (m < 0) m = MODE_COUNT - 1;
   if (m >= MODE_COUNT) m = 0;
   g_mode = (Mode)m;
+  g_tempoMode = false;
   hap(100, 25);
   if (g_mode != MODE_DRUM) {
     M5.Speaker.end();
@@ -728,7 +981,7 @@ static void nextMode(int dir) {
   }
 }
 
-static void btnB() {
+static void btnBShort() {
   switch (g_mode) {
     case MODE_SWARM:
       g_swarmVar = (SwarmVar)((g_swarmVar + 1) % SV_COUNT);
@@ -739,14 +992,20 @@ static void btnB() {
       hap(90, 20);
       break;
     case MODE_TUNNEL:
-      g_tunnelWarp = !g_tunnelWarp;
-      hap(90, 20);
+      // nudge deeper
+      hap(100, 25);
       break;
     case MODE_PULSE:
-      g_pulseMirror = !g_pulseMirror;
+      g_pulsePat = (PulsePat)((g_pulsePat + 1) % PP_COUNT);
       hap(90, 20);
       break;
     case MODE_DRUM: {
+      if (g_tempoMode) {
+        g_tempoMode = false;
+        recomputeLoopLen();
+        hap(120, 40);
+        break;
+      }
       int armed = -1;
       for (int i = 0; i < 4; i++) if (g_padArmed[i]) { armed = i; break; }
       if (armed >= 0) {
@@ -762,6 +1021,7 @@ static void btnB() {
         g_loopN = 0;
         g_loopStart = millis();
         g_loopPlayI = 0;
+        recomputeLoopLen();
         hap(80, 25);
       }
       break;
@@ -770,14 +1030,38 @@ static void btnB() {
   }
 }
 
+static void btnBLong() {
+  if (g_mode != MODE_DRUM) return;
+  g_tempoMode = true;
+  g_tempoTapN = 0;
+  g_bpm = 120.f;
+  recomputeLoopLen();
+  hap(150, 50);
+}
+
 static void handleInput() {
   M5.update();
   hapService();
 
+  // B long-press detection
+  if (M5.BtnB.isPressed()) {
+    if (g_btnBDown == 0) g_btnBDown = millis();
+    else if (!g_btnBLong && millis() - g_btnBDown > 650) {
+      g_btnBLong = true;
+      btnBLong();
+    }
+  }
+  if (M5.BtnB.wasReleased()) {
+    if (!g_btnBLong && g_btnBDown && millis() - g_lastBtn > 160)
+      btnBShort();
+    g_btnBDown = 0;
+    g_btnBLong = false;
+    g_lastBtn = millis();
+  }
+
   if (millis() - g_lastBtn > 180) {
     if (M5.BtnA.wasPressed()) { nextMode(-1); g_lastBtn = millis(); }
     if (M5.BtnC.wasPressed()) { nextMode(1); g_lastBtn = millis(); }
-    if (M5.BtnB.wasPressed()) { btnB(); g_lastBtn = millis(); }
   }
 
   auto td = M5.Touch.getDetail();
@@ -786,15 +1070,47 @@ static void handleInput() {
       int col = td.x < W / 2 ? 0 : 1;
       int row = td.y < (12 + (H - 20) / 2) ? 0 : 1;
       int id = row * 2 + col;
-      if (id >= 0 && id < 4) {
-        g_padHoldId = id;
-        g_padHoldStart = millis();
-        playPad((Pad)id, true);
+      if (id < 0 || id > 3) return;
+
+      if (g_tempoMode) {
+        // tap tempo
+        uint32_t now = millis();
+        if (g_tempoTapN > 0 && now - g_tempoTaps[g_tempoTapN - 1] > 2000)
+          g_tempoTapN = 0;
+        if (g_tempoTapN < 8) g_tempoTaps[g_tempoTapN++] = now;
+        if (g_tempoTapN >= 2) {
+          float sum = 0;
+          int cnt = 0;
+          for (int i = 1; i < g_tempoTapN; i++) {
+            float dt = (float)(g_tempoTaps[i] - g_tempoTaps[i - 1]);
+            if (dt > 200.f && dt < 2000.f) { sum += dt; cnt++; }
+          }
+          if (cnt > 0) {
+            float avg = sum / cnt;
+            g_bpm = 60000.f / avg;
+            if (g_bpm < 40.f) g_bpm = 40.f;
+            if (g_bpm > 240.f) g_bpm = 240.f;
+            recomputeLoopLen();
+          }
+        }
+        hap(60, 15);
+        return;
       }
+
+      // armed pad tapped again → clear sample + cancel arm
+      if (g_padArmed[id]) {
+        clearPadSample(id);
+        g_padArmed[id] = false;
+        g_padHoldId = -1;
+        return;
+      }
+
+      g_padHoldId = id;
+      g_padHoldStart = millis();
+      playPad((Pad)id, true);
     }
-    if (td.isPressed() && g_padHoldId >= 0) {
+    if (td.isPressed() && g_padHoldId >= 0 && !g_tempoMode) {
       if (millis() - g_padHoldStart > 3000) {
-        // arm for record
         for (int i = 0; i < 4; i++) g_padArmed[i] = (i == g_padHoldId);
         g_padHoldId = -1;
         hap(140, 60);
@@ -814,18 +1130,17 @@ void setup() {
   cfg.internal_spk = true;
   M5.begin(cfg);
   M5.Display.setRotation(1);
-  if (!M5.Imu.begin()) {
-    // still try — some builds init IMU inside M5.begin
-  }
-  // warm up a few IMU samples
-  for (int i = 0; i < 10; i++) {
-    M5.Imu.update();
-    delay(5);
+  // IMU is initialized by M5.begin when present (any Core2 revision).
+  // Optional: load factory/user calibration from NVS if available.
+  if (M5.Imu.isEnabled()) {
+    M5.Imu.loadOffsetFromNVS();
+    for (int i = 0; i < 15; i++) { M5.Imu.update(); delay(4); }
   }
   canvas.setColorDepth(16);
   canvas.createSprite(W, H);
   srand((unsigned)esp_random());
   seedParticles();
+  recomputeLoopLen();
   splash();
   loadAllPads();
   M5.Mic.begin();
@@ -838,20 +1153,19 @@ void loop() {
     sampleAudio();
     sampleImu();
   } else {
-    sampleImu(); // still allow shake
-    serviceLoop();
+    sampleImu();
+    if (!g_tempoMode) serviceLoop();
   }
 
   g_t += 0.03f + g_level * 0.02f;
-  g_hue += 0.12f;
+  g_hue += 0.12f + g_level * 0.08f;
   if (g_hue >= 360.f) g_hue -= 360.f;
 
-  // clear only via sprite (one push = no tear/flicker)
   canvas.fillSprite(rgb565(8, 4, 16));
 
   switch (g_mode) {
     case MODE_SWARM:  modeSwarm(); break;
-    case MODE_EYE:    modeEyeFixed(); break;
+    case MODE_EYE:    modeEye(); break;
     case MODE_TUNNEL: modeTunnel(); break;
     case MODE_PULSE:  modePulse(); break;
     case MODE_DRUM:   modeDrum(); break;
