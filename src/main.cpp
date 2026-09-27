@@ -543,27 +543,31 @@ static void modeEye() {
 
   auto td = M5.Touch.getDetail();
   if (td.wasPressed()) {
-    floatstatic void modeTunnel() {
+    float dx = td.x - cx, dy = td.y - cy;
+    if (dx * dx + dy * dy < 55.f * 55.f) {
+      g_poke = 1.f;
+      hap(200, 60);
+    }
+  }
+}
+
+static void modeTunnel() {
   static float z = 0;
-  // Interesting deep point; we keep reframing so zoom never dies
   static float fcx = -0.743643887037151f;
   static float fcy = 0.131825904205312f;
 
   float speed = 0.12f + g_level * 0.25f + g_peak * 0.1f;
 
-  // DIVE = into the hole (rings expand toward viewer)
-  // RECEDE = opposite
-  // User reported dive felt like recede — invert sense here:
+  // DIVE into hole vs RECEDE out
   if (g_tunnelMode == TM_DIVE || g_tunnelMode == TM_PORTAL || g_tunnelMode == TM_FRACTAL)
-    z -= speed;   // dive: decrease depth param so rings grow
+    z -= speed;
   else
-    z += speed;   // recede
+    z += speed;
 
   float spin = g_t * 0.3f + g_lookX * 1.4f;
   int cx = W / 2 + (int)(g_lookX * -50.f);
   int cy = H / 2 + (int)(g_lookY * 42.f);
 
-  // Touch drag pans fractal / tunnel aim
   auto td = M5.Touch.getDetail();
   if (td.isPressed() && td.y > 16 && td.y < H - 16) {
     if (g_touchPrevX >= 0) {
@@ -573,7 +577,6 @@ static void modeEye() {
         g_fracPanX -= dx * 0.0035f / g_fracZoom;
         g_fracPanY -= dy * 0.0035f / g_fracZoom;
       } else {
-        // nudge aim
         g_lookX += dx * 0.004f;
         g_lookY += dy * 0.004f;
       }
@@ -586,19 +589,13 @@ static void modeEye() {
   }
 
   if (g_tunnelMode == TM_FRACTAL) {
-    // Continuous fractal dive (Mandelbulber-style endless zoom)
-    // IMU steers the target point; touch pans; zoom never "runs out"
     fcx += g_lookX * 0.00008f / g_fracZoom + g_fracPanX * 0.02f;
     fcy += g_lookY * 0.00008f / g_fracZoom + g_fracPanY * 0.02f;
     g_fracPanX *= 0.85f;
     g_fracPanY *= 0.85f;
     g_fracZoom *= 1.f + 0.012f + g_level * 0.01f;
-    // Precision reset: fold zoom back and keep diving
-    if (g_fracZoom > 1e5f) {
-      g_fracZoom *= 0.1f;
-    }
+    if (g_fracZoom > 1e5f) g_fracZoom *= 0.1f;
 
-    // Half-res for speed (every 2px) — still full coverage feel
     const int step = 2;
     const int maxIt = 18;
     for (int iy = 14; iy < H - 14; iy += step) {
@@ -614,9 +611,8 @@ static void modeEye() {
           if (zr * zr + zi * zi > 4.f) break;
         }
         uint16_t col;
-        if (k >= maxIt) {
-          col = rgb565(0, 0, 0);
-        } else {
+        if (k >= maxIt) col = rgb565(0, 0, 0);
+        else {
           float mu = (float)k + g_t * 0.5f + g_level * 4.f;
           col = hsv565(g_hue + mu * 14.f + logf(g_fracZoom) * 8.f, 0.9f,
                        0.25f + 0.5f * (k / (float)maxIt) + g_peak * 0.15f);
@@ -624,30 +620,24 @@ static void modeEye() {
         canvas.fillRect(ix, iy, step, step, col);
       }
     }
-    // steer reticle
     canvas.drawCircle(cx, cy, 10, hsv565(g_hue + 40.f, 0.5f, 0.7f));
     canvas.drawLine(cx - 5, cy, cx + 5, cy, rgb565(255, 255, 200));
     canvas.drawLine(cx, cy - 5, cx, cy + 5, rgb565(255, 255, 200));
   } else {
-    // Light backdrop
     drawPsyBg();
-
-    // Infinite tunnel: many rings, depth never runs out (fmod forever)
     const float period = 14.f;
     const int rings = 16;
     for (int ring = 0; ring < rings; ring++) {
       float depth = fmodf(fabsf(z) + ring * (period / rings), period);
       if (depth < 0.15f) depth = 0.15f;
-      // audio morphs ring radius and lobe count
       float rad = (150.f + g_level * 50.f + g_peak * 20.f * sinf(ring + g_t * 3.f)) / depth;
       float spinR = spin + g_level * 0.4f * sinf(ring * 0.5f + g_t);
-      int sides = 5 + ((int)(g_peak * 4.f + ring * 0.3f) % 4); // 5..8
+      int sides = 5 + ((int)(g_peak * 4.f + ring * 0.3f) % 4);
       uint16_t c = hsv565(g_hue + ring * 13.f + g_t * 20.f + depth * 6.f,
                           0.85f, 0.2f + (1.f - depth / period) * 0.55f);
       for (int k = 0; k < sides; k++) {
         float a0 = spinR + k * (2.f * (float)M_PI / sides);
         float a1 = spinR + (k + 1) * (2.f * (float)M_PI / sides);
-        // audio warps vertices
         float w0 = 1.f + g_level * 0.25f * sinf(a0 * 3.f + g_t * 2.f);
         float w1 = 1.f + g_level * 0.25f * sinf(a1 * 3.f + g_t * 2.f);
         canvas.drawLine(
@@ -692,11 +682,6 @@ static void modeEye() {
 
     canvas.fillCircle(cx, cy, 2 + (int)(g_level * 8),
                       hsv565(g_hue + g_t * 50.f, 1.f, 0.5f + g_peak * 0.4f));
-  }
-}
-
-illCircle(cx, cy, 2 + (int)(g_level * 10),
-                      hsv565(g_hue + g_t * 50.f, 1.f, 0.55f + g_peak * 0.4f));
   }
 }
 
@@ -870,59 +855,162 @@ static int autoTrim(int16_t *buf, int n) {
 }
 
 static void playPad(Pad p, bool recordIntoLoop) {
-  // Free I2S from mic so speaker can run
+  // Non-blocking as possible: don't thrash Mic/Speaker every hit
   if (M5.Mic.isEnabled()) M5.Mic.end();
-  if (!M5.Speaker.isEnabled()) M5.Speaker.begin();
-  M5.Speaker.setVolume(220);
+  if (!M5.Speaker.isEnabled()) {
+    M5.Speaker.begin();
+    M5.Speaker.setVolume(220);
+  }
 
   if (g_padSample[p] && g_padSampleLen[p] > 40) {
-    // Mono raw @ 16k — playRaw is DMA; do not delay the whole buffer
     M5.Speaker.playRaw(g_padSample[p], (size_t)g_padSampleLen[p], 16000, false);
     if (p == PAD_KICK) kickSubHaptic();
-    else if (p == PAD_SNARE) hap(90, 22);
+    else if (p == PAD_SNARE) hap(90, 18);
   } else {
-    // Synth fallback — short single tones (Speaker queues)
     switch (p) {
       case PAD_KICK:
-        M5.Speaker.tone(55, 100);
+        M5.Speaker.tone(55, 90);
         kickSubHaptic();
         break;
       case PAD_SNARE:
-        M5.Speaker.tone(200, 25);
-        M5.Speaker.tone(3200, 40);
-        hap(80, 18);
+        M5.Speaker.tone(200, 20);
+        M5.Speaker.tone(3200, 35);
+        hap(70, 15);
         break;
       case PAD_HAT_C:
-        M5.Speaker.tone(9000, 12);
+        M5.Speaker.tone(9000, 10);
         break;
       case PAD_HAT_O:
-        M5.Speaker.tone(7500, 45);
+        M5.Speaker.tone(7500, 35);
         break;
     }
   }
 
   if (recordIntoLoop && g_loopOn && g_loopN < LOOP_MAX) {
     uint32_t at = (millis() - g_loopStart) % g_loopLenMs;
-    g_loopEv[g_loopN] = (uint8_t)p;
-    g_loopAt[g_loopN] = (uint16_t)at;
+    // insert sorted by time so playback stays ordered
+    int pos = g_loopN;
+    while (pos > 0 && g_loopAt[pos - 1] > (uint16_t)at) {
+      g_loopEv[pos] = g_loopEv[pos - 1];
+      g_loopAt[pos] = g_loopAt[pos - 1];
+      pos--;
+    }
+    g_loopEv[pos] = (uint8_t)p;
+    g_loopAt[pos] = (uint16_t)at;
     g_loopN++;
   }
-  g_micRestoreAt = millis() + 180; // let sample start, then free speaker for mic
+  g_micRestoreAt = millis() + 150;
 }
 
-static void serviceMicSpeaker() {
-  if (g_micRestoreAt && millis() >= g_micRestoreAt) {
-    g_micRestoreAt = 0;
-    if (g_mode != MODE_DRUM || g_tempoMode) {
-      // non-drum always wants mic
+static void serviceLoop() {
+  if (!g_loopOn || g_loopN <= 0) return;
+
+  uint32_t now = millis();
+  uint32_t elapsed = (now - g_loopStart) % g_loopLenMs;
+  g_loopPulse = (float)elapsed / (float)g_loopLenMs;
+
+  // Edge-detect each event once per cycle — NEVER clear the loop here
+  static uint32_t prevElapsed = 0;
+  static uint32_t armedMask = 0; // bits: which events still need to fire this cycle
+
+  bool wrapped = elapsed < prevElapsed;
+  if (wrapped || armedMask == 0) {
+    // new cycle — re-arm all events (loop continues until user stops)
+    if (g_loopN >= 32) armedMask = 0xFFFFFFFFu;
+    else armedMask = (1u << g_loopN) - 1u;
+  }
+
+  for (int i = 0; i < g_loopN; i++) {
+    if (!(armedMask & (1u << i))) continue;
+    uint16_t at = g_loopAt[i];
+    bool cross = false;
+    if (wrapped) {
+      // fired if in the tail after prevElapsed OR in the head up to elapsed
+      if (at >= prevElapsed || at <= elapsed + 12) cross = true;
+    } else {
+      if (prevElapsed < at && elapsed + 12 >= at) cross = true;
+      // also catch if we jumped past it
+      if (prevElapsed < at && elapsed >= at) cross = true;
     }
-    if (g_mode != MODE_DRUM) {
-      M5.Speaker.end();
-      if (!M5.Mic.isEnabled()) M5.Mic.begin();
+    if (cross) {
+      playPad((Pad)g_loopEv[i], false);
+      armedMask &= ~(1u << i);
     }
   }
+  prevElapsed = elapsed;
 }
 
+static void modeDrum() {
+  // FULL SCREEN beat pulse when loop is active — the whole stage breathes
+  float phase = g_loopOn ? g_loopPulse : (g_tempoMode
+      ? fmodf((float)millis(), 60000.f / g_bpm) / (60000.f / g_bpm)
+      : -1.f);
+
+  float beatFlash = 0.f;
+  if (phase >= 0.f) {
+    // 4 beats per loop: sharp attack, soft decay
+    float b = fmodf(phase * 4.f, 1.f);
+    beatFlash = (1.f - b) * (1.f - b); // bright on each beat
+    // stronger on downbeat
+    int which = (int)(phase * 4.f) % 4;
+    if (which == 0) beatFlash *= 1.f;
+    else beatFlash *= 0.55f;
+  }
+
+  // Base + full-screen pulse wash
+  uint8_t br = (uint8_t)(12 + beatFlash * 50.f);
+  uint8_t bg = (uint8_t)(8 + beatFlash * 30.f);
+  uint8_t bb = (uint8_t)(20 + beatFlash * 70.f);
+  canvas.fillSprite(rgb565(br, bg, bb));
+  if (beatFlash > 0.15f) {
+    // expanding ring from center on the beat
+    int rad = (int)(20 + beatFlash * 140.f);
+    canvas.drawCircle(W / 2, H / 2, rad, hsv565(g_hue + beatFlash * 40.f, 0.6f, beatFlash * 0.7f));
+    canvas.drawCircle(W / 2, H / 2, rad / 2, hsv565(g_hue + 80.f, 0.5f, beatFlash * 0.4f));
+  }
+
+  const uint16_t baseCols[4] = {
+    rgb565(0, 160, 150), rgb565(180, 30, 160),
+    rgb565(70, 200, 35), rgb565(35, 70, 150)
+  };
+  const int pw = W / 2, ph = (H - 20) / 2;
+
+  for (int i = 0; i < 4; i++) {
+    int px = (i % 2) * pw;
+    int py = 12 + (i / 2) * ph;
+    uint16_t c = baseCols[i];
+    if (g_padArmed[i] && ((millis() / 200) & 1))
+      c = rgb565(255, 255, 120);
+    // slight lift on beat without being the metronome itself
+    if (beatFlash > 0.5f) {
+      uint8_t r = ((c >> 11) & 0x1F) << 3;
+      uint8_t g = ((c >> 5) & 0x3F) << 2;
+      uint8_t b = (c & 0x1F) << 3;
+      r = (uint8_t)fminf(255.f, r + beatFlash * 40.f);
+      g = (uint8_t)fminf(255.f, g + beatFlash * 40.f);
+      b = (uint8_t)fminf(255.f, b + beatFlash * 30.f);
+      c = rgb565(r, g, b);
+    }
+    canvas.fillRoundRect(px + 6, py + 6, pw - 12, ph - 12, 10, c);
+    canvas.setTextColor(rgb565(15, 12, 25));
+    canvas.setTextSize(2);
+    canvas.setCursor(px + pw / 2 - 24, py + ph / 2 - 8);
+    canvas.print(PAD_NAME[i]);
+    canvas.setTextSize(1);
+    if (g_padSample[i]) {
+      canvas.setCursor(px + 14, py + ph - 24);
+      canvas.print("SMP");
+    }
+  }
+
+  if (g_tempoMode) {
+    canvas.fillRoundRect(60, 98, 200, 36, 8, rgb565(20, 12, 36));
+    canvas.setTextColor(hsv565(160, 0.5f, 0.9f));
+    canvas.setTextSize(1);
+    canvas.setCursor(78, 110);
+    canvas.printf("tempo  %.0f   tap · B holds", g_bpm);
+  }
+}
 
 static void recordPadSample(int pad) {
   const int nMax = 7200;
