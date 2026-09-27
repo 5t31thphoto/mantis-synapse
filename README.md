@@ -1,4 +1,4 @@
-# SYNAPSE — a small green god in a glass panel
+# SYNAPSE — a small green bug in a glass panel
 
 Psychedelic praying-mantis fidget toy, calm physics room and dancing / singing mantis puppet for the **M5Stack Core2**.
 Everything listens (mic spectrum, beats, voice), everything feels (IMU tilt, shake, touch, haptics).
