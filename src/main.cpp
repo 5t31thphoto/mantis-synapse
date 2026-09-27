@@ -7,6 +7,10 @@
 #include "app.h"
 #include "audio.h"
 #include "fx.h"
+#include "wire.h"
+#ifndef HOST
+#include <Preferences.h>
+#endif
 #include "mantis_splash.h"
 #include <string.h>
 
@@ -34,26 +38,94 @@ static int g_pulsePat = 0;
 static bool g_eyeTrack = true;
 static bool g_mantisSing = false;
 
-// ---------------- haptics (non-blocking, I2C writes only on change) ----------------
-static uint32_t g_hapUntil = 0, g_kickStart = 0, g_kickEnd = 0;
+// ---------------- haptics: an expressive little mixer for the vibration motor ----------------
+// The Core2 motor is an ERM whose strength follows setVibration(0..255), so we shape it:
+//   taps      short hits with a decaying tail (hap)
+//   rumble    a continuous layer: amount, pulse rate (Hz) and grit (roughness), refreshed per frame
+//   gestures  keyframed envelopes (hapGesture) for moments that deserve a shape
+//   cut       instant silence (hapCut), e.g. the moment we cross into a new dimension
+// Everything is max-mixed, remapped above the motor's dead zone, and written only when it changes.
+static uint32_t g_hapUntil = 0, g_hapStart = 0, g_kickStart = 0, g_kickEnd = 0, g_quietUntil = 0, g_lastVibWrite = 0;
 static uint8_t g_hapLevel = 0, g_vibNow = 255;
-static void vib(uint8_t v) { if (v != g_vibNow) { g_vibNow = v; M5.Power.setVibration(v); } }
+static float g_rumAmt = 0, g_rumTarget = 0, g_rumRate = 6.f, g_rumGrit = 0, g_rumPh = 0, g_rumJit = 0;
+static uint32_t g_rumStamp = 0, g_rumJitAt = 0, g_hapT = 0;
+struct HapKey { uint8_t level; uint16_t ms; };
+static const HapKey *g_gest = nullptr; static int g_gestN = 0, g_gestI = 0; static uint32_t g_gestT0 = 0; static uint8_t g_gestFrom = 0;
+static const HapKey G_THREAD[]  = {{150, 22}, {40, 45}, {220, 28}, {0, 110}};                                   // ta-DING
+static const HapKey G_CHAIN[]   = {{90, 70}, {170, 60}, {60, 50}, {200, 70}, {90, 50}, {255, 110}, {0, 260}};   // swelling triple
+static const HapKey G_MISS[]    = {{170, 18}, {110, 90}, {50, 110}, {85, 70}, {0, 240}};                        // dull wobble, sinking
+static const HapKey G_THUNDER[] = {{50, 160}, {150, 120}, {80, 170}, {210, 90}, {120, 260}, {70, 320}, {0, 480}};   // rolling, far away
+static const HapKey G_SETTLE[]  = {{120, 40}, {0, 90}, {170, 55}, {0, 160}};                                    // two soft pulses: done
+static const HapKey G_REBIRTH[] = {{30, 250}, {140, 350}, {230, 200}, {0, 30}};                                 // swell, then gone
+static const HapKey G_PAIN[]    = {{255, 30}, {120, 60}, {190, 40}, {60, 140}, {0, 160}};                       // flinch + throb
+static const HapKey *const GEST[] = {G_THREAD, G_CHAIN, G_MISS, G_THUNDER, G_SETTLE, G_REBIRTH, G_PAIN};
+static const int GEST_N[] = {4, 7, 5, 7, 4, 4, 5};
+
+static void vib(uint8_t v) {
+  uint32_t now = millis();
+  if (v == g_vibNow) return;
+  if (v != 0 && g_vibNow != 0 && abs((int)v - (int)g_vibNow) < 4) return;       // don't spam I2C with tiny changes
+  if (v != 0 && now - g_lastVibWrite < 4) return;
+  g_vibNow = v; g_lastVibWrite = now; M5.Power.setVibration(v);
+}
 void hap(uint8_t level, uint16_t ms) {
-  if (level >= g_hapLevel || millis() >= g_hapUntil) { g_hapLevel = level; g_hapUntil = millis() + ms; }
+  if (millis() < g_quietUntil) return;
+  if (level >= g_hapLevel || millis() >= g_hapUntil) { g_hapLevel = level; g_hapStart = millis(); g_hapUntil = millis() + ms; }
 }
 void kickSubHaptic() { g_kickStart = millis(); g_kickEnd = g_kickStart + 150; }
+void hapRumble(float amount, float rateHz, float grit) {
+  g_rumTarget = clampf(amount, 0.f, 1.f); g_rumRate = rateHz; g_rumGrit = clampf(grit, 0.f, 1.f); g_rumStamp = millis();
+}
+void hapGesture(uint8_t id) {
+  if (millis() < g_quietUntil || id >= sizeof(GEST_N) / sizeof(GEST_N[0])) return;
+  g_gestFrom = g_vibNow == 255 ? 0 : g_vibNow; g_gest = GEST[id]; g_gestN = GEST_N[id]; g_gestI = 0; g_gestT0 = millis();
+}
+void hapCut(uint16_t quietMs) {
+  g_rumAmt = g_rumTarget = 0; g_gest = nullptr; g_hapLevel = 0; g_hapUntil = 0; g_kickEnd = 0;
+  g_quietUntil = millis() + quietMs;
+  g_vibNow = 0; M5.Power.setVibration(0);
+}
 static void hapService() {
   uint32_t now = millis();
-  if (g_kickEnd && now < g_kickEnd) {                 // "subwoofer" throb, not a phone buzz
-    float u = (float)(now - g_kickStart) / (float)(g_kickEnd - g_kickStart);
-    float env = (1.f - u) * (1.f - u);
-    vib((uint8_t)(env * (((now / 9) & 1) ? 230 : 40)));
-    return;
+  float dt = (now - g_hapT) / 1000.f; if (dt > 0.1f) dt = 0.1f; g_hapT = now;
+  if (now < g_quietUntil) { vib(0); return; }
+  float out = 0;
+  // taps: hit hard, then a soft tail
+  if (g_hapLevel && now < g_hapUntil) {
+    float u = (float)(now - g_hapStart) / (float)(g_hapUntil - g_hapStart + 1);
+    out = fmaxf(out, g_hapLevel / 255.f * (1.f - 0.45f * u * u));
+  } else g_hapLevel = 0;
+  // kick "subwoofer" throb
+  if (g_kickEnd && now < g_kickEnd) {
+    float u = (float)(now - g_kickStart) / (float)(g_kickEnd - g_kickStart), env = (1.f - u) * (1.f - u);
+    out = fmaxf(out, env * (((now / 9) & 1) ? 0.9f : 0.15f));
+  } else g_kickEnd = 0;
+  // rumble: eases toward its target; if nobody refreshes it, it fades away
+  if (now - g_rumStamp > 120) g_rumTarget = 0;
+  g_rumAmt += (g_rumTarget - g_rumAmt) * clampf(dt * (g_rumTarget > g_rumAmt ? 10.f : 6.f), 0.f, 1.f);
+  if (g_rumAmt > 0.01f) {
+    g_rumPh += dt * g_rumRate; if (g_rumPh > 1000.f) g_rumPh -= 1000.f;
+    float w = 0.5f + 0.5f * sinf(g_rumPh * 6.2831853f);
+    w = w * w * (3.f - 2.f * w);                                 // rounder throb
+    if (now - g_rumJitAt > 12) { g_rumJitAt = now; g_rumJit = (esp_random() % 1000) / 1000.f; }
+    float floor_ = 0.45f + 0.5f * g_rumAmt * g_rumAmt;            // strong rumbles fill in: pulses become a roar
+    float v = g_rumAmt * (floor_ + (1.f - floor_) * w) * (1.f - g_rumGrit * 0.35f * g_rumJit);
+    out = fmaxf(out, v);
   }
-  g_kickEnd = 0;
-  if (g_hapLevel && now < g_hapUntil) { vib(g_hapLevel); return; }
-  g_hapLevel = 0;
-  vib(0);
+  // gesture: linear ramps between keyframes
+  if (g_gest) {
+    uint32_t e = now - g_gestT0;
+    while (g_gest && e >= g_gest[g_gestI].ms) {
+      e -= g_gest[g_gestI].ms; g_gestT0 += g_gest[g_gestI].ms; g_gestFrom = g_gest[g_gestI].level;
+      if (++g_gestI >= g_gestN) g_gest = nullptr;
+    }
+    if (g_gest) {
+      float u = (float)e / (float)(g_gest[g_gestI].ms + 1);
+      out = fmaxf(out, (g_gestFrom + (g_gest[g_gestI].level - g_gestFrom) * u) / 255.f);
+    }
+  }
+  // above the dead zone the motor responds; below it, silence
+  vib(out < 0.03f ? 0 : (uint8_t)(55.f + out * 200.f));
 }
 
 // ---------------- frame pipeline: render core 1, push core 0 ----------------
@@ -97,12 +169,18 @@ static bool takeTap(int &x, int &y) {
   return true;
 }
 static void nextMode(int dir);
+enum CalState : uint8_t { CAL_IDLE = 0, CAL_RING, CAL_RUN, CAL_DONE };
+static uint8_t s_cal = CAL_IDLE;
+static uint32_t s_calT = 0;
+static int s_calX = 0, s_calY = 0;
+static float s_calS[3]; static int s_calN = 0;
 static void btnBShort();
 static void eyePoke(int x, int y);
 static uint32_t s_bDown = 0;
 static uint32_t s_touchDown = 0;
 static int s_touchX0 = 0, s_touchY0 = 0;
 static bool s_longFired = false;
+static bool s_centreTouch = false;
 
 static void pollInput() {
   M5.update();
@@ -120,21 +198,50 @@ static void pollInput() {
     else if (inStage) {
       g_tapLatch = true; g_tapX = td.x; g_tapY = td.y;
       s_touchDown = now; s_touchX0 = td.x; s_touchY0 = td.y; s_longFired = false;
+      s_centreTouch = (td.x - W / 2) * (td.x - W / 2) + (td.y - H / 2) * (td.y - H / 2) < 52 * 52;
       if (g_mode == MODE_EYE) eyePoke(td.x, td.y);
       else if (g_mode == MODE_MANTIS) mantisTap(td.x, td.y);
       else if (g_mode == MODE_CALM) calmTouch(td.x, td.y, true);
     }
   } else if (td.isPressed() && inStage && s_touchDown) {
-    if (abs(td.x - s_touchX0) + abs(td.y - s_touchY0) > 14) s_touchDown = 0;   // it's a drag
-    else if (!s_longFired && now - s_touchDown > 600) {
-      s_longFired = true;
-      if (g_mode == MODE_CALM) { calmLongPress(); hap(60, 60); }
+    if (abs(td.x - s_touchX0) + abs(td.y - s_touchY0) > 14) { s_touchDown = 0; if (s_cal == CAL_RING) s_cal = CAL_IDLE; }   // a drag
+    else {
+      uint32_t held = now - s_touchDown;
+      if (!s_longFired && !s_centreTouch && held > 600) {
+        s_longFired = true;
+        if (g_mode == MODE_CALM) { calmLongPress(); hap(60, 60); }
+      }
+      // hold still near the centre: after 2 s a ring closes in on the finger, then we calibrate
+      if (s_centreTouch && s_cal == CAL_IDLE && held > 2000) { s_cal = CAL_RING; s_calT = now; s_calX = td.x; s_calY = td.y; }
+      if (s_cal == CAL_RING && now - s_calT > 1200) { s_cal = CAL_RUN; s_calT = now; s_calN = 0; s_calS[0] = s_calS[1] = 0; hapCut(1150); }   // motor off: it would shake the gyro
     }
   }
-  if (!td.isPressed()) s_touchDown = 0;
+  if (td.wasReleased() && s_touchDown && s_centreTouch && s_cal == CAL_IDLE && g_mode == MODE_CALM) {
+    uint32_t held = now - s_touchDown;
+    if (held > 600 && held < 2000) { calmLongPress(); hap(60, 60); }
+  }
+  if (!td.isPressed()) { s_touchDown = 0; if (s_cal == CAL_RING) s_cal = CAL_IDLE; }
 }
 
 // ---------------- sensors ----------------
+// g_lookX/Y and g_gravX/Y: exactly V12 (gaze, parallax, swarm chaos, calm gravity were right).
+// g_flyX/Y: steering for flight modes, measured from the neutral pose captured during calibration,
+// with a deadzone, so holding the Core2 at your natural angle no longer keeps pushing one way.
+float g_flyX = 0, g_flyY = 0;
+static float s_neutX = 0, s_neutY = 0;
+static void loadCal() {
+#ifndef HOST
+  Preferences p;
+  if (p.begin("synapse", true)) { s_neutX = p.getFloat("nx", 0.f); s_neutY = p.getFloat("ny", 0.f); p.end(); }
+#endif
+}
+static void saveCal() {
+#ifndef HOST
+  Preferences p;
+  if (p.begin("synapse", false)) { p.putFloat("nx", s_neutX); p.putFloat("ny", s_neutY); p.end(); }
+#endif
+}
+static inline float softDz(float v, float dz) { return v > dz ? v - dz : (v < -dz ? v + dz : 0.f); }
 static void sampleImu() {
   if (!M5.Imu.update()) return;
   auto d = M5.Imu.getImuData();
@@ -143,18 +250,64 @@ static void sampleImu() {
   g_gx = d.gyro.x; g_gy = d.gyro.y; g_gz = d.gyro.z;
   g_gravX = -g_ay; g_gravY = g_ax;
   float tx = -g_ay, ty = g_ax;
+  if (s_cal == CAL_RUN) { s_calS[0] += tx; s_calS[1] += ty; s_calN++; }
   if (fabsf(tx) < 0.08f) tx = 0;
   if (fabsf(ty) < 0.08f) ty = 0;
   if (fabsf(g_gx) + fabsf(g_gy) > 8.f) { g_lookX += g_gy * 0.0025f; g_lookY += g_gx * 0.0025f; }
   float k = (fabsf(tx) + fabsf(ty) < 0.15f) ? 0.22f : 0.12f;
   g_lookX += (tx - g_lookX) * k; g_lookY += (ty - g_lookY) * k;
   g_lookX = clampf(g_lookX, -1.1f, 1.1f); g_lookY = clampf(g_lookY, -1.1f, 1.1f);
+  g_flyX = clampf(softDz(g_lookX - s_neutX, 0.06f) * 1.3f, -1.1f, 1.1f);
+  g_flyY = clampf(softDz(g_lookY - s_neutY, 0.06f) * 1.3f, -1.1f, 1.1f);
   float mag = sqrtf(ax * ax + ay * ay + az * az);
   g_shake = g_shake * 0.8f + fabsf(mag - 1.f) * 0.2f;
   if (g_shake > 0.5f && millis() - g_shakeAt > 350) {
     g_shakeAt = millis(); g_shakeKick = true;
     g_hue = fmodf(g_hue + 40.f + (esp_random() % 120), 360.f);
     hap(150, 40);
+  }
+}
+static void calService() {
+  uint32_t now = millis();
+  if (s_cal == CAL_RING) {                                  // a heartbeat that quickens as the ring closes
+    float u = clampf((now - s_calT) / 1200.f, 0.f, 1.f);
+    hapRumble(0.25f + u * 0.35f, 1.3f + u * 5.5f, 0.f);
+  }
+  // M5Unified's own gyro offset calibration runs while the device is held still (its documented method),
+  // then the offsets are saved to NVS. The neutral pose for flying is averaged over the same second.
+  static bool calOn = false;
+  if (s_cal == CAL_RUN && !calOn) { calOn = true; M5.Imu.setCalibration(0, 200, 0); }
+  if (s_cal == CAL_RUN && now - s_calT > 1200) {
+    M5.Imu.setCalibration(0, 0, 0); calOn = false;
+    M5.Imu.saveOffsetToNVS();
+    if (s_calN >= 8) { s_neutX = s_calS[0] / s_calN; s_neutY = s_calS[1] / s_calN; saveCal(); }
+    g_lookX = -g_ay; g_lookY = g_ax;
+    s_cal = CAL_DONE; s_calT = now; hapGesture(HG_SETTLE);
+  } else if (s_cal == CAL_DONE && now - s_calT > 900) s_cal = CAL_IDLE;
+}
+static void drawCal() {
+  uint32_t now = millis();
+  if (s_cal == CAL_RING) {
+    float u = clampf((now - s_calT) / 1200.f, 0.f, 1.f), r = 64.f * (1.f - u) * (1.f - u * 0.3f);
+    canvas.drawCircle(s_calX, s_calY, (int)r + 2, wire::PLUM);
+    canvas.drawCircle(s_calX, s_calY, (int)r + 1, wire::TEAL);
+    canvas.drawCircle(s_calX, s_calY, (int)r, wire::LIME);
+    for (int k = 0; k < 6; k++) {                              // six sigils converge with the ring
+      float a = k * 1.0471976f + u * 3.f;
+      canvas.fillCircle(s_calX + (int)(cosf(a) * r), s_calY + (int)(sinf(a) * r), 2, wire::LIME);
+    }
+    canvas.fillCircle(s_calX, s_calY, 1 + (int)(u * 3.f), wire::LIME);
+  } else if (s_cal == CAL_RUN || s_cal == CAL_DONE) {
+    bool run = s_cal == CAL_RUN;
+    canvas.fillRoundRect(60, 96, 200, 48, 10, rgb565(4, 18, 20));
+    canvas.drawRoundRect(60, 96, 200, 48, 10, wire::TEAL);
+    canvas.drawRoundRect(61, 97, 198, 46, 9, wire::PLUM);
+    canvas.setTextSize(1); canvas.setTextColor(wire::LIME);
+    const char *t = run ? "hold still & flat - calibrating" : "calibrated";
+    canvas.setCursor(160 - (int)strlen(t) * 3, 108); canvas.print(t);
+    float u = run ? clampf((now - s_calT) / 1200.f, 0.f, 1.f) : 1.f;
+    canvas.fillRect(80, 126, (int)(160 * u), 4, wire::TEAL);
+    canvas.drawRect(80, 126, 160, 4, wire::PLUM);
   }
 }
 
@@ -181,6 +334,12 @@ static void addTrail(int x, int y, uint16_t c) {
 }
 static void drawPsyBg() {
   float pulse = 0.08f + g_level * 0.18f + g_peak * 0.12f;
+  // mantis aura: teal / plum breathing with the room's sound
+  for (int y = 14; y < H - 14; y += 4) {
+    float u = (float)(y - 14) / (H - 28), s = 0.5f + 0.5f * sinf(u * 6.f + g_t * 0.7f);
+    float k = 0.10f + g_level * 0.25f;
+    canvas.fillRect(0, y, W, 4, rgb565((uint8_t)(93 * s * k), (uint8_t)(115 * (1.f - s) * k), (uint8_t)((115 * (1.f - s) + 93 * s) * k)));
+  }
   for (int i = 0; i < 12; i++) {
     float yy = 16.f + fmodf(i * 19.f + g_t * (12.f + g_level * 40.f) + g_lookY * 30.f + 400.f, (float)(H - 30));
     canvas.drawFastHLine(0, (int)yy, W, hsv565(g_hue + i * 18.f + g_t * 15.f, 0.7f, pulse * (0.5f + 0.5f * sinf(i + g_t * 2.f))));
@@ -211,6 +370,15 @@ static void modeSwarm() {
   }
   float gx = 0, gy = 0;
   if (g_swarmVar == SV_CHAOS) { gx = g_lookX * 0.85f; gy = g_lookY * 0.85f; }
+  if (g_shakeKick) {                                    // shake: the swarm bursts apart
+    for (int i = 0; i < N_PART; i++) {
+      float a = (esp_random() % 6283) / 1000.f, s = 6.f + (esp_random() % 800) / 100.f;
+      float ox = g_p[i].x - W * 0.5f, oy = g_p[i].y - H * 0.5f, on = sqrtf(ox * ox + oy * oy) + 1.f;
+      g_p[i].vx += cosf(a) * s + ox / on * 5.f; g_p[i].vy += sinf(a) * s + oy / on * 5.f;
+      g_p[i].hue += 60.f;
+      addTrail((int)g_p[i].x, (int)g_p[i].y, hsv565(g_hue + i * 5.f, 0.9f, 0.9f));
+    }
+  }
   float pulse = 0.45f + g_level * 1.5f;
   float soundHue = g_hue + g_level * 100.f + g_peak * 40.f + aud::centroid * 90.f;
   float metaR = (g_swarmVar == SV_ORBIT) ? 220.f : 500.f;
@@ -220,9 +388,9 @@ static void modeSwarm() {
       float dx = g_p[i].x - g_p[j].x, dy = g_p[i].y - g_p[j].y, d2 = dx * dx + dy * dy;
       if (d2 < metaR && d2 > 1.f) {
         float tt = 1.f - d2 / metaR;
-        int br = 2 + (int)(tt * (g_swarmVar == SV_ORBIT ? 4.f : 8.f) * (0.5f + g_level));
+        int br = 2 + (int)(tt * (g_swarmVar == SV_ORBIT ? 4.f : 8.f) * (0.5f + g_level + aud::bass * 0.6f));
         canvas.fillCircle((int)((g_p[i].x + g_p[j].x) * 0.5f), (int)((g_p[i].y + g_p[j].y) * 0.5f), br,
-                          hsv565(soundHue + i + j, 0.75f, 0.2f + tt * 0.4f));
+                          hsv565(soundHue + i + j, 0.75f, 0.2f + tt * (0.4f + aud::onset * 0.4f)));
         g_p[i].vx -= dx * metaPull * tt; g_p[i].vy -= dy * metaPull * tt;
         g_p[j].vx += dx * metaPull * tt; g_p[j].vy += dy * metaPull * tt;
       }
@@ -255,7 +423,7 @@ static void modeSwarm() {
     if (p.y < 16) { p.y = 16; p.vy *= -0.6f; }
     if (p.y > H - 18) { p.y = H - 18; p.vy *= -0.6f; }
     float h = soundHue + p.hue * 0.3f + i * 2.f, v = 0.4f + g_level * 0.5f + g_peak * 0.15f;
-    int r = 3 + (int)(g_level * 6.f) + (i & 1);
+    int r = 3 + (int)(g_level * 7.f + aud::bass * 5.f + aud::onset * 3.f) + (i & 1);   // the mic makes them swell and throb
     uint16_t col = hsv565(h, 0.8f, v);
     canvas.fillCircle((int)p.x, (int)p.y, r, col);
     if (r > 4) canvas.fillCircle((int)p.x - 1, (int)p.y - 1, r / 2, hsv565(h + 20.f, 0.5f, fminf(1.f, v + 0.2f)));
@@ -299,7 +467,6 @@ static void eyePoke(int x, int y) {
   s_flinch = 1.f; s_shakeEye = 1.f; s_angry = fminf(1.f, s_angry + 0.4f);
   s_pokeX = x; s_pokeY = y; s_pokeAt = millis();
   hap(255, bull ? 140 : 90);
-  aud::sfx(0.85f + s_pain * 0.35f + (bull ? 0.25f : 0.f));
   int n = 6 + (int)(s_pain * 8.f) + (bull ? 6 : 0);
   for (int i = 0; i < n; i++) {
     bool left = i & 1;
@@ -533,26 +700,30 @@ static void tunnelRender(bool dive) {
       fillSlice(s_sl[(s_zi + 255) & 255], pathX(z) + aud::bass * 0.25f * sinf(z * 0.3f), pathY(z));
     }
     // steer: tilt (and drag) moves the camera inside the tube
-    s_camX += (g_lookX * 1.5f + dragX * 8.f) * dt * (1.f + g_level);
-    s_camY += (g_lookY * 1.2f + dragY * 8.f) * dt * (1.f + g_level);
+    s_camX += (g_flyX * 1.5f + dragX * 8.f) * dt * (1.f + g_level);
+    s_camY += (g_flyY * 1.2f + dragY * 8.f) * dt * (1.f + g_level);
     float nx = s_sl[(s_zi + 6) & 255].ox / 50.f, ny = s_sl[(s_zi + 6) & 255].oy / 50.f;
+    if (fabsf(g_flyX) + fabsf(g_flyY) < 0.05f) {            // hands level: drift gently back to the middle of the tube
+      s_camX += (nx - s_camX) * clampf(dt * 0.5f, 0, 1); s_camY += (ny - s_camY) * clampf(dt * 0.5f, 0, 1);
+    }
     float ex = s_camX - nx, ey = s_camY - ny, er = sqrtf(ex * ex + ey * ey);
     if (er > 0.62f) {
       s_camX = nx + ex / er * 0.6f; s_camY = ny + ey / er * 0.6f;
-      if (s_scrape < 0.3f) hap(170, 45);
+      if (s_scrape < 0.3f) hap(170, 25);
       s_scrape = 1.f;
     }
   } else {
     s_tz -= speed * dt;
     int zi = (int)floorf(s_tz);
-    s_bendX += (g_lookX * 1.4f + dragX * 10.f + sinf(g_t * 3.f) * aud::bass * 0.8f) * dt;
-    s_bendY += (g_lookY * 1.1f + dragY * 10.f + cosf(g_t * 2.3f) * aud::mid * 0.6f) * dt;
+    s_bendX += (g_flyX * 1.4f + dragX * 10.f + sinf(g_t * 3.f) * aud::bass * 0.8f) * dt;
+    s_bendY += (g_flyY * 1.1f + dragY * 10.f + cosf(g_t * 2.3f) * aud::mid * 0.6f) * dt;
     s_bendX = clampf(s_bendX, -2.4f, 2.4f); s_bendY = clampf(s_bendY, -2.4f, 2.4f);
     while (s_zi > zi) { s_zi--; fillSlice(s_sl[(s_zi + 2) & 255], s_bendX, s_bendY); }
     s_camX += (s_bendX - s_camX) * clampf(dt * 8.f, 0, 1);
     s_camY += (s_bendY - s_camY) * clampf(dt * 8.f, 0, 1);
   }
   s_scrape = fmaxf(0.f, s_scrape - dt * 3.f);
+  if (s_scrape > 0.05f) hapRumble(0.3f + s_scrape * 0.5f, 26.f, 0.9f);
 
   // per-depth tables
   float spin = g_t * (dive ? 20.f : -14.f) + g_gz * 0.05f;
@@ -594,8 +765,16 @@ static void tunnelRender(bool dive) {
   float h = g_hue / 360.f;
   if (dive) fx::palCosine(0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 1.f, 1.f, 1.f, 0.0f + h, 0.33f + h + aud::centroid * 0.3f, 0.67f + h, g_t * 0.05f);
   else fx::palCosine(0.5f, 0.4f, 0.6f, 0.5f, 0.45f, 0.4f, 1.f, 0.8f, 0.6f, 0.8f + h, 0.2f + h, 0.5f + h, -g_t * 0.04f);
+  fx::palOpal(0.22f + g_level * 0.15f, 0.5f + g_lookX * 0.35f + g_lookY * 0.25f + g_t * 0.03f, g_t * 0.05f, 0.35f + aud::onset * 0.5f);
   fx::palFlash(s_scrape * 0.7f + aud::onset * 0.25f);
   fx::present(canvas);
+  {  // geometric wireframe glitching through the ether, riding the tube's bend
+    float vpX = 160.f + s_offX[40] * 2.f, vpY = 120.f + s_offY[40] * 2.f;
+    float gl = 0.06f + aud::onset * 0.9f + g_level * 0.15f + s_scrape * 0.6f;
+    wire::tunnelRings(vpX, vpY, s_tz * 0.07f, 0.25f * sinf(g_t * 0.4f) + aud::mid * 0.3f, g_level + aud::bass * 0.5f, gl, !dive);
+    if (aud::onset > 0.5f)                                        // on hits: a crystal phases through
+      wire::tesseract(vpX, vpY, 16.f + aud::bass * 22.f, g_t * 1.3f, g_t * 0.9f, g_t * 0.5f, 0.5f, wire::LIME);
+  }
 
   if (dive) {    // reticle shows where the tube heads next
     int rx = 160 + (int)(s_offX[40] * 2), ry = 120 + (int)(s_offY[40] * 2);
@@ -607,6 +786,7 @@ static void tunnelRender(bool dive) {
 
 // ---- fractal: morphing Julia, adaptive quality, orbit-trap colouring (no flat fields) ----
 static float s_fx = 0, s_fy = 0, s_fs = 3.2f / 160.f, s_frot = 0, s_fzoomDir = -1.f;
+static float s_reborn = 0, s_empty = 0;          // dissolve progress, time spent in a void
 static int s_fIt = 22, s_preset = 0;
 static float s_cTr = 1.f;
 static float s_cr0 = -0.8f, s_ci0 = 0.156f, s_crP = -0.8f, s_ciP = 0.156f;
@@ -641,12 +821,11 @@ static void fractalRender() {
 
   // steer with tilt, rotate with twist, breathe zoom with bass
   float c = cosf(s_frot), s = sinf(s_frot);
-  s_fx += (c * g_lookX - s * g_lookY) * s_fs * 70.f * dt;
-  s_fy += (s * g_lookX + c * g_lookY) * s_fs * 70.f * dt;
+  s_fx += (c * g_flyX - s * g_flyY) * s_fs * 70.f * dt;
+  s_fy += (s * g_flyX + c * g_flyY) * s_fs * 70.f * dt;
   s_frot += (g_gz * 0.004f + 0.05f) * dt;
+  s_fzoomDir = -1.f;                                   // always diving
   s_fs *= expf(s_fzoomDir * dt * (0.22f + g_level * 0.5f));
-  if (s_fs < 0.00002f) s_fzoomDir = 1.f;
-  if (s_fs > 3.6f / 160.f) { s_fzoomDir = -1.f; s_fx *= 0.98f; s_fy *= 0.98f; }
   s_fx = clampf(s_fx, -1.8f, 1.8f); s_fy = clampf(s_fy, -1.4f, 1.4f);
   float sc = s_fs * (1.f - aud::bass * 0.12f);
 
@@ -694,166 +873,224 @@ static void fractalRender() {
     float mx = detX / detN - 80.f, my = detY / detN - 60.f;
     s_fx += (ux * mx + vx * my) * dt * 0.6f; s_fy += (uy * mx + vy * my) * dt * 0.6f;
   }
-  if (inN > 17000 || loN > 17000 || detN < 60) s_fzoomDir = 1.f;
-  else if (detN > 1500 && s_fzoomDir > 0 && s_fs < 2.5f / 160.f) s_fzoomDir = -1.f;
+  // too deep for float precision, or lost in a void: the dive loops into a new world
+  s_empty = (inN > 16000 || loN > 16000 || detN < 60) ? s_empty + dt : fmaxf(0.f, s_empty - dt);
+  if (s_fs < 3e-6f || s_empty > 1.2f) {
+    memcpy(fx::back, fx::buf, fx::LW * fx::LH);
+    s_preset = (s_preset + 1 + (esp_random() % 3)) % 8;
+    s_crP = s_cr0 = PRESETS[s_preset][0]; s_ciP = s_ci0 = PRESETS[s_preset][1]; s_cTr = 1.f;
+    s_fs = 3.0f / 160.f; s_fx = 0; s_fy = 0; s_empty = 0; s_reborn = 1.f;
+    hapGesture(HG_REBIRTH);
+  }
+  if (s_reborn > 0) {                                  // dither-dissolve: the old world keeps falling inward
+    s_reborn = fmaxf(0.f, s_reborn - dt * 0.9f);
+    float zf = 1.f + (1.f - s_reborn) * 1.5f;
+    int thr = (int)(s_reborn * 255.f);
+    for (int y = 0; y < fx::LH; y++)
+      for (int x = 0; x < fx::LW; x++) {
+        uint32_t hsh = (uint32_t)(x * 73856093u ^ y * 19349663u); hsh ^= hsh >> 13; hsh *= 0x5bd1e995u; hsh ^= hsh >> 15;
+        if ((int)(hsh & 255) < thr) {
+          int sx = 80 + (int)((x - 80) / zf), sy = 60 + (int)((y - 60) / zf);
+          fx::buf[y * fx::LW + x] = fx::back[sy * fx::LW + sx];
+        }
+      }
+  }
   float h = g_hue / 360.f + aud::centroid * 0.4f;
   fx::palCosine(0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 2.f, 1.f, 1.f + g_level, 0.5f + h, 0.2f + h, 0.25f + h, g_t * 0.03f);
-  fx::palFlash(aud::onset * 0.3f);
+  fx::palOpal(0.25f, 0.5f + g_lookX * 0.35f + g_lookY * 0.25f, g_t * 0.04f, 0.3f + aud::onset * 0.6f);
+  fx::palFlash(aud::onset * 0.3f + s_reborn * 0.2f);
   fx::present(canvas);
   uint32_t took = micros() - t0;                       // adaptive quality, demo-style
   if (took > 21000 && s_fIt > 12) s_fIt--;
   else if (took < 14000 && s_fIt < 40) s_fIt++;
 }
 
-// ---- portal: warp-speed through dimensions ----
+// ---- portal: fly the ether; thread 3 hoops to summon a portal; fly INTO the next dimension ----
 struct Star { float x, y, z, pz; };
 static Star s_st[200];
-static float s_wx = 0, s_wy = 0, s_wz = 0, s_pcx = 0, s_pcy = 0, s_transit = 0, s_emerge = 0;
-static int s_combo = 0, s_dim = 0;
-static float s_dimP[12];
-static uint32_t s_wSpawn = 0;
-static bool s_wAlive = false;
-static void newDimension() {
-  for (int i = 0; i < 12; i++) s_dimP[i] = (esp_random() % 1000) / 1000.f;
-  s_dim++;
+static float s_pcx = 0, s_pcy = 0, s_emerge = 0;
+static int s_dim = 0;
+static float s_dimP[12], s_nextP[12];
+static float s_hx = 0, s_hy = 0, s_hz = 0, s_hoopFlash = 0;   // the current hoop (world x/y, depth)
+static bool s_hoopAlive = false;
+static int s_hoopN = 0;                                          // consecutive hoops threaded (0..3)
+static uint32_t s_hoopNext = 0;
+static float s_ptx = 0, s_pty = 0, s_ptz = 0;                  // the portal
+static bool s_portal = false;
+static uint16_t s_palN[256];                                     // next dimension's palette (byte-swapped 565)
+static void rollDim(float *p) { for (int i = 0; i < 12; i++) p[i] = (esp_random() % 1000) / 1000.f; }
+static void dimPalette(const float *p, float t, int set) {       // set=0 -> fx palette, 1 -> s_palN
+  float hA = p[0] * 360.f + t * 6.f + aud::centroid * 60.f, hB = hA + 60.f + p[1] * 180.f;
+  for (int i = 0; i < 256; i++) {
+    float u = i / 255.f;
+    uint16_t c = u < 0.25f ? hsv565(hA, 0.8f, 0.06f + u * 1.4f)
+                 : (u < 0.7f ? hsv565(hA + (hB - hA) * (u - 0.25f) / 0.45f, 0.85f - (u - 0.25f) * 0.6f, 0.4f + u * 0.6f)
+                             : hsv565(hB, (1.f - u) * 1.6f, 1.f));
+    if (set == 0) fx::palSet(i, (uint8_t)(((c >> 11) & 31) << 3), (uint8_t)(((c >> 5) & 63) << 2), (uint8_t)((c & 31) << 3));
+    else s_palN[i] = (uint16_t)((c >> 8) | (c << 8));
+  }
+}
+static inline int nebulaAt(const float *p, int x, int y, float t, int ox, int oy) {
+  uint8_t t1 = (uint8_t)(t * (8.f + p[5] * 20.f)), t2 = (uint8_t)(t * 13.f), t3 = (uint8_t)(-t * 11.f);
+  int f1 = 1 + (int)(p[6] * 3.f), f2 = 1 + (int)(p[7] * 3.f);
+  return fx::sn[(uint8_t)((x + ox) * f1 + t1)] + fx::sn[(uint8_t)((y + oy) * f2 + t2)] + fx::sn[(uint8_t)((x + y + ox) * 2 + t3)];
 }
 static void portalRender() {
   float dt = g_dt;
   static bool init = false;
   if (!init) {
-    init = true; newDimension();
+    init = true; rollDim(s_dimP); rollDim(s_nextP); s_dim = 1;
     for (auto &s : s_st) { s.x = ((int)(esp_random() % 2000) - 1000) / 1000.f; s.y = ((int)(esp_random() % 2000) - 1000) / 1000.f; s.z = s.pz = (esp_random() % 1000) / 1000.f + 0.05f; }
+    s_hoopNext = millis() + 1500;
   }
   float speed = 0.45f + aud::bass * 1.3f + g_level * 0.6f + aud::onset * 0.8f;
   auto td = M5.Touch.getDetail();
-  float steerX = g_lookX, steerY = g_lookY;
+  float steerX = g_flyX, steerY = g_flyY;
   if (td.isPressed() && td.y > 14 && td.y < H - 14) { steerX = (td.x - 160) / 90.f; steerY = (td.y - 120) / 70.f; }
+#ifdef PORTAL_AUTOPILOT
+  { float ax_ = s_portal ? s_ptx - s_pcx : s_hx - s_pcx, ay_ = s_portal ? s_pty - s_pcy : s_hy - s_pcy; steerX = clampf(ax_ * 3.f, -1.f, 1.f); steerY = clampf(ay_ * 3.f, -1.f, 1.f); }
+#endif
   s_pcx += steerX * dt * 0.9f; s_pcy += steerY * dt * 0.9f;
 
+  // ---- this dimension: feedback streaks + nebula + stars ----
   fx::swap();
-  if (s_transit > 0) {
-    // inside the wormhole: swirling LUT tunnel accelerating to a white-out
-    s_transit -= dt;
-    float u = 1.f - s_transit / 1.5f;
-    uint8_t spin = (uint8_t)(g_t * 300.f), fly = (uint8_t)(g_t * (400.f + u * 900.f));
+  float swirl = (s_dimP[3] - 0.5f) * 0.05f + g_gz * 0.0004f;
+  float zoom = 1.035f + aud::bass * 0.05f;
+  float c = cosf(swirl), s = sinf(swirl);
+  for (int j = 0; j < fx::GH; j++)
+    for (int i = 0; i < fx::GW; i++) {
+      float dx = i * 8.f - 80.f, dy = j * 8.f - 60.f;
+      fx::gx[j][i] = 80.f + (c * dx + s * dy) / zoom; fx::gy[j][i] = 60.f + (-s * dx + c * dy) / zoom;
+    }
+  fx::warp((uint8_t)(12 + s_dimP[4] * 10.f), false);
+  {
+    int ox = (int)(s_pcx * 40.f), oy = (int)(s_pcy * 40.f), lift = 34 + (int)(aud::mid * 40.f);
+    float t = g_t;
     auto rows_ = [&](int y0, int y1) {
-    for (int y = y0; y < y1; y++) {
-      uint8_t *row = fx::buf + y * fx::LW;
-      for (int x = 0; x < fx::LW; x++) {
-        uint16_t t = fx::tunAt(x - 80 + (int)(sinf(g_t * 5.f) * 6.f), y - 60);
-        int d = t & 255, a = t >> 8;
-        int v = fx::sn[(uint8_t)(a * 3 + d * 2 + spin)] + fx::sn[(uint8_t)(d * 6 - fly)] + 128 + (int)(aud::bands[(a >> 3) & 31] * 60.f);
-        v = (v * (d < 200 ? 255 : (255 - (d - 200) * 4))) >> 8;
-        row[x] = (uint8_t)clampf((float)v, 1, 255);
-      }
-    }
-  };
-  fx::parallel(rows_);
-    fx::palCosine(0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 1.f, 1.f, 1.f, s_dimP[0], s_dimP[1], s_dimP[2], g_t * 0.2f);
-    fx::palFlash(u > 0.7f ? (u - 0.7f) * 3.3f : 0.f);
-    hap((uint8_t)(60 + u * 150.f), 40);
-    if (s_transit <= 0) {
-      newDimension(); s_combo++; s_emerge = 1.f; s_wAlive = false; s_wSpawn = millis() + 700;
-      hap(220, 120); fx::clear(0);
-    }
-  } else {
-    // feedback: dimension-specific swirl + zoom = streaks and nebula smear
-    float swirl = (s_dimP[3] - 0.5f) * 0.05f + g_gz * 0.0004f;
-    float zoom = 1.035f + aud::bass * 0.05f;
-    float c = cosf(swirl), s = sinf(swirl);
-    for (int j = 0; j < fx::GH; j++)
-      for (int i = 0; i < fx::GW; i++) {
-        float dx = i * 8.f - 80.f, dy = j * 8.f - 60.f;
-        fx::gx[j][i] = 80.f + (c * dx + s * dy) / zoom; fx::gy[j][i] = 60.f + (-s * dx + c * dy) / zoom;
-      }
-    fx::warp((uint8_t)(12 + s_dimP[4] * 10.f), false);
-    // this dimension's nebula: a slow plasma under the streaks (max-blend, dim)
-    {
-      uint8_t t1 = (uint8_t)(g_t * (8.f + s_dimP[5] * 20.f)), t2 = (uint8_t)(g_t * 13.f), t3 = (uint8_t)(-g_t * 11.f);
-      int f1 = 1 + (int)(s_dimP[6] * 3.f), f2 = 1 + (int)(s_dimP[7] * 3.f);
-      int ox = (int)(s_pcx * 40.f), oy = (int)(s_pcy * 40.f);
-      int lift = 34 + (int)(aud::mid * 40.f);
-      auto rows_ = [&](int y0, int y1) {
-    for (int y = y0; y < y1; y++) {
+      for (int y = y0; y < y1; y++) {
         uint8_t *row = fx::buf + y * fx::LW;
-        int ry = fx::sn[(uint8_t)((y + oy) * f2 + t2)];
         for (int x = 0; x < fx::LW; x++) {
-          int n = fx::sn[(uint8_t)((x + ox) * f1 + t1)] + ry + fx::sn[(uint8_t)((x + y + ox) * 2 + t3)];
+          int n = nebulaAt(s_dimP, x, y, t, ox, oy);
           n = n > 0 ? (n * lift) >> 8 : 0;
           if (n > row[x]) row[x] = (uint8_t)n;
         }
       }
-  };
-  fx::parallel(rows_);
-    }
-    // nebula motes
-    for (int k = 0; k < 3; k++) {
-      float a = g_t * (0.2f + k * 0.13f) + s_dimP[5 + k] * 6.28f;
-      fx::disc(80 + (int)(cosf(a) * (30 + k * 12)), 60 + (int)(sinf(a * 1.3f) * (20 + k * 8)), 2 + (int)(aud::mid * 4.f), (uint8_t)(40 + k * 12));
-    }
-    // stars
-    float fov = 95.f + aud::bass * 30.f;
-    for (auto &st : s_st) {
-      st.pz = st.z;
-      st.z -= speed * dt * (0.6f + s_dimP[6]);
-      float sx0 = 80.f + (st.x - s_pcx * 0.3f) / st.pz * fov * 0.5f, sy0 = 60.f + (st.y - s_pcy * 0.3f) / st.pz * fov * 0.5f;
-      if (st.z < 0.03f) { st.x = ((int)(esp_random() % 2000) - 1000) / 1000.f; st.y = ((int)(esp_random() % 2000) - 1000) / 1000.f; st.z = st.pz = 1.f; continue; }
-      float sx = 80.f + (st.x - s_pcx * 0.3f) / st.z * fov * 0.5f, sy = 60.f + (st.y - s_pcy * 0.3f) / st.z * fov * 0.5f;
-      uint8_t b = (uint8_t)clampf(90.f + 200.f * (1.f - st.z) + aud::treble * 60.f, 60, 255);
-      fx::line((int)sx0, (int)sy0, (int)sx, (int)sy, b);
-      if (st.z < 0.3f) fx::line((int)sx0 + 1, (int)sy0, (int)sx + 1, (int)sy, b);
-    }
-    // wormhole
-    if (!s_wAlive && millis() > s_wSpawn) {
-      s_wAlive = true; s_wz = 1.6f;
-      s_wx = s_pcx + ((int)(esp_random() % 140) - 70) / 100.f; s_wy = s_pcy + ((int)(esp_random() % 100) - 50) / 100.f;
-    }
-    if (s_wAlive) {
-      s_wz -= dt * (0.35f + speed * 0.25f);
-      float ox = s_wx - s_pcx, oy = s_wy - s_pcy;
-      float px = 80.f + ox / s_wz * 30.f, py = 60.f + oy / s_wz * 30.f;
-      float r = 11.f / s_wz * (1.f + aud::bass * 0.3f);
-      if (s_wz < 1.f) { s_pcx += ox * dt * 1.2f; s_pcy += oy * dt * 1.2f; }   // gentle aim assist
-      for (int k = 0; k < 28; k++) {
-        float a = k * 0.2244f + g_t * 4.f, rr = r * (1.f + 0.25f * sinf(k * 3.f + g_t * 9.f));
-        float a2 = a + 0.9f;
-        fx::line((int)(px + cosf(a) * rr), (int)(py + sinf(a) * rr), (int)(px + cosf(a2) * rr * 0.55f), (int)(py + sinf(a2) * rr * 0.55f), 255);
-      }
-      fx::disc((int)px, (int)py, (int)(r * 0.45f), 0);
-      fx::ring((int)px, (int)py, (int)r + 2, 200);
-      if (s_wz < 0.22f) {
-        if (ox * ox + oy * oy < 0.16f) { s_transit = 1.5f; hap(200, 80); }
-        else { s_combo = 0; hap(60, 60); }
-        s_wAlive = false; s_wSpawn = millis() + 900;
-      }
-    }
-    // palette: deep-space tint -> dimension hues -> white-hot star cores
-    {
-      float hA = s_dimP[0] * 360.f + g_t * 6.f + aud::centroid * 60.f, hB = hA + 60.f + s_dimP[1] * 180.f;
-      for (int i = 0; i < 256; i++) {
-        float u = i / 255.f;
-        uint16_t c = u < 0.25f ? hsv565(hA, 0.8f, 0.06f + u * 1.4f)
-                     : (u < 0.7f ? hsv565(hA + (hB - hA) * (u - 0.25f) / 0.45f, 0.85f - (u - 0.25f) * 0.6f, 0.4f + u * 0.6f)
-                                 : hsv565(hB, (1.f - u) * 1.6f, 1.f));
-        fx::palSet(i, (uint8_t)(((c >> 11) & 31) << 3), (uint8_t)(((c >> 5) & 63) << 2), (uint8_t)((c & 31) << 3));
-      }
-    }
-    fx::palFlash(s_emerge + aud::onset * 0.2f);
-    s_emerge = fmaxf(0.f, s_emerge - dt * 1.5f);
+    };
+    fx::parallel(rows_);
   }
+  float fov = 95.f + aud::bass * 30.f;
+  for (auto &st : s_st) {
+    st.pz = st.z;
+    st.z -= speed * dt * (0.6f + s_dimP[6]);
+    if (st.z < 0.03f) { st.x = ((int)(esp_random() % 2000) - 1000) / 1000.f; st.y = ((int)(esp_random() % 2000) - 1000) / 1000.f; st.z = st.pz = 1.f; continue; }
+    float sx0 = 80.f + (st.x - s_pcx * 0.3f) / st.pz * fov * 0.5f, sy0 = 60.f + (st.y - s_pcy * 0.3f) / st.pz * fov * 0.5f;
+    float sx = 80.f + (st.x - s_pcx * 0.3f) / st.z * fov * 0.5f, sy = 60.f + (st.y - s_pcy * 0.3f) / st.z * fov * 0.5f;
+    uint8_t b = (uint8_t)clampf(90.f + 200.f * (1.f - st.z) + aud::treble * 60.f, 60, 255);
+    fx::line((int)sx0, (int)sy0, (int)sx, (int)sy, b);
+    if (st.z < 0.3f) fx::line((int)sx0 + 1, (int)sy0, (int)sx + 1, (int)sy, b);
+  }
+  dimPalette(s_dimP, g_t, 0);
+  fx::palFlash(s_emerge * 0.6f + s_hoopFlash * 0.25f + aud::onset * 0.2f);
+  s_emerge = fmaxf(0.f, s_emerge - dt * 1.2f);
+  s_hoopFlash = fmaxf(0.f, s_hoopFlash - dt * 3.f);
   fx::present(canvas);
-  if (s_transit <= 0) {
-    canvas.drawCircle(160, 120, 6, rgb565(255, 255, 220));
-    if (s_wAlive) {   // arrow toward the wormhole
-      float ox = s_wx - s_pcx, oy = s_wy - s_pcy, d = sqrtf(ox * ox + oy * oy);
-      if (d > 0.2f) canvas.fillCircle(160 + (int)(ox / d * 18.f), 120 + (int)(oy / d * 18.f), 2, rgb565(255, 120, 255));
+
+  // ---- hoops: thread three in a row ----
+  float approach = dt * (0.42f + speed * 0.28f);
+  if (!s_portal && !s_hoopAlive && millis() > s_hoopNext) {
+    s_hoopAlive = true; s_hz = 3.2f;
+    s_hx = s_pcx + ((int)(esp_random() % 140) - 70) / 100.f; s_hy = s_pcy + ((int)(esp_random() % 100) - 50) / 100.f;
+  }
+  if (s_hoopAlive) {
+    s_hz -= approach;
+    float ox = s_hx - s_pcx, oy = s_hy - s_pcy;
+    if (s_hz < 0.18f) {
+      bool in = ox * ox + oy * oy < 0.34f * 0.34f;
+      if (in) { s_hoopN++; s_hoopFlash = 1.f; hapGesture(s_hoopN >= 3 ? HG_CHAIN : HG_THREAD); } else { s_hoopN = 0; hapGesture(HG_MISS); }
+#ifdef PORTAL_AUTOPILOT
+      printf("t=%.1f hoop %s (off %.2f,%.2f) chain=%d\n", millis() / 1000.f, in ? "THREAD" : "miss", ox, oy, s_hoopN);
+#endif
+      s_hoopAlive = false; s_hoopNext = millis() + 900;
+      if (s_hoopN >= 3) { s_portal = true; s_ptz = 4.2f; s_ptx = s_pcx + ((int)(esp_random() % 120) - 60) / 100.f; s_pty = s_pcy + ((int)(esp_random() % 80) - 40) / 100.f; }
+    } else {
+      float px = 160.f + ox / s_hz * 60.f, py = 120.f + oy / s_hz * 60.f, r = 20.f / s_hz;
+      float pulse = 1.f + aud::bass * 0.15f;
+      uint16_t main = (s_hoopN == 2) ? rgb565(255, 230, 120) : wire::LIME;
+      for (int k = 0; k < 3; k++) canvas.drawEllipse((int)px, (int)py, (int)(r * pulse) + k, (int)(r * pulse * 0.9f) + k, k == 0 ? wire::PLUM : (k == 1 ? main : wire::TEAL));
+      for (int k = 0; k < 10; k++) {                                   // beads spin faster with the music
+        float a = k * 0.6283f + g_t * (1.5f + g_level * 4.f);
+        canvas.fillCircle((int)(px + cosf(a) * r * pulse), (int)(py + sinf(a) * r * pulse * 0.9f), r > 30 ? 2 : 1, main);
+      }
     }
   }
-  if (s_combo > 0) {
-    canvas.setTextSize(2); canvas.setTextColor(hsv565(g_hue + 180.f, 0.6f, 1.f));
-    canvas.setCursor(W / 2 - 10, 20); canvas.printf("x%d", s_combo);
-    canvas.setTextSize(1);
+
+  // ---- the portal: its inside is the next dimension; fly into it ----
+  if (s_portal) {
+    s_ptz -= dt * (0.30f + speed * 0.18f);
+    float ox = s_ptx - s_pcx, oy = s_pty - s_pcy;
+    if (s_ptz < 1.6f) { s_pcx += ox * dt * 0.8f; s_pcy += oy * dt * 0.8f; }       // gentle aim assist
+    float px = 80.f + ox / s_ptz * 30.f, py = 60.f + oy / s_ptz * 30.f;          // lores
+    float r = 13.f / s_ptz * (1.f + aud::bass * 0.12f);
+    bool aligned = ox * ox + oy * oy < 0.45f * 0.45f;
+    {  // a massive disruption in space-time: you feel it before you reach it
+      float u = clampf((4.2f - s_ptz) / 4.085f, 0.f, 1.f);
+      float amt = (0.14f + 0.86f * powf(u, 2.4f)) * (0.9f + aud::bass * 0.25f);
+      hapRumble(amt, 4.f + u * u * 20.f, 0.15f + u * 0.7f);
+    }
+    float t = g_t;
+    uint8_t fly = (uint8_t)(t * 120.f), spin = (uint8_t)(t * 60.f);
+    int lift = 40 + (int)(aud::mid * 40.f);
+    auto inside = [&](int x, int y) -> int {                           // the next world, seen down its own tunnel
+      float dx = x - px, dy = y - py;
+      uint16_t tt = fx::tunAt((int)(dx * 40.f / fmaxf(r, 1.f)), (int)(dy * 40.f / fmaxf(r, 1.f)));
+      int dd = tt & 255, aa = tt >> 8;
+      int n = nebulaAt(s_nextP, x, y, t, 0, 0);
+      n = (n > 0 ? (n * lift) >> 8 : 0) + ((fx::sn[(uint8_t)(dd * 5 - fly)] + fx::sn[(uint8_t)(aa * 3 + spin)]) >> 2) + 60;
+      return n < 0 ? 0 : (n > 255 ? 255 : n);
+    };
+    if (s_ptz < 0.115f) {                                              // the portal now covers the whole view
+      if (aligned) {                                                   // we're through: this IS the new world now
+        for (int y = 0; y < fx::LH; y++) for (int x = 0; x < fx::LW; x++) fx::buf[y * fx::LW + x] = (uint8_t)inside(x, y);
+        memcpy(s_dimP, s_nextP, sizeof(s_dimP)); rollDim(s_nextP); s_dim++;
+        s_emerge = 0.f; s_hoopN = 0; s_portal = false; s_hoopNext = millis() + 2500;
+        hapCut(350);                                                     // ...and then: silence. we're through.
+#ifdef PORTAL_AUTOPILOT
+        printf("t=%.1f THROUGH PORTAL -> dim %d\n", millis() / 1000.f, s_dim);
+#endif
+      } else { s_ptz = 4.2f; s_ptx = s_pcx + ((int)(esp_random() % 120) - 60) / 100.f; s_pty = s_pcy; hapGesture(HG_MISS); }
+    } else {
+      dimPalette(s_nextP, g_t, 1);
+      uint16_t *fb = (uint16_t *)canvas.getBuffer();
+      int x0 = (int)fmaxf(0.f, px - r), x1 = (int)fminf(159.f, px + r), y0 = (int)fmaxf(0.f, py - r), y1 = (int)fminf(119.f, py + r);
+      float r2 = r * r;
+      for (int y = y0; y <= y1 && fb; y++)
+        for (int x = x0; x <= x1; x++) {
+          float dx = x - px, dy = y - py;
+          if (dx * dx + dy * dy > r2) continue;
+          uint16_t v = s_palN[inside(x, y)];
+          fb[(y * 2) * W + x * 2] = v; fb[(y * 2) * W + x * 2 + 1] = v;
+          fb[(y * 2 + 1) * W + x * 2] = v; fb[(y * 2 + 1) * W + x * 2 + 1] = v;
+        }
+      int R = (int)(r * 2.f), X = (int)(px * 2.f), Y = (int)(py * 2.f);       // crisp rim, full res
+      for (int k = 0; k < 4; k++) canvas.drawCircle(X, Y, R + k, k == 0 ? wire::LIME : (k == 1 ? wire::TEAL : (k == 2 ? wire::PLUM : rgb565(20, 0, 20))));
+      for (int k = 0; k < 18; k++) {
+        float a = k * 0.349f + g_t * (2.f + g_level * 5.f), rr = R * (1.08f + 0.06f * sinf(k * 2.f + g_t * 7.f));
+        canvas.fillCircle(X + (int)(cosf(a) * rr), Y + (int)(sinf(a) * rr), R > 60 ? 3 : 2, hsv565(s_nextP[0] * 360.f + k * 20.f, 0.7f, 1.f));
+      }
+    }
   }
+
+  // ---- HUD: aim point, hoop chain, dimension ----
+  canvas.drawCircle(160, 120, 6, rgb565(255, 255, 220));
+  float tx = 0, ty = 0; bool target = false;
+  if (s_portal) { tx = s_ptx - s_pcx; ty = s_pty - s_pcy; target = true; }
+  else if (s_hoopAlive) { tx = s_hx - s_pcx; ty = s_hy - s_pcy; target = true; }
+  if (target) { float d = sqrtf(tx * tx + ty * ty); if (d > 0.2f) canvas.fillCircle(160 + (int)(tx / d * 18.f), 120 + (int)(ty / d * 18.f), 2, wire::LIME); }
+  for (int k = 0; k < 3; k++) {
+    int cx = W / 2 - 16 + k * 16;
+    if (k < s_hoopN || s_portal) canvas.fillCircle(cx, 22, 4, wire::LIME); else canvas.drawCircle(cx, 22, 4, wire::TEAL);
+  }
+  canvas.setTextSize(1); canvas.setTextColor(wire::TEAL); canvas.setCursor(W - 50, 18); canvas.printf("dim %d", s_dim);
 }
 
 static void modeTunnel() {
@@ -881,6 +1118,34 @@ static void gridWarp(float cx, float cy, float zoom, float rot, float wobA, floa
       float sx = cx + (c * dx + s * dy) / zoom, sy = cy + (-s * dx + c * dy) / zoom;
       if (wobA != 0.f) { sx += sinf(j * wobF + wobT) * wobA; sy += cosf(i * wobF * 1.3f - wobT) * wobA; }
       fx::gx[j][i] = sx; fx::gy[j][i] = sy;
+    }
+}
+
+// ---- the crystal glass panel: a rosette of facets (mandala-symmetric Voronoi) ----
+static uint8_t *s_fid = nullptr;
+static const int NFAC = 37;
+static float s_fnx[NFAC], s_fny[NFAC];
+static int8_t s_fdx[NFAC], s_fdy[NFAC];
+static int16_t s_fsh[NFAC];
+static void crystallize() {
+  if (!s_fid) s_fid = (uint8_t *)malloc(fx::LW * fx::LH);
+  float sx[NFAC], sy[NFAC];
+  float rot = (esp_random() % 628) / 100.f;
+  int n = 0;
+  sx[n] = 80; sy[n] = 60; n++;
+  const int ringN[3] = {6, 12, 18}; const float ringR[3] = {20.f, 44.f, 74.f};
+  for (int r = 0; r < 3; r++)
+    for (int k = 0; k < ringN[r]; k++) {
+      float a = rot + (k + (r & 1) * 0.5f) * 6.2831853f / ringN[r];
+      float j = ((int)(esp_random() % 100) - 50) * 0.04f;
+      sx[n] = 80 + cosf(a) * (ringR[r] + j) * 1.25f; sy[n] = 60 + sinf(a) * (ringR[r] + j); n++;
+    }
+  for (int i = 0; i < NFAC; i++) { float a = (esp_random() % 628) / 100.f; s_fnx[i] = cosf(a); s_fny[i] = sinf(a); }
+  for (int y = 0; y < fx::LH; y++)
+    for (int x = 0; x < fx::LW; x++) {
+      int best = 0; float bd = 1e9f;
+      for (int i = 0; i < NFAC; i++) { float dx = x - sx[i], dy = (y - sy[i]) * 1.25f, d = dx * dx + dy * dy; if (d < bd) { bd = d; best = i; } }
+      s_fid[y * fx::LW + x] = (uint8_t)best;
     }
 }
 
@@ -1012,8 +1277,51 @@ static void modePulse() {
       break;
     }
   }
+  // mantis opal over the pattern's own colours; big hits let the original colours bloom through
+  static float bloom = 0;
+  bloom = fmaxf(aud::onset, bloom - dt * 1.5f);
+  float sheen = 0.5f + g_lookX * 0.4f + g_lookY * 0.3f + t * 0.015f;           // tilt it like labradorite
+  fx::palOpal(0.5f - bloom * 0.3f, sheen, t * 0.05f, 0.45f + aud::onset * 0.5f);
   fx::palFlash(aud::onset * 0.15f);
-  fx::present(canvas);
+
+  // crystal glass panel (display only): facets refract with the bass and flash with the tilt
+  if (!s_fid || g_shakeKick) crystallize();
+  float refr = 1.5f + aud::bass * 4.f + g_level * 1.5f;
+  for (int i = 0; i < NFAC; i++) {
+    s_fdx[i] = (int8_t)(s_fnx[i] * refr); s_fdy[i] = (int8_t)(s_fny[i] * refr);
+    float f = s_fnx[i] * g_lookX + s_fny[i] * g_lookY;                         // facet faces the light?
+    s_fsh[i] = (int16_t)(f * 34.f + (f > 0.55f ? 40.f : 0.f) * (0.4f + g_level));
+  }
+  fx::presentCrystal(canvas, s_fid, s_fdx, s_fdy, s_fsh, (uint8_t)(14 + g_level * 30.f));
+
+  // ---- crisp layers: no echo, so they read as glass against the liquid ----
+  int CX = cx * 2, CY = cy * 2;
+  wire::engrave(CX, CY, 36.f + aud::bass * 10.f, t * 0.04f + g_lookX * 0.15f, 1 + (int)(g_level * 2.f + aud::onset * 4.f));
+  // the waveform: bent by the same flow as the liquid, torn by loud entropy, leaves a faint ghost in the feedback
+  {
+    int py = -1, px = 0;
+    float ent = g_level * 0.35f + aud::onset * 0.3f;
+    uint32_t r = (uint32_t)(t * 1000.f);
+    for (int x = 0; x < W; x += 2) {
+      int gi = x / 16, gj = CY / 16; if (gi > fx::GW - 1) gi = fx::GW - 1; if (gj > fx::GH - 1) gj = fx::GH - 1; if (gj < 0) gj = 0;
+      float dxw = (gi * 8.f - fx::gx[gj][gi]) * 6.f, dyw = (gj * 8.f - fx::gy[gj][gi]) * 6.f;
+      int k0 = (x >> 1) & 255;
+      float sv = (sc[k0] + sc[(k0 + 1) & 255] + sc[(k0 + 2) & 255] + sc[(k0 + 3) & 255]) * 0.25f;   // flowing, not spiky
+      int y = CY + (int)(sv / 9000.f * (26.f + g_level * 30.f) + dyw);
+      int xx = x + (int)dxw;
+      r = r * 1664525u + 1013904223u;
+      bool tear = ((r >> 24) & 255) < (uint32_t)(ent * 255.f);
+      if (py >= 0 && !tear) {
+        canvas.drawLine(px, py + 2, xx, y + 2, wire::PLUM);
+        canvas.drawLine(px, py, xx, y, wire::LIME);
+        fx::line(px / 2, py / 2, xx / 2, y / 2, 70);
+      }
+      px = xx; py = y;
+    }
+  }
+  // the sage's crystal: a tesseract turning in four dimensions
+  float ts = (g_pulsePat == 2 ? 12.f : 18.f) + aud::bass * 22.f;
+  wire::tesseract(CX, CY, ts, t * 0.7f + aud::mid, t * 0.5f + aud::treble * 2.f, t * 0.3f, aud::onset * 0.6f, rgb565(40, 220, 200));
 }
 
 // ============================================================
@@ -1021,14 +1329,17 @@ static void modePulse() {
 // ============================================================
 static void drawChrome() {
   static const char *names[] = {"swarm", "eye", "tunnel", "pulse", "calm", "mantis"};
-  canvas.fillRect(0, 0, W, 13, rgb565(6, 3, 12));
-  canvas.fillRect(0, H - 13, W, 13, rgb565(6, 3, 12));
+  canvas.fillRect(0, 0, W, 13, rgb565(3, 10, 12));
+  canvas.fillRect(0, H - 13, W, 13, rgb565(3, 10, 12));
+  canvas.drawFastHLine(0, 13, W, wire::PLUM); canvas.drawFastHLine(0, H - 14, W, wire::PLUM);
+  canvas.drawFastHLine(0, 13, (int)(W * clampf(g_level, 0.f, 1.f)), wire::LIME);            // live mic meter
   canvas.setTextSize(1);
-  canvas.setTextColor(hsv565(g_hue, 0.55f, 0.75f)); canvas.setCursor(8, 3); canvas.print("synapse");
-  canvas.setTextColor(hsv565(g_hue + 40.f, 0.4f, 0.6f)); canvas.setCursor(64, 3); canvas.print(names[g_mode]);
+  canvas.setTextColor(wire::LIME); canvas.setCursor(8, 3); canvas.print("synapse");
+  canvas.setTextColor(rgb565(40, 190, 180)); canvas.setCursor(64, 3); canvas.print(names[g_mode]);
   int orb = 2 + (int)(g_level * 5.f + g_peak * 3.f);
   if (orb > 6) orb = 6;
-  canvas.fillCircle(W - 12, 6, orb, hsv565(g_hue + g_level * 60.f, 0.7f, 0.45f + g_level * 0.4f));
+  canvas.fillCircle(W - 12, 6, orb + 1, wire::PLUM);
+  canvas.fillCircle(W - 12, 6, orb, aud::onset > 0.3f ? wire::LIME : hsv565(g_hue + g_level * 60.f, 0.7f, 0.45f + g_level * 0.4f));
 
   const char *bl = "";
   switch (g_mode) {
@@ -1042,7 +1353,7 @@ static void drawChrome() {
   }
   canvas.setTextColor(hsv565(g_hue, 0.35f, 0.55f));
   canvas.setCursor(10, H - 10); canvas.print("<");
-  canvas.setTextColor(hsv565(g_hue + 20.f, 0.7f, 0.95f));
+  canvas.setTextColor(wire::LIME);
   canvas.setCursor(W / 2 - (int)strlen(bl) * 3, H - 10); canvas.print(bl);
   canvas.setTextColor(hsv565(g_hue, 0.35f, 0.55f));
   canvas.setCursor(W - 16, H - 10); canvas.print(">");
@@ -1061,7 +1372,7 @@ static void btnBShort() {
     case MODE_EYE: g_eyeTrack = !g_eyeTrack; break;
     case MODE_TUNNEL: g_tunnelMode = (TunnelMode)((g_tunnelMode + 1) % TM_COUNT); fx::clear(0); break;
     case MODE_PULSE: g_pulsePat = (g_pulsePat + 1) % PP_COUNT; break;
-    case MODE_MANTIS: g_mantisSing = !g_mantisSing; break;
+    case MODE_MANTIS: g_mantisSing = !g_mantisSing; if (g_mantisSing) aud::calibrateAmbient(3000.f); break;
     case MODE_CALM: calmNext(); break;
     default: break;
   }
@@ -1105,6 +1416,7 @@ void setup() {
   M5.begin(cfg);
   M5.Display.setRotation(1);
   if (M5.Imu.isEnabled()) { M5.Imu.loadOffsetFromNVS(); for (int i = 0; i < 15; i++) { M5.Imu.update(); delay(4); } }
+  loadCal();
 
   for (int i = 0; i < 2; i++) { s_fb[i]->setColorDepth(16); s_fb[i]->setPsram(true); }
   s_fb[0]->createSprite(W, H);
@@ -1133,6 +1445,7 @@ void loop() {
   pollInput();
   aud::service(g_dt);
   sampleImu();
+  calService();
   g_level = aud::level; g_peak = aud::peak;
   for (int i = 0; i < MIC_N; i++) g_mic[i] = aud::scope[i * 2];
 
@@ -1150,5 +1463,9 @@ void loop() {
   }
   g_shakeKick = false;
   drawChrome();
+  drawCal();
+  if (g_mode == MODE_MANTIS && g_mantisSing && aud::calibrating()) {
+    canvas.setTextColor(wire::LIME); canvas.setCursor(W / 2 - 51, 20); canvas.print("listening to the room");
+  }
   present();
 }

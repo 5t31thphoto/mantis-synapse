@@ -537,8 +537,8 @@ void mantisDraw(bool sing) {
       float gX = micX - 16.f, gY = micY + 30.f;
       float dx = gX - shX[0], dy = gY - shY[0], d = clampf(hypotf(dx, dy), fabsf(L1 - L2) + 1.f, (L1 + L2) * 0.99f);
       float th = atan2f(dy, dx), al = acosf(clampf((L1 * L1 + d * d - L2 * L2) / (2.f * L1 * d), -1.f, 1.f));
-      float ea = th + al;                                   // elbow swings out to the left
-      if (cosf(th - al) * L1 < cosf(ea) * L1) ea = th - al;
+      float ea = th + al;                                   // natural hold: the elbow drops, tucked by the body
+      if (sinf(th - al) < sinf(ea)) ea = th - al;         // (verified by render: this branch drops the elbow)
       eX = shX[0] + cosf(ea) * L1; eY = shY[0] + sinf(ea) * L1;
       uf.a = ea / DEG - boneAngle(AR, RIG_ARM_END_X, RIG_ARM_END_Y, false);
       scf.x = eX; scf.y = eY;

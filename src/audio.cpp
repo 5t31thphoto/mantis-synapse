@@ -20,6 +20,9 @@ static uint32_t s_micAt = 0;
 static int16_t s_micBuf[MIC_REC];
 static float s_floor = 400.f, s_prevBands[32], s_fluxAvg = 0.1f, s_period = 500.f;
 static uint32_t s_lastOnsetMs = 0;
+static const int CAL_BLOCKS = 28;                 // ~0.9 s of listening
+static int s_calN = CAL_BLOCKS;                   // calibrate at boot
+static float s_calAcc = 0, s_calMin = 1e9f, s_loudRef = 1200.f, s_calCap = 1000.f;
 static int16_t *s_sfx = nullptr; static int s_sfxLen = 0;
 static uint32_t s_sfxRate = SR, s_sfxUntil = 0;
 static bool s_sfxPending = false;
@@ -72,7 +75,7 @@ static void analyze(const int16_t *x, bool fromMic, float dt) {
   // AGC: fast up, slow down -> always lively, never pinned
   s_agc = mx > s_agc ? s_agc * 0.6f + mx * 0.4f : s_agc * (1.f - 0.25f * dt) + mx * 0.25f * dt;
   if (s_agc < 12000.f) s_agc = 12000.f;
-  float q = fromMic ? clampf_(level * 2.f, 0.f, 1.f) : 1.f;   // silence stays calm
+  float q = fromMic ? clampf_(level * 3.f, 0.f, 1.f) : 1.f;   // silence stays calm, any real sound opens fully
   for (int b = 0; b < 32; b++) {
     float v = clampf_(raw[b] / s_agc * 1.15f, 0.f, 1.3f) * (0.25f + 0.75f * q);
     float d = v - s_prevBands[b];
@@ -122,8 +125,17 @@ static void micBlock(float dt) {
     if (i >= MIC_REC - 256) scope[i - (MIC_REC - 256)] = (int16_t)v;
   }
   e /= MIC_REC;
-  s_floor = e < s_floor ? s_floor * 0.7f + e * 0.3f : s_floor * 0.997f + e * 0.003f;
-  float lv = clampf_((e - s_floor * 1.15f) / 4200.f, 0.f, 1.5f);
+  // ambient floor: measured by calibrateAmbient(); afterwards it only drifts while the room is
+  // genuinely quiet, so sustained music can never be mistaken for silence.
+  if (s_calN > 0) {
+    s_calAcc += e; s_calMin = fminf(s_calMin, e);
+    if (--s_calN == 0) { s_floor = clampf_((s_calAcc / CAL_BLOCKS) * 0.6f + s_calMin * 0.4f, 60.f, s_calCap); s_loudRef = 1200.f; }
+  } else if (e < s_floor * 1.6f) s_floor = e < s_floor ? s_floor * 0.9f + e * 0.1f : s_floor * 0.995f + e * 0.005f;
+  float above = fmaxf(0.f, e - s_floor * 1.2f);
+  // loudness AGC: follows the room's loud parts up fast, lets go slowly; never more sensitive than 1200
+  s_loudRef = above > s_loudRef ? s_loudRef * 0.7f + above * 0.3f : s_loudRef * 0.9985f;
+  if (s_loudRef < 1200.f) s_loudRef = 1200.f;
+  float lv = s_calN > 0 ? 0.f : clampf_(above / (s_loudRef * 0.8f), 0.f, 1.5f);
   level = lv > level ? level * 0.45f + lv * 0.55f : level * 0.82f + lv * 0.18f;
   peak = peak * 0.75f + clampf_(pk / 22000.f, 0.f, 1.5f) * 0.25f;
   float z = clampf_((float)zc / (MIC_REC * 0.35f), 0.f, 1.f);
@@ -155,6 +167,8 @@ static void toMic() {
 }
 
 void begin() { fftInit(); synthSfx(); toMic(); }
+void calibrateAmbient(float cap) { s_calN = CAL_BLOCKS; s_calAcc = 0; s_calMin = 1e9f; s_calCap = cap; }
+bool calibrating() { return s_calN > 0; }
 
 void sfx(float pitch) {
   s_sfxRate = (uint32_t)(SR * clampf_(pitch, 0.5f, 2.f));

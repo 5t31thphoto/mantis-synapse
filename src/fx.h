@@ -27,6 +27,9 @@ bool begin();
 void swap();
 void clear(uint8_t v = 0);
 void present(M5Canvas &c);
+// crystal glass panel: each facet refracts the image by its own offset and lifts it by its own
+// sheen (labradorite flash); facet borders glow. Display-only: the feedback never sees it.
+void presentCrystal(M5Canvas &c, const uint8_t *fid, const int8_t *fdx, const int8_t *fdy, const int16_t *fsh, uint8_t edge);
 void warp(uint8_t fade, bool smooth);        // buf <- back sampled through grid
 void warpIdentity();
 
@@ -36,6 +39,9 @@ void palCosine(float ar, float ag, float ab, float br, float bg, float bb,
                float gamma = 1.f);
 void palSet(int i, uint8_t r, uint8_t g, uint8_t b);
 void palFlash(float amt);                    // lift towards white
+// holographic opal / labradorite: blend the current palette towards the mantis colours
+// (teal #007373, plum #5d005d, lime) and sweep a spectral sheen band through it (sheen = tilt).
+void palOpal(float amt, float sheen, float t, float glint);
 
 // primitives (brightness = index, max-blend)
 void plot(int x, int y, uint8_t v);

@@ -51,8 +51,10 @@ changes the room's variant:
 * **sand** — sand art between glass panes. Turn it over and watch the layers stream through the water into new
   landscapes; fingertip pushes grains aside; a sound lets a bubble go. Long-press: a new sand picture.
 * **waves** — a wave-machine tank with a paper boat. Tilt to slosh, drag through the surface, hum to raise the swell.
+  The sky is the room's sound: clouds gather, rain falls and rings the water, loud hits in a storm throw lightning.
   Long-press: night, with moon glitter and bioluminescent crests.
-* **aquarium** — blacklight pebbles, plankton, a pulsing jellyfish, bubbles that wobble, merge and pop at the surface.
+* **aquarium** — blacklight pebbles that pulse with the bass, plankton you can stir, a pulsing jellyfish, fish that
+  wander, dart from taps and loud sounds and come to look at a held finger, bubbles that wobble, merge and pop.
   Tap a bubble to pop it, tap water to release some, hold to stream them. Long-press: UV on / off.
 
 **MANTIS** — the whole bug, built from separated sprites on a skeleton (IK legs, planted feet, squash & stretch),
@@ -66,6 +68,39 @@ The drum machine now lives in its own firmware, **Mantis Studio** (drums, lead, 
 dancing mantis). Synapse keeps the microphone on permanently, so every mode hears the room without dropouts, and
 the per-pixel effects render on both CPU cores.
 
+## Portal flights
+
+Fly the ether and steer through the hoops that appear in the distance. Thread **three in a row** (the dots at the
+top fill up; a miss resets the chain) and a portal appears far ahead. The next dimension is already visible inside
+it: fly into it and you're there, no loading screen. Speed follows the music; tilt or touch to steer.
+
+## Haptics
+
+The vibration motor is played, not switched: a small mixer shapes taps with soft tails, a continuous rumble
+(strength, pulse rate, grit) and keyframed gestures.
+* **Portal** - you feel it the moment it appears: a slow, heavy throb. It grows stronger, faster and grittier as it
+  approaches until the pulses merge into a roar at the crossing - then silence, the instant you're through.
+* **Hoops** - a rising "ta-DING" when you thread one, a swelling triple when the chain completes, a dull sinking
+  wobble when you miss.
+* **Dive** - scraping the tube wall is gritty and lasts exactly as long as you scrape.
+* **Fractal** - a rebirth swells and vanishes.
+* **Calm** - the flowing liquid has weight when it sloshes, big swells meeting the glass press softly, and
+  lightning brings rolling distant thunder.
+* **Calibration** - a heartbeat that quickens as the ring closes, the motor goes completely still while the gyro
+  calibrates (so it can't disturb the measurement), then two soft pulses: done.
+
+## Calibrate the tilt (do this once)
+
+Lay the Core2 flat and still, press and **hold a finger still in the middle of the screen**. After 2 seconds a
+ring closes in on your finger; then it shows **"hold still & flat - calibrating"** for about a second.
+This runs M5Unified's own gyro offset calibration (its documented method: still on a desk) and saves it to NVS,
+and it records your neutral pose for flying (dive, recede, fractal, portal steer from that pose, with a deadzone,
+so holding the Core2 at a natural angle no longer keeps pushing one way). Gaze, parallax, swarm chaos and the
+calm room's gravity use the real direction of gravity, so rotating the Core2 always pours the liquid to the bottom.
+
+The microphone learns the room's background level at boot (and again whenever the mantis starts singing), so
+quiet rooms stay calm and sustained music keeps everything moving.
+
 ## Code map
 
 | file | |
@@ -73,6 +108,7 @@ the per-pixel effects render on both CPU cores.
 | `src/main.cpp` | frame pipeline (double-buffered, LCD push on core 0 while input keeps polling), input, modes |
 | `src/calm.cpp` | the physics room: particle fluid (position-based), sand automaton, wave tank, aquarium |
 | `src/audio.cpp` | always-on mic: FFT (32 bands), spectral-flux onsets, beat PLL, calm follower, brief sfx |
+| `src/wire.cpp` | crisp overlays: glitching chromatic wireframes, tesseract, tunnel rings, engraved mandala lattice |
 | `src/fx.cpp` | 160×120 indexed demo engine: palettes, bilinear grid-warp feedback, LUTs, dual-core raster, 2× present |
 | `src/mantis.cpp` | the puppet: FK skeleton, IK legs and mic arm, choreography, face (blink, blush, mouth), stage |
 | `src/mantis_rig.h` | generated sprites + joint positions |

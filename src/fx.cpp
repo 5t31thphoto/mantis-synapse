@@ -161,6 +161,52 @@ void palCosine(float ar, float ag, float ab, float br, float bg, float bb,
   }
 }
 
+void presentCrystal(M5Canvas &c, const uint8_t *fid, const int8_t *fdx, const int8_t *fdy, const int16_t *fsh, uint8_t edge) {
+  uint16_t *fb = (uint16_t *)c.getBuffer();
+  if (!fb) return;
+  auto rows_ = [&](int y0, int y1) {
+    for (int y = y0; y < y1; y++) {
+      const uint8_t *f = fid + y * LW;
+      uint32_t *r0 = (uint32_t *)(fb + (y * 2) * W);
+      uint32_t *r1 = r0 + W / 2;
+      for (int x = 0; x < LW; x++) {
+        int id = f[x];
+        int sx = x + fdx[id], sy = y + fdy[id];
+        sx = sx < 0 ? 0 : (sx >= LW ? LW - 1 : sx); sy = sy < 0 ? 0 : (sy >= LH ? LH - 1 : sy);
+        int v = buf[sy * LW + sx] + fsh[id];
+        bool e = (x + 1 < LW && f[x + 1] != id) || (y + 1 < LH && fid[(y + 1) * LW + x] != id);
+        if (e) v += edge;
+        v = v < 0 ? 0 : (v > 255 ? 255 : v);
+        uint32_t o = s_pal[v];
+        r0[x] = o; r1[x] = o;
+      }
+    }
+  };
+  parallel(rows_);
+}
+
+void palOpal(float amt, float sheen, float t, float glint) {
+  static const float K[4][3] = {{0, 115, 115}, {93, 0, 93}, {140, 255, 40}, {0, 115, 115}};
+  float band = sheen - floorf(sheen);
+  for (int i = 1; i < 256; i++) {
+    uint16_t v = (uint16_t)(s_pal[i] & 0xFFFF); v = (uint16_t)((v >> 8) | (v << 8));
+    float r = (float)((v >> 11) << 3), g = (float)(((v >> 5) & 63) << 2), b = (float)((v & 31) << 3);
+    float u = i / 255.f, q = u * 3.f + t;
+    q -= floorf(q / 3.f) * 3.f;
+    int k = (int)q; float f = q - k;
+    float br = 0.25f + 0.85f * u;
+    float mr = (K[k][0] + (K[k + 1][0] - K[k][0]) * f) * br, mg = (K[k][1] + (K[k + 1][1] - K[k][1]) * f) * br, mb = (K[k][2] + (K[k + 1][2] - K[k][2]) * f) * br;
+    r += (mr - r) * amt; g += (mg - g) * amt; b += (mb - b) * amt;
+    float d = fabsf(u - band); if (d > 0.5f) d = 1.f - d;                // labradorescence: a spectral glint band
+    float gl = d < 0.07f ? (1.f - d / 0.07f) * glint : 0.f;
+    if (gl > 0) {
+      float h = u * 6.f + t * 2.f;
+      r += (128.f + 127.f * cosf(h)) * gl; g += (128.f + 127.f * cosf(h - 2.094f)) * gl; b += (128.f + 127.f * cosf(h + 2.094f)) * gl;
+    }
+    palSet(i, (uint8_t)(r > 255 ? 255 : r), (uint8_t)(g > 255 ? 255 : g), (uint8_t)(b > 255 ? 255 : b));
+  }
+}
+
 void palFlash(float amt) {
   if (amt <= 0.01f) return;
   amt = clampf(amt, 0, 1);

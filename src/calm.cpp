@@ -12,6 +12,7 @@
 #include "app.h"
 #include "audio.h"
 #include "fx.h"
+#include "wire.h"
 #include <string.h>
 
 enum Room : uint8_t { R_FLOW = 0, R_SPLASH, R_SAND, R_WAVES, R_BUBBLES, R_COUNT };
@@ -24,6 +25,9 @@ static void softHap(uint8_t lv, uint16_t ms) {
   s_hapAt = millis(); hap(lv, ms);
 }
 static inline float frand() { return (esp_random() & 0xFFFF) / 65535.f; }
+// Every room uses the same calibrated gravity (s_gx, s_gy). Rooms that need a floor (pool, tank)
+// get a gentle downward floor ONLY while the device is close to its calibrated neutral.
+static inline float flatFloor() { float m = sqrtf(s_gx * s_gx + s_gy * s_gy); return 0.35f * clampf(1.f - m * 2.5f, 0.f, 1.f); }
 
 // ---------- palette gradient helper: stops (index, rgb565) ----------
 static void grad(const int *at, const uint16_t *col, int n) {
@@ -215,7 +219,7 @@ static void roomFlow() {
   // gentle touch of the glass when it sloshes
   float e = 0;
   for (int i = 0; i < s_fn; i += 7) e += fabsf(pvx[i]) + fabsf(pvy[i]);
-  if (e > 2600.f) softHap(45, 12);
+  if (e > 2600.f) hapRumble(clampf((e - 2600.f) / 5000.f, 0.08f, 0.32f), 8.f, 0.35f);   // the liquid's weight
 }
 
 // ============================================================
@@ -241,9 +245,9 @@ static void splashAt(float x, float y, float power) {
 }
 static void roomSplash() {
   FluidP P = {3.6f, 0.6f, 0.05f, 0.03f, 200.f};
-  float gx = s_gx, gy = s_gy + 0.5f;                 // a pool: always some down
+  float gx = s_gx, gy = s_gy + flatFloor();          // honest gravity, soft floor when flat
   if (s_tDown && (fabsf(s_tdx) + fabsf(s_tdy)) > 0.5f) fluidStir(s_tx, s_ty, s_tdx, s_tdy, 10.f);
-  fluidStep(P, gx * 0.8f, gy);
+  fluidStep(P, gx, gy);
   // rain (long-press), and the room breathes a drop now and then with the sound
   s_rainT -= g_dt;
   if (s_var[R_SPLASH] && s_rainT < 0) { s_rainT = 0.12f + frand() * 0.25f; spawnDrop(4.f + frand() * 152.f, 9.f, 0, 30.f, 0); }
@@ -349,7 +353,10 @@ static void roomSand() {
   float gm = sqrtf(s_gx * s_gx + s_gy * s_gy);
   if (gm > 0.22f) {
     float a = atan2f(s_gy, s_gx);
-    int oct = ((int)lroundf(a / 0.785398f) + 8) & 7;
+    static int oct = 2;                                   // keep the current direction until the tilt clearly changes
+    float ca = oct * 0.785398f, da = a - ca;
+    while (da > 3.14159f) da -= 6.28318f; while (da < -3.14159f) da += 6.28318f;
+    if (fabsf(da) > 0.52f) oct = ((int)lroundf(a / 0.785398f) + 8) & 7;
     static const int8_t DX[8] = {1, 1, 0, -1, -1, -1, 0, 1}, DY[8] = {0, 1, 1, 1, 0, -1, -1, -1};
     float p = clampf(0.45f + gm * 0.45f + aud::calm * 0.1f, 0.f, 0.97f);
     sandStep(DX[oct], DY[oct], p);
@@ -419,11 +426,17 @@ static void roomSand() {
 // ============================================================
 static float s_h[160], s_v[160], s_boatX = 80.f, s_boatV = 0;
 static Drop s_spray[40];
+// weather: the room's sound becomes the sky
+static float s_cloud = 0, s_rainAmt = 0, s_wind = 0, s_cloudPos = 0, s_flash = 0, s_boltT = 0;
+static uint32_t s_boltAt = 0;
+static int s_boltX = 0;
+struct Rain { float x, y; uint8_t live; };
+static Rain s_rain[90];
 static void roomWaves() {
   float dt = g_dt;
   bool night = s_var[R_WAVES];
-  float gy = 0.6f + fmaxf(0.f, s_gy) * 0.4f;
-  float slope = clampf(s_gx / gy, -0.7f, 0.7f);
+  float gyE = fmaxf(0.3f, s_gy + flatFloor());       // the surface lies perpendicular to gravity
+  float slope = clampf(s_gx / gyE, -0.7f, 0.7f);
   float c = aud::calm;
   // wave machine paddle on the left; its stroke follows the sound
   static float padPh = 0;
@@ -454,7 +467,21 @@ static void roomWaves() {
     for (int x = 0; x < 160; x++) s_h[x] -= mean;
   }
   if (frand() < c * aud::treble * 0.8f) s_v[esp_random() % 160] += (frand() - 0.5f) * 20.f;   // breath on the water
-  if (fabsf(s_v[2]) > 30.f || fabsf(s_v[157]) > 30.f) softHap(40, 18);
+  { float we = fabsf(s_v[2]) + fabsf(s_v[157]); if (we > 40.f) hapRumble(clampf((we - 40.f) / 160.f, 0.06f, 0.4f), 2.5f, 0.15f); }   // swells meeting the glass
+  // weather follows the mic: quiet = clear, sustained sound gathers clouds, then rain; loud hits in a storm = lightning
+  s_cloud += (clampf(c * 1.5f, 0.f, 1.f) - s_cloud) * clampf(dt * 0.5f, 0.f, 1.f);
+  s_rainAmt += (clampf((c - 0.45f) * 2.5f, 0.f, 1.f) - s_rainAmt) * clampf(dt * 0.4f, 0.f, 1.f);
+  s_wind += (clampf(aud::treble * 1.5f + c * 0.3f, 0.f, 1.f) - s_wind) * clampf(dt * 0.8f, 0.f, 1.f);
+  s_cloudPos += dt * (4.f + s_wind * 30.f);
+  s_boatV += s_wind * 3.f * dt;
+  if (aud::onset > 0.7f && s_rainAmt > 0.35f && millis() - s_boltAt > 1400) {
+    s_boltAt = millis(); s_boltT = 0.25f; s_flash = 1.f; s_boltX = 30 + (int)(esp_random() % 260);
+    hapGesture(HG_THUNDER);
+  }
+  s_flash = fmaxf(0.f, s_flash - dt * 4.f); s_boltT -= dt;
+  if (frand() < s_rainAmt * 0.9f)
+    for (int k = 0; k < 1 + (int)(s_rainAmt * 3.f); k++)
+      for (auto &r : s_rain) if (!r.live) { r = {frand() * 340.f - 20.f, 14.f, 1}; break; }
 
   // render
   uint8_t t1 = (uint8_t)(g_t * 26.f), t2 = (uint8_t)(g_t * -17.f), tm = (uint8_t)(g_t * 90.f);
@@ -466,7 +493,13 @@ static void roomWaves() {
         float sy = 66.f - s_h[x];
         int v;
         if (y < sy) {
-          v = 2 + y / 4;                                               // sky 0..40
+          v = 2 + y / 4;                                               // sky 0..19
+          if (s_cloud > 0.05f && y < 56) {                             // clouds 20..39, drifting with the wind
+            int cp = (int)s_cloudPos;
+            int cc = fx::sn[(uint8_t)(x * 2 + cp + y * 3)] + fx::sn[(uint8_t)(x * 5 - y * 7 + cp * 2)] + fx::sn[(uint8_t)(x + y * 11 - cp)];
+            int thr = 200 - (int)(s_cloud * 300.f) + y * 2;
+            if (cc > thr) { v = 20 + (cc - thr) / 5; if (v > 39) v = 39; }
+          }
           if (night && ((x * 73 + y * 151) % 97) == 0 && y < 50) v = 40 + (fx::sn[(uint8_t)(x * 9 + tm)] > 60 ? 10 : 0);
           if (night) { int dx = x - moonX, dy = y - 24; if (dx * dx + dy * dy < 36) v = 60; }
         } else {
@@ -486,18 +519,22 @@ static void roomWaves() {
     }
   };
   fx::parallel(rows_);
+  float st = 1.f - s_rainAmt * 0.55f;                                   // storms dim the sky
   if (!night) {
-    int at[] = {0, 40, 60, 72, 180, 190, 200, 255};
-    uint16_t col[] = {rgb565(40, 70, 120), rgb565(250, 170, 130), rgb565(255, 240, 200), hsv565(185.f, 0.6f, 0.75f), hsv565(215.f, 0.9f, 0.12f),
+    int at[] = {0, 19, 20, 39, 40, 60, 72, 180, 190, 200, 255};
+    uint16_t col[] = {rgb565((uint8_t)(40 * st), (uint8_t)(70 * st), (uint8_t)(120 * st)), rgb565((uint8_t)(250 * st), (uint8_t)(170 * st), (uint8_t)(130 * st)),
+                      rgb565((uint8_t)(150 * st), (uint8_t)(150 * st), (uint8_t)(170 * st)), rgb565((uint8_t)(255 * st), (uint8_t)(250 * st), (uint8_t)(245 * st)),
+                      rgb565(250, 170, 130), rgb565(255, 240, 200), hsv565(185.f, 0.6f, 0.75f * (0.6f + 0.4f * st)), hsv565(215.f, 0.9f, 0.12f),
                       rgb565(200, 230, 255), rgb565(200, 240, 250), rgb565(255, 255, 255)};
-    grad(at, col, 8);
+    grad(at, col, 11);
   } else {
     float bh = 160.f + aud::centroid * 60.f;
-    int at[] = {0, 39, 40, 50, 60, 72, 180, 190, 200, 255};
-    uint16_t col[] = {rgb565(2, 2, 10), rgb565(14, 10, 40), rgb565(140, 140, 170), rgb565(255, 255, 230), rgb565(240, 240, 210),
+    int at[] = {0, 19, 20, 39, 40, 50, 60, 72, 180, 190, 200, 255};
+    uint16_t col[] = {rgb565(2, 2, 10), rgb565(14, 10, 40), rgb565(20, 20, 40), rgb565(90, 90, 130), rgb565(140, 140, 170), rgb565(255, 255, 230), rgb565(240, 240, 210),
                       hsv565(230.f, 0.8f, 0.2f), rgb565(0, 0, 4), rgb565(200, 210, 170), hsv565(bh, 0.9f, 0.35f), hsv565(bh, 0.4f, 1.f)};
-    grad(at, col, 10);
+    grad(at, col, 12);
   }
+  fx::palFlash(s_flash * 0.45f);
   fx::present(canvas);
   // a little paper boat rides the swell
   int bx = (int)s_boatX;
@@ -514,6 +551,28 @@ static void roomWaves() {
   canvas.fillTriangle(x0, y0, x1, y1, x2, y2, hull); canvas.fillTriangle(x0, y0, x2, y2, x3, y3, hull);
   P(0, -3, x0, y0); P(0, -18, x1, y1); P(9, -4, x2, y2);
   canvas.fillTriangle(x0, y0, x1, y1, x2, y2, night ? rgb565(120, 255, 220) : rgb565(255, 120, 110));
+  // rain streaks: each drop that lands rings the surface
+  for (auto &r : s_rain) {
+    if (!r.live) continue;
+    float wx = 40.f + s_wind * 160.f;
+    r.x += wx * dt; r.y += 260.f * dt;
+    int lx = (int)(r.x * 0.5f);
+    if (lx >= 0 && lx < 160 && r.y * 0.5f > 66.f - s_h[lx]) { s_v[lx] -= 4.f; r.live = 0; continue; }
+    if (r.y > H || r.x > W + 20) { r.live = 0; continue; }
+    canvas.drawLine((int)r.x, (int)r.y, (int)(r.x - wx * 0.03f), (int)(r.y - 8.f), night ? rgb565(90, 110, 160) : rgb565(180, 200, 230));
+  }
+  if (s_boltT > 0) {                                        // lightning: jagged, forked, gone in a blink
+    int x = s_boltX, y = 14;
+    uint32_t sd = s_boltAt;
+    int surf = (int)((66.f - s_h[(int)clampf((float)(s_boltX / 2), 0.f, 159.f)]) * 2.f);
+    while (y < surf) {
+      sd = sd * 1664525u + 1013904223u;
+      int nx = x + (int)((sd >> 24) % 21) - 10, ny = y + 8 + (int)((sd >> 16) % 10);
+      canvas.drawLine(x, y, nx, ny, rgb565(230, 220, 255)); canvas.drawLine(x + 1, y, nx + 1, ny, wire::LIME);
+      if (((sd >> 8) & 7) == 0) canvas.drawLine(nx, ny, nx + 14, ny + 12, rgb565(160, 150, 220));
+      x = nx; y = ny;
+    }
+  }
   for (auto &d : s_spray) {
     if (!d.live) continue;
     d.vy += 300.f * dt; d.x += d.vx * dt; d.y += d.vy * dt;
@@ -535,6 +594,51 @@ static Mote s_pk[48];
 static uint8_t *s_floor = nullptr;                // pebble layer, 160 x 22, palette index (0 = none)
 static float s_emit = 0, s_holdEmit = 0;
 static float s_jx = 90, s_jy = 150, s_jph = 0;
+struct Fish { float x, y, vx, vy, head, size, hue, ph, dart; };
+static Fish s_fish[6];
+static float s_scareX = -1, s_scareY = -1; static uint32_t s_scareAt = 0;
+static void fishInit() {
+  static const float hues[6] = {178.f, 300.f, 95.f, 28.f, 178.f, 300.f};      // teal, plum, lime, orange...
+  for (int i = 0; i < 6; i++) s_fish[i] = {40.f + frand() * 240.f, 50.f + frand() * 120.f, 0, 0, frand() * 6.28f, 9.f + frand() * 6.f, hues[i], frand() * 6.f, 0};
+}
+static void fishUpdate(float dt, bool uv) {
+  float c = aud::calm;
+  bool startle = aud::onset > 0.6f;
+  for (auto &f : s_fish) {
+    f.ph += dt * (6.f + f.dart * 20.f + c * 6.f);
+    f.head += (sinf(f.ph * 0.13f + f.hue) * 0.9f) * dt;                        // idle wander
+    float spd = 18.f + c * 22.f + f.dart * 110.f;
+    // walls: turn back towards the middle of the tank
+    float tx = 160.f - f.x, ty = 115.f - f.y;
+    if (f.x < 40 || f.x > 280 || f.y < 44 || f.y > 180) { float ta = atan2f(ty, tx), d = ta - f.head; while (d > 3.14159f) d -= 6.28318f; while (d < -3.14159f) d += 6.28318f; f.head += d * dt * 3.f; }
+    // flee a tap / a loud sound; approach a held finger (curious), stop short of it
+    if (s_scareX >= 0 && millis() - s_scareAt < 600) {
+      float dx = f.x - s_scareX, dy = f.y - s_scareY, d2 = dx * dx + dy * dy;
+      if (d2 < 90 * 90) { f.head = atan2f(dy, dx) + (frand() - 0.5f) * 0.6f; f.dart = 1.f; }
+    }
+    if (startle && frand() < 0.5f) { f.head += (frand() - 0.5f) * 3.f; f.dart = fmaxf(f.dart, 0.7f); }
+    if (s_tDown) {
+      float dx = s_tx * 2.f - f.x, dy = s_ty * 2.f - f.y, d = sqrtf(dx * dx + dy * dy);
+      if (d > 26.f && d < 160.f && f.dart < 0.2f) { float ta = atan2f(dy, dx), dd = ta - f.head; while (dd > 3.14159f) dd -= 6.28318f; while (dd < -3.14159f) dd += 6.28318f; f.head += dd * dt * 1.5f; }
+      if (d < 26.f) spd *= 0.2f;
+    }
+    f.dart = fmaxf(0.f, f.dart - dt * 1.4f);
+    float wantX = cosf(f.head) * spd, wantY = sinf(f.head) * spd * 0.6f;
+    f.vx += (wantX - f.vx) * clampf(dt * 3.f, 0.f, 1.f); f.vy += (wantY - f.vy) * clampf(dt * 3.f, 0.f, 1.f);
+    f.x += (f.vx + s_gx * 8.f) * dt; f.y += (f.vy + s_gy * 5.f) * dt;               // a subtle current follows the tilt
+    f.x = clampf(f.x, 14.f, 306.f); f.y = clampf(f.y, 30.f, 190.f);
+    // draw: side-on, facing its motion; tail wags, UV makes them glow
+    float dir = f.vx >= 0 ? 1.f : -1.f, sz = f.size;
+    uint16_t body = uv ? hsv565(f.hue, 0.85f, 0.75f + aud::level * 0.25f) : hsv565(f.hue, 0.7f, 0.85f);
+    uint16_t fin = uv ? hsv565(f.hue + 40.f, 0.9f, 1.f) : hsv565(f.hue + 20.f, 0.8f, 0.6f);
+    float wag = sinf(f.ph) * sz * 0.45f;
+    int tx0 = (int)(f.x - dir * sz * 0.9f), ty0 = (int)f.y;
+    canvas.fillTriangle(tx0, ty0, (int)(tx0 - dir * sz * 0.9f), (int)(f.y - sz * 0.55f + wag), (int)(tx0 - dir * sz * 0.9f), (int)(f.y + sz * 0.55f + wag), fin);
+    canvas.fillEllipse((int)f.x, (int)f.y, (int)sz, (int)(sz * 0.48f), body);
+    canvas.drawFastHLine((int)(f.x - sz * 0.6f), (int)f.y, (int)(sz * 1.1f), fin);
+    canvas.fillCircle((int)(f.x + dir * sz * 0.55f), (int)(f.y - sz * 0.12f), 1, rgb565(10, 10, 20));
+  }
+}
 static void pebbles() {
   memset(s_floor, 0, 160 * 22);
   for (int k = 0; k < 70; k++) {
@@ -561,16 +665,18 @@ static void popAt(float x, float y, float r) {
 static void roomBubbles() {
   float dt = g_dt, c = aud::calm;
   bool uv = s_var[R_BUBBLES];
-  float ux = -s_gx, uy = -s_gy;                      // bubbles rise against gravity
-  float um = sqrtf(ux * ux + uy * uy);
-  if (um < 0.3f) { ux = 0; uy = -1; } else { ux /= um; uy /= um; }
+  float gm = sqrtf(s_gx * s_gx + s_gy * s_gy);        // bubbles rise against gravity, easing to 'up' when flat
+  float wv = clampf(gm * 3.f, 0.f, 1.f);
+  float ux = gm > 0.01f ? -s_gx / gm * wv : 0.f, uy = (gm > 0.01f ? -s_gy / gm * wv : 0.f) - (1.f - wv);
+  float un = sqrtf(ux * ux + uy * uy) + 1e-4f; ux /= un; uy /= un;
   // bubbler + your finger
   s_emit -= dt;
   if (s_emit < 0) { s_emit = 0.35f / (1.f + c * 6.f); bubble(236.f + frand() * 6.f, 206.f, 1.5f + frand() * 2.f + c * 3.f); }
   if (s_tDown) { s_holdEmit -= dt; if (s_holdEmit < 0) { s_holdEmit = 0.07f; bubble(s_tx * 2.f + (frand() - 0.5f) * 6.f, s_ty * 2.f, 1.5f + frand() * 3.f); } }
 
   // background: water gradient + slow god-rays, pebble floor
-  uint8_t t1 = (uint8_t)(g_t * 7.f), t2 = (uint8_t)(g_t * -5.f);
+  uint8_t t1 = (uint8_t)(g_t * 7.f + s_gx * 20.f), t2 = (uint8_t)(g_t * -5.f + s_gy * 12.f);   // rays lean with the tilt
+  int rayK = 12 + (int)(aud::calm * 20.f + aud::onset * 12.f);                                  // and brighten with sound
   auto rows_ = [&](int y0, int y1) {
     for (int y = y0; y < y1; y++) {
       uint8_t *row = fx::buf + y * fx::LW;
@@ -582,7 +688,7 @@ static void roomBubbles() {
       int base = 4 + y / 7;
       for (int x = 0; x < fx::LW; x++) {
         int r = fx::sn[(uint8_t)(x * 2 + y + t1)] + fx::sn[(uint8_t)(x * 3 - y + t2)];
-        row[x] = (uint8_t)(base + (r > 150 ? (r - 150) >> 3 : 0) + (r > 200 ? 8 : 0));
+        row[x] = (uint8_t)(base + (r > 150 ? ((r - 150) >> 3) * rayK >> 4 : 0) + (r > 200 ? 8 : 0));
       }
     }
   };
@@ -590,9 +696,10 @@ static void roomBubbles() {
   // plankton glow
   for (auto &m : s_pk) {
     m.ph += dt;
-    m.x += (sinf(m.ph * 0.7f) * 3.f - s_gx * 6.f) * dt; m.y += (cosf(m.ph * 0.5f) * 2.f - s_gy * 3.f) * dt;
+    m.x += (sinf(m.ph * 0.7f) * 3.f + s_gx * 6.f) * dt; m.y += (cosf(m.ph * 0.5f) * 2.f + s_gy * 3.f) * dt;
+    if (s_tDown) { float dx = m.x - s_tx, dy = m.y - s_ty; if (dx * dx + dy * dy < 400.f) { m.x += s_tdx * 0.6f; m.y += s_tdy * 0.6f; } }
     if (m.x < 0) m.x += 160; if (m.x >= 160) m.x -= 160; m.y = clampf(m.y, 9.f, 96.f);
-    uint8_t v = (uint8_t)(128 + (int)(6.f + 6.f * sinf(m.ph * 3.f) + c * 4.f));
+    uint8_t v = (uint8_t)(128 + (int)clampf(6.f + 6.f * sinf(m.ph * 3.f) + c * 4.f + aud::onset * 4.f, 0.f, 15.f));
     fx::plot((int)m.x, (int)m.y, v);
   }
   if (uv) {
@@ -602,7 +709,7 @@ static void roomBubbles() {
     static const uint16_t neon[6] = {rgb565(255, 40, 200), rgb565(80, 255, 60), rgb565(255, 150, 20), rgb565(40, 200, 255), rgb565(255, 255, 60), rgb565(180, 80, 255)};
     for (int p = 0; p < 6; p++)
       for (int s = 0; s < 16; s++) {
-        uint16_t cc = neon[p]; float k = 0.35f + s * 0.05f;
+        uint16_t cc = neon[p]; float k = (0.35f + s * 0.05f) * (0.75f + aud::bass * 0.6f);
         fx::palSet(144 + p * 16 + s, (uint8_t)clampf(((cc >> 11) << 3) * k, 0, 255), (uint8_t)clampf((((cc >> 5) & 63) << 2) * k, 0, 255), (uint8_t)clampf(((cc & 31) << 3) * k, 0, 255));
       }
   } else {
@@ -622,7 +729,7 @@ static void roomBubbles() {
   s_jph += dt * (0.8f + c * 0.8f);
   float pulse = powf(fmaxf(0.f, sinf(s_jph * 3.1416f)), 3.f);
   s_jy += (-pulse * 26.f + 7.f) * dt;
-  s_jx += sinf(g_t * 0.13f) * 6.f * dt - s_gx * 10.f * dt;
+  s_jx += sinf(g_t * 0.13f) * 6.f * dt + s_gx * 10.f * dt;
   if (s_jy < 40) s_jy = 40; if (s_jy > 175) s_jy = 175;
   s_jx = clampf(s_jx, 30.f, 290.f);
   uint16_t jc = uv ? hsv565(300.f + sinf(g_t * 0.2f) * 40.f, 0.6f, 0.9f) : rgb565(230, 200, 240);
@@ -642,6 +749,8 @@ static void roomBubbles() {
     canvas.drawFastHLine((int)s_jx - hw, (int)(s_jy - bh + dy), hw * 2 + 1, dy < 3 ? jc : (uv ? hsv565(290.f, 0.7f, 0.45f) : rgb565(170, 140, 190)));
   }
   canvas.drawFastHLine((int)(s_jx - bw), (int)s_jy, (int)(bw * 2), jc);
+
+  fishUpdate(dt, uv);
 
   // bubbles: buoyancy, wobble, merge, pop at the surface
   for (int i = 0; i < 56; i++) {
@@ -688,6 +797,7 @@ void calmBegin() {
   s_floor = (uint8_t *)malloc(160 * 22);
   sandPicture();
   pebbles();
+  fishInit();
   fluidSeed(340, 40.f);
 }
 
@@ -720,6 +830,7 @@ void calmTouch(int x, int y, bool down) {
       for (auto &b : s_bub)
         if (b.live && (b.x - x) * (b.x - x) + (b.y - y) * (b.y - y) < (b.r + 8) * (b.r + 8)) { popAt(b.x, b.y, b.r); b.live = 0; return; }
       for (int k = 0; k < 5; k++) bubble(x + (frand() - 0.5f) * 14.f, y + (frand() - 0.5f) * 14.f, 1.5f + frand() * 4.f);
+      s_scareX = x; s_scareY = y; s_scareAt = millis();
       break;
     }
     default: break;

@@ -20,4 +20,6 @@ extern float bands[32];
 extern float bass, mid, treble, centroid;
 bool speakerLive();                    // true only while an sfx is sounding
 void sfx(float pitch);                 // comic squeak
+void calibrateAmbient(float cap = 1000.f);   // listen ~0.9 s to learn the room's noise floor (capped)
+bool calibrating();
 }

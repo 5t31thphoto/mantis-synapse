@@ -22,11 +22,16 @@ extern float g_level, g_peak;          // 0..~1.5 audio energy (mic OR drum loop
 extern float g_lookX, g_lookY;         // tilt, -1.1..1.1
 extern int16_t g_mic[MIC_N];           // scope for PULSE
 extern bool g_shakeKick;
+extern float g_flyX, g_flyY;           // flight steering: tilt from the calibrated neutral, deadzoned
 extern float g_gravX, g_gravY;         // gravity in screen space (downhill)               // true for one frame after a shake
 
 // ---- haptics (main thread only; non-blocking) ----
 void hap(uint8_t level, uint16_t ms);
 void kickSubHaptic();
+void hapRumble(float amount, float rateHz, float grit);   // continuous layer; call every frame while it should play
+void hapGesture(uint8_t id);                              // designed envelopes:
+enum : uint8_t { HG_THREAD = 0, HG_CHAIN, HG_MISS, HG_THUNDER, HG_SETTLE, HG_REBIRTH, HG_PAIN };
+void hapCut(uint16_t quietMs);                            // instant silence, held for quietMs
 
 // ---- colour helpers ----
 static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
