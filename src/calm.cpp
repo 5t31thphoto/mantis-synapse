@@ -13,6 +13,7 @@
 #include "audio.h"
 #include "fx.h"
 #include "wire.h"
+#include "rider_sprites.h"
 #include <string.h>
 
 enum Room : uint8_t { R_FLOW = 0, R_SPLASH, R_SAND, R_WAVES, R_BUBBLES, R_COUNT };
@@ -600,6 +601,7 @@ struct Rider { float x, y, vx, vy, ang, spin, t, crashT; bool air; uint8_t state
 static Rider s_rd = {160, 100, 60, 0, 0, 0, 0, 0, false, 0};
 struct Debris { float x, y, vx, vy, a; bool live; };
 static Debris s_deb[14];
+static float miniMantisFly = 0;
 static inline float surfY(float xs) { int lx = (int)clampf(xs * 0.5f, 0.f, 159.f); return (66.f - s_h[lx]) * 2.f; }
 static inline float surfSlope(float xs) { int lx = (int)clampf(xs * 0.5f, 1.f, 158.f); return (s_h[lx + 1] - s_h[lx - 1]) * 0.5f; }   // + = rising to the right
 static void miniMantis(float x, float y, float s, float ang, float arms, bool night) {   // a little rider
@@ -616,6 +618,47 @@ static void miniMantis(float x, float y, float s, float ang, float arms, bool ni
   }
   int a1, a2; P(-2 * s, -19 * s, a1, a2); canvas.drawLine(hx, hy - (int)(3 * s), a1 - (int)(3 * s), a2 - (int)(5 * s), g);
 }
+static M5Canvas s_spr[8];                 // 4 riders x (facing right, facing left)
+static bool s_sprReady = false;
+static float s_headDX[4], s_headDY[4];     // top of the head, relative to the sprite's bottom-centre
+static void sprInit() {
+  const uint16_t *D[4] = {SPR_JETSKI, SPR_SPEEDBOAT, SPR_SURF_LIE, SPR_SURF_STAND};
+  const int WW[4] = {SPR_JETSKI_W, SPR_SPEEDBOAT_W, SPR_SURF_LIE_W, SPR_SURF_STAND_W}, HH[4] = {SPR_JETSKI_H, SPR_SPEEDBOAT_H, SPR_SURF_LIE_H, SPR_SURF_STAND_H};
+  for (int k = 0; k < 4; k++)
+    for (int m = 0; m < 2; m++) {
+      M5Canvas &s = s_spr[k * 2 + m];
+      s.setColorDepth(16); s.createSprite(WW[k], HH[k]); s.setPivot(WW[k] * 0.5f, HH[k] * 0.5f);   // rotate about the centre (explicit)
+      for (int y = 0; y < HH[k]; y++) for (int x = 0; x < WW[k]; x++) s.drawPixel(x, y, D[k][y * WW[k] + (m ? WW[k] - 1 - x : x)]);
+    }
+  for (int k = 0; k < 4; k++) {                                   // the head = topmost solid pixel
+    bool found = false;
+    for (int y = 0; y < HH[k] && !found; y++) for (int x = 0; x < WW[k]; x++) {
+      uint16_t v = D[k][y * WW[k] + x]; int R = (v >> 11) << 3, G = ((v >> 5) & 63) << 2, B = (v & 31) << 3;
+      if (v != 0xF81F && G > R + 12 && G > B + 12) { s_headDX[k] = x - WW[k] * 0.5f; s_headDY[k] = (float)(y - HH[k]) + 1.f; found = true; break; }
+    }
+  }
+  s_sprReady = true;
+}
+// draw rider sprite k (0 jet ski, 1 speedboat, 2 surfer lying, 3 surfer standing) with its bottom-centre at (x,y)
+static void sprDraw(int k, float x, float y, float ang, bool left) {
+  if (!s_sprReady) sprInit();
+  M5Canvas &s = s_spr[k * 2 + (left ? 1 : 0)];
+  float hh = s.height() * 0.5f;
+  s.pushRotateZoom(&canvas, x + sinf(ang) * hh, y - cosf(ang) * hh, ang * 57.2958f, 1.f, 1.f, (uint16_t)0xF81F);
+}
+static void antennae(float hx, float hy, float ang, float t);
+static void headAnt(int k, float x, float y, float ang, bool left, float t) {   // feelers on the sprite's own head
+  if (!s_sprReady) return;
+  float dx = s_headDX[k] * (left ? -1.f : 1.f), dy = s_headDY[k];
+  float c = cosf(ang), s = sinf(ang);
+  antennae(x + c * dx - s * dy, y + s * dx + c * dy, ang, t);
+}
+static void antennae(float hx, float hy, float ang, float t) {   // the orange feelers, drawn live (they wiggle)
+  for (int s = -1; s <= 1; s += 2) {
+    float a = ang - 1.5708f + s * 0.35f + sinf(t * 7.f + s) * 0.12f;
+    canvas.drawLine((int)hx, (int)hy, (int)(hx + cosf(a) * 6.f), (int)(hy + sinf(a) * 6.f), rgb565(255, 120, 40));
+  }
+}
 static void spray(float x, float y, int n, float up) {
   for (int k = 0; k < n; k++) for (auto &d : s_spray) if (!d.live) { d = {x, y, (frand() - 0.5f) * 120.f, -40.f - frand() * up, 1, 1}; break; }
 }
@@ -629,17 +672,34 @@ static void riders(float dt, bool night) {
     if (r.crashT > 0) {                                                          // wrecked: debris, then drop back in
       r.crashT -= dt;
       for (auto &d : s_deb) if (d.live) { d.vy += 500.f * dt; d.x += d.vx * dt; d.y += d.vy * dt; d.a += dt * 8.f; if (d.y > 240) d.live = false;
-        canvas.drawLine((int)d.x, (int)d.y, (int)(d.x + cosf(d.a) * 6), (int)(d.y + sinf(d.a) * 6), rgb565(240, 240, 250)); }
+        canvas.drawLine((int)d.x, (int)d.y, (int)(d.x + cosf(d.a) * 5), (int)(d.y + sinf(d.a) * 5), (&d - s_deb) & 1 ? rgb565(170, 110, 50) : rgb565(120, 75, 35)); }   // wood splinters
+      if (miniMantisFly > 0) { miniMantisFly -= dt * 0.5f; float u = 1.f - miniMantisFly; miniMantis(r.x + (r.x < 160 ? 1 : -1) * u * 120.f, 150.f - sinf(u * 3.14159f) * 110.f, 0.7f, u * 12.f, 1.f, night); }
       if (r.crashT <= 0) { r.x = 160; r.y = 20; r.vy = 0; r.vx = (frand() < 0.5f ? -1 : 1) * 30.f; r.air = true; }
       return;
     }
-    float thr = heavy ? 55.f : 90.f, acc = heavy ? 35.f : 140.f;
+    float thr = heavy ? 50.f : 80.f, acc = heavy ? 40.f : 150.f;
     float dir = r.vx >= 0 ? 1.f : -1.f;
-    r.vx += dir * acc * dt; if (fabsf(r.vx) > thr) r.vx = dir * thr;
-    r.vx += -sl * (heavy ? 20.f : 40.f) * dt;                                  // waves push you around
+    // hunt for a ramp: a steep face rising in front, not far away -> full throttle up it
+    bool ramp = false;
+    for (int k = 6; k <= 40; k += 4) {
+      int cx = (int)clampf((r.x + dir * k * 2.f) * 0.5f, 1.f, 158.f);
+      float fs = (s_h[cx + 1] - s_h[cx - 1]) * 0.5f * dir;          // + = rising ahead
+      if (fs > (heavy ? 1.0f : 0.5f)) { ramp = true; break; }
+    }
+    if (!ramp && !r.air && frand() < dt * 0.9f) {                    // a good wave behind? swing round for it
+      for (int k = 6; k <= 40; k += 4) { int cx = (int)clampf((r.x - dir * k * 2.f) * 0.5f, 1.f, 158.f); if ((s_h[cx + 1] - s_h[cx - 1]) * 0.5f * -dir > 1.2f) { r.vx = -r.vx * 0.5f; dir = -dir; break; } }
+    }
+    if (ramp) { thr *= heavy ? 1.6f : 1.5f; acc *= 2.f; }
+    r.vx += dir * acc * dt; if (!heavy && fabsf(r.vx) > thr) r.vx = dir * thr; if (heavy && fabsf(r.vx) > 95.f) r.vx = dir * 95.f;
+    r.vx += -sl * (heavy ? 55.f : 40.f) * dt;                                  // waves push you around (the heavy hull runs downhill)
+    if (heavy && fabsf(r.vx) > thr) r.vx *= 1.f - dt * 0.6f;                       // momentum: it only slowly bleeds off extra speed
     if (!r.air) {
       float launch = -sl * r.vx * 0.9f + s_v[lx] * 2.2f;                        // riding up a steep face at speed = air
-      if (launch > (heavy ? 170.f : 60.f)) { r.air = true; r.vy = -launch * (heavy ? 0.5f : 0.9f); r.spin = (!heavy && launch > 120.f) ? dir * 9.f : 0.f; spray(r.x, sy, 6, 90); }
+      if (launch > (heavy ? 62.f : 28.f)) {
+#ifdef RIDER_LOG
+        printf("%s launch %.0f\n", heavy ? "speedboat" : "jetski", launch);
+#endif
+        r.air = true; r.vy = -launch * (heavy ? 0.6f : 1.05f); r.spin = (!heavy && launch > 90.f) ? dir * 9.f : 0.f; spray(r.x, sy, 6, 90); }
       else { r.y = sy; r.ang = atan2f(-sl, 2.f); r.vy = 0; }
       if (heavy && fabsf(r.vx) > 25.f) s_v[lx] += dir * 1.2f;                    // the heavy hull plows a wake
     }
@@ -652,34 +712,23 @@ static void riders(float dt, bool night) {
     }
     r.x += r.vx * dt;
     if (r.x < 16 || r.x > W - 16) {                                              // the wall
-      if (heavy && fabsf(r.vx) > 48.f) {                                         // too fast: crash!
+#ifdef RIDER_LOG
+      printf("%s hits the wall at %.0f\n", heavy ? "speedboat" : "jetski", fabsf(r.vx));
+#endif
+      if (heavy && fabsf(r.vx) > 72.f) {                                         // a real smash: it splinters!
         r.crashT = 2.6f; hapGesture(HG_CRACK); spray(r.x, sy, 20, 200);
         for (auto &d : s_deb) d = {r.x, sy - 6, (r.x < 160 ? 1.f : -1.f) * (40.f + frand() * 140.f), -80.f - frand() * 200.f, frand() * 6.f, true};
+        miniMantisFly = 1.f;
         r.vx = 0; return;
       }
-      r.x = clampf(r.x, 16.f, W - 16.f); r.vx = -r.vx * (heavy ? 0.5f : 0.9f); spray(r.x, sy, 5, 70); hap(90, 18);
+      r.x = clampf(r.x, 16.f, W - 16.f); r.vx = -r.vx * (heavy ? 0.45f : 0.9f); spray(r.x, sy, heavy ? 8 : 5, 70); hap(heavy ? 130 : 90, 20);   // a bump, not a wreck
       if (!heavy && !r.air) { r.air = true; r.vy = -120.f; r.spin = (r.vx > 0 ? 1.f : -1.f) * 12.f; }   // jet ski: bounce and flip
     }
-    // draw
-    float c = cosf(r.ang), s = sinf(r.ang); float d2 = r.vx >= 0 ? 1.f : -1.f;
-    const float K = 1.35f;                                                    // readable size
-    auto Pt = [&](float lx2, float ly2, int &ox, int &oy) { lx2 *= K; ly2 *= K; ox = (int)(r.x + (c * lx2 - s * ly2) * d2); oy = (int)(r.y + s * lx2 * d2 + c * ly2); };
-    int a0, b0, a1, b1, a2, b2, a3, b3;
-    if (!heavy) {
-      Pt(-14, -2, a0, b0); Pt(14, -2, a1, b1); Pt(9, 5, a2, b2); Pt(-12, 5, a3, b3);
-      canvas.fillTriangle(a0, b0, a1, b1, a2, b2, wire::LIME); canvas.fillTriangle(a0, b0, a2, b2, a3, b3, rgb565(0, 115, 115));
-      Pt(6, -2, a0, b0); Pt(8, -12, a1, b1); canvas.drawLine(a0, b0, a1, b1, rgb565(200, 200, 210));
-      int mx, my; Pt(-2, -3, mx, my);
-      miniMantis(mx, my, 1.25f, r.ang * d2, r.air ? 1.f : 0.2f, night);
-    } else {
-      Pt(-24, -4, a0, b0); Pt(22, -4, a1, b1); Pt(14, 7, a2, b2); Pt(-22, 7, a3, b3);
-      canvas.fillTriangle(a0, b0, a1, b1, a2, b2, rgb565(240, 240, 245)); canvas.fillTriangle(a0, b0, a2, b2, a3, b3, rgb565(240, 240, 245));
-      Pt(-22, 2, a0, b0); Pt(16, 2, a1, b1); canvas.drawLine(a0, b0, a1, b1, rgb565(93, 0, 93)); Pt(-22, 3, a0, b0); Pt(16, 3, a1, b1); canvas.drawLine(a0, b0, a1, b1, rgb565(93, 0, 93));
-      Pt(2, -4, a0, b0); Pt(10, -12, a1, b1); canvas.drawLine(a0, b0, a1, b1, rgb565(150, 200, 230));
-      int mx, my; Pt(-6, -4, mx, my);
-      miniMantis(mx, my, 1.25f, r.ang * d2, r.air ? 0.8f : 0.f, night);
-      if (fabsf(r.vx) > 30.f && !r.air && frand() < 0.5f) spray(r.x - d2 * 22, sy, 1, 40);
-    }
+    // draw: the sprite rides the surface (or the air), tilted with the slope
+    bool left = r.vx < 0;
+    sprDraw(heavy ? 1 : 0, r.x, r.y + (heavy ? 3.f : 2.f), r.ang, left);
+    headAnt(heavy ? 1 : 0, r.x, r.y + (heavy ? 3.f : 2.f), r.ang, left, r.t);
+    if (fabsf(r.vx) > 30.f && !r.air && frand() < 0.5f) spray(r.x - (left ? -1.f : 1.f) * (heavy ? 14.f : 8.f), sy, 1, heavy ? 40 : 60);
   } else {                                                                      // SURFBOARD
     // find the biggest wave
     int best = 0; float bh = -1e9f;
@@ -689,26 +738,34 @@ static void riders(float dt, bool night) {
     if (r.state == 0) {                                                         // paddling toward it
       r.vx += (clampf((target - r.x) * 0.6f, -40.f, 40.f) - r.vx) * dt * 1.5f;
       r.y = sy; r.ang = atan2f(-sl, 2.f);
-      if (face > 1.2f && fabsf(waveMove) > 8.f && fabsf(r.x - target) < 50.f) { if (frand() < 0.6f) { r.state = 1; r.t = 0; hap(90, 20); } else { r.state = 2; r.t = 0; r.vy = -90.f; spray(r.x, sy, 10, 100); hap(140, 30); } }
+      if (face > 0.9f && fabsf(waveMove) > 6.f && fabsf(r.x - target) < 50.f) { if (frand() < 0.82f) { r.state = 1; r.t = 0; hap(90, 20); } else { r.state = 2; r.t = 0; r.vy = -90.f; spray(r.x, sy, 10, 100); hap(140, 30); } }
     } else if (r.state == 1) {                                                  // standing up: ride the face
       r.vx += (-sl * 60.f - r.vx * 0.3f) * dt;
       r.y = sy; r.ang = atan2f(-sl, 2.f);
       float wobble = sinf(r.t * 7.f) * (face < 0.4f ? 1.f : 0.3f);
       r.ang += wobble * 0.2f;
-      if ((face < 0.25f && r.t > 1.2f) || face > 4.f || r.t > 6.f) { r.state = face > 4.f ? 2 : 0; r.t = 0; r.vy = -110.f; if (r.state == 2) { spray(r.x, sy, 12, 120); hap(150, 30); } }
+      if ((face < 0.2f && r.t > 2.2f) || face > 5.5f || r.t > 9.f) { r.state = face > 5.5f ? 2 : 0; r.t = 0; r.vy = -110.f; if (r.state == 2) { spray(r.x, sy, 12, 120); hap(150, 30); } }
     } else {                                                                    // wipeout: tumble, splash, climb back on
       r.vy += 400.f * dt; r.y += r.vy * dt; r.ang += dt * 12.f;
       if (r.y > sy + 6) { r.y = sy + 6; r.vy = 0; }
       if (r.t > 1.6f) { r.state = 0; r.ang = 0; }
     }
     r.x = clampf(r.x + r.vx * dt, 14.f, W - 14.f);
-    float c = cosf(r.ang), s = sinf(r.ang);
-    int x0 = (int)(r.x - c * 25), y0 = (int)(r.y - s * 25), x1 = (int)(r.x + c * 25), y1 = (int)(r.y + s * 25);
-    canvas.drawLine(x0, y0, x1, y1, wire::LIME); canvas.drawLine(x0, y0 + 1, x1, y1 + 1, rgb565(93, 0, 93)); canvas.drawLine(x0, y0 - 1, x1, y1 - 1, wire::LIME);
-    if (r.state == 0) {                                                         // lying down, paddling
-      miniMantis(r.x - c * 2, r.y - 4, 1.15f, r.ang - 1.45f, 0.5f + 0.5f * sinf(r.t * 10.f), night);
-    } else if (r.state == 1) miniMantis(r.x, r.y - 3, 1.3f, r.ang, 0.6f + 0.4f * sinf(r.t * 9.f), night);   // arms balancing
-    else miniMantis(r.x + 14, r.y - 8, 1.15f, r.ang * 1.5f, 1.f, night);
+    bool left = r.vx < 0;
+    if (r.state == 0) {                                                         // lying on the board, paddling
+      sprDraw(2, r.x, r.y + 2.f, r.ang, left);
+      float ax = r.x + (left ? 1.f : -1.f) * 2.f, ay = r.y + 1.f, st = sinf(r.t * 10.f);
+      canvas.drawLine((int)ax, (int)ay - 2, (int)(ax + st * 4.f), (int)(ay + 3), rgb565(120, 220, 90));   // a paddling arm
+      headAnt(2, r.x, r.y + 2.f, r.ang, left, r.t);
+    } else if (r.state == 1) {                                                  // up and riding, arms out for balance
+      sprDraw(3, r.x, r.y + 2.f, r.ang, left);
+      float c2 = cosf(r.ang), s2 = sinf(r.ang), hdx = s_headDX[3] * (left ? -1.f : 1.f), hdy = s_headDY[3] + 4.f;
+      float hx = r.x + c2 * hdx - s2 * hdy, hy = r.y + 2.f + s2 * hdx + c2 * hdy, b = sinf(r.t * 9.f) * 0.5f;
+      canvas.drawLine((int)hx, (int)hy + 5, (int)(hx - 6), (int)(hy + 3 - b * 4), rgb565(120, 220, 90));
+      canvas.drawLine((int)hx, (int)hy + 5, (int)(hx + 6), (int)(hy + 3 + b * 4), rgb565(120, 220, 90));
+      headAnt(3, r.x, r.y + 2.f, r.ang, left, r.t);
+    } else sprDraw(3, r.x, r.y, r.ang, left);                                   // wipeout: tumbling
+
   }
 }
 void calmBoatNext() { s_boatType = (uint8_t)((s_boatType + 1) % 4); s_rd = {160, 80, 60, 0, 0, 0, 0, 0, true, 0}; }

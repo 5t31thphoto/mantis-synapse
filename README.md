@@ -61,9 +61,10 @@ changes the room's variant:
   Lightning strikes at a distance: close strikes show a bolt and hit with an instant crack, far ones flash in the
   clouds; either way the thunder arrives later the further away it was, and rolls through the motor.
   Go quiet and the storm slowly passes.
-  **Hold B** for another boat: the paper boat (classic), the mantis on a jet ski (jumps, flips off the walls), in a
-  speedboat (heavy; hit the wall too fast and it wrecks, then drops back in), or on a surfboard (paddles to the
-  biggest wave, tries to stand up and ride it... or wipes out).
+  **Hold B** for another boat: the paper boat (classic), the mantis on a jet ski (hunts steep faces and launches off
+  them, flips off the walls), in a wooden speedboat (drives and shreds; bumps are fine, but charge a wall hard enough
+  and it splinters, then drops back in), or on a surfboard (paddles to the biggest wave, stands up and rides it...
+  or wipes out). Rider sprites: src/rider_sprites.h (generated from the sprite sheet).
   Long-press: night, with moon glitter and bioluminescent crests.
 * **aquarium** — blacklight pebbles that pulse with the bass, plankton you can stir, a pulsing jellyfish, fish that
   wander, dart from taps and loud sounds and come to look at a held finger, bubbles that wobble, merge and pop.

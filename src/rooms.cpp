@@ -42,6 +42,15 @@ bool touchNow(int &x, int &y) {
   x = td.x; y = td.y; return true;
 }
 
+// ---- claps: a sharp spike in peak loudness over its own recent average (doesn't adapt away a steady rhythm) ----
+float s_clapSlow = 0.05f;
+bool clapSpike(float dt) {
+  float x = aud::peak;
+  bool hit = x > 0.28f && x > s_clapSlow * 2.2f + 0.08f;
+  s_clapSlow += (x - s_clapSlow) * clampf(dt * (x > s_clapSlow ? 1.5f : 6.f), 0.f, 1.f);
+  return hit || (aud::onset > 0.4f && (aud::treble > 0.3f || aud::zcr > 0.3f));
+}
+
 // ---- sparkles / confetti ----
 struct Spark { float x, y, vx, vy, life; uint16_t c; bool live; };
 Spark s_sp[120];
@@ -405,13 +414,16 @@ void draw(float dt) {
   mantisV(160, 132, 1.6f, arm, arm, s_solved ? 1.f : flash * 0.6f);
   if (flash > 0.3f && !s_solved) for (int k = 0; k < 6; k++) { float a = k * 1.047f; canvas.drawLine(160 + (int)(cosf(a) * 14), 96 + (int)(sinf(a) * 14), 160 + (int)(cosf(a) * 24), 96 + (int)(sinf(a) * 24), rgb565(255, 240, 150)); }
   // your clap: a sharp, bright transient near the beat
-  if (!s_solved && aud::onset > 0.4f && (aud::treble > 0.3f || aud::zcr > 0.3f)) {
+  if (!s_solved && clapSpike(dt)) {
     static float lastClap = -9;
     if (s_t - lastClap > 0.2f) {                                                  // one clap = one event
       lastClap = s_t;
-      float heard = s_t - 0.06f;                                                  // the mic hears it a moment late
+      float heard = s_t - 0.13f;                                                  // the mic + analysis hear it ~130 ms late
       float err = fmodf(heard + BEAT * 0.5f, BEAT) - BEAT * 0.5f;                 // distance to the nearest beat
-      bool good = fabsf(err) < 0.27f;
+      bool good = fabsf(err) < 0.31f;                                             // generous: 'on it' feels on it
+#ifdef CLAP_LOG
+      printf("clap heard t=%.3f err=%+.3f good=%d\n", s_t, err, good);
+#endif
       hist = (uint8_t)(((hist << 1) | (good ? 1 : 0)) & 0x0F);
       int n = 0; for (int k = 0; k < 4; k++) n += (hist >> k) & 1;
       streak = n;
@@ -765,7 +777,7 @@ void tap(int, int) {}
 //  24 MORE ROOMS — two more for every formula
 // ============================================================
 // ---- shared sensing helpers ----
-bool clapEvent() { static float last = -9; if (s_t < last) last = -9; if (aud::onset > 0.4f && (aud::treble > 0.3f || aud::zcr > 0.3f) && s_t - last > 0.2f) { last = s_t; return true; } return false; }
+bool clapEvent() { static float last = -9; if (s_t < last) last = -9; if (clapSpike(g_dt) && s_t - last > 0.2f) { last = s_t; return true; } return false; }
 bool knockEvent() { static float last = -9; if (s_t < last) last = -9; int tx, ty; if (!touchNow(tx, ty) && g_jolt > 0.22f && fabsf(g_gyroX) + fabsf(g_gyroY) + fabsf(g_gyroZ) < 90.f && s_t - last > 0.14f) { last = s_t; return true; } return false; }
 float blowAmt() { return clampf((aud::level - 0.3f) * 2.f, 0.f, 1.f) * (aud::zcr > 0.3f ? 1.f : 0.25f); }
 int humBand(bool &steady) {
@@ -1214,6 +1226,7 @@ void roomsDraw() {
   }
 }
 #ifdef HOST
+float roomsTime() { return s_t; }
 __attribute__((weak)) float g_dbgMarbleX = 0, g_dbgMarbleY = 0;
 float roomsAlignPos(int i) { return align::lock[i] ? 999.f : align::pos[i]; }
 void roomsDebugSolve() { s_solved = true; }
