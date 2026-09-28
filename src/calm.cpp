@@ -267,7 +267,14 @@ static void koiInit() {
     for (int s = 0; s < 7; s++) { k.sx[s] = k.x; k.sy[s] = k.y; }
   }
 }
+static bool s_koiDance = false;
 static void koiStep(float dt) {
+  // Easter egg: a steady beat in the room and the koi swim-dance (tail flicks on the beat, a shared turn each bar)
+  s_koiDance = aud::beatConf > 0.55f && aud::level > 0.08f;
+  static int lastBar = -1;
+  int bar = (int)(aud::beatPos / 4.f);
+  if (s_koiDance && bar != lastBar) { float t = (bar & 1) ? 0.45f : -0.45f; for (auto &k : s_koi) k.h += t; }
+  lastBar = bar;
   for (auto &k : s_koi) {
     k.ph += dt * (3.f + k.dart * 10.f);
     k.h += sinf(k.ph * 0.23f + k.pat) * 0.6f * dt;                        // lazy wandering
@@ -301,7 +308,7 @@ static inline void fdot(int x, int y, int r, uint8_t v) {
 static void koiDraw() {
   memcpy(s_floorDyn, s_floorTex, 160 * 106);
   for (auto &k : s_koi) {
-    float sw = sinf(k.ph * 2.f) * 1.4f;                                    // tail swish
+    float sw = s_koiDance ? sinf(aud::beatPos * 6.2831853f + k.pat * 0.3f) * 1.9f : sinf(k.ph * 2.f) * 1.4f;   // tail swish (on the beat when dancing)
     for (int s = 6; s >= 0; s--) {
       int r = s == 0 ? 3 : (s < 3 ? 4 : (s < 5 ? 3 : 2));
       uint8_t v;
@@ -576,6 +583,7 @@ static void roomSand() {
 // ============================================================
 //  WAVES — a wave-machine tank: tilt it, touch it, hum at it
 // ============================================================
+static uint8_t s_boatType = 0;             // 0 paper boat (classic) · 1 jet ski · 2 speedboat · 3 surfboard (long-press B)
 static float s_h[160], s_v[160], s_boatX = 80.f, s_boatV = 0;
 static Drop s_spray[40];
 // weather: the room's sound becomes the sky
@@ -587,6 +595,125 @@ static uint32_t s_boltAt = 0;
 static int s_boltX = 0;
 struct Rain { float x, y; uint8_t live; };
 static Rain s_rain[90];
+// ---------------- the other boats: simple rules, emergent silliness ----------------
+struct Rider { float x, y, vx, vy, ang, spin, t, crashT; bool air; uint8_t state; };   // x,y full-res; surf: 0 paddle 1 standing 2 wipeout
+static Rider s_rd = {160, 100, 60, 0, 0, 0, 0, 0, false, 0};
+struct Debris { float x, y, vx, vy, a; bool live; };
+static Debris s_deb[14];
+static inline float surfY(float xs) { int lx = (int)clampf(xs * 0.5f, 0.f, 159.f); return (66.f - s_h[lx]) * 2.f; }
+static inline float surfSlope(float xs) { int lx = (int)clampf(xs * 0.5f, 1.f, 158.f); return (s_h[lx + 1] - s_h[lx - 1]) * 0.5f; }   // + = rising to the right
+static void miniMantis(float x, float y, float s, float ang, float arms, bool night) {   // a little rider
+  uint16_t g = night ? rgb565(110, 200, 120) : rgb565(120, 220, 90), d = rgb565(60, 130, 50);
+  float c = cosf(ang), sn = sinf(ang);
+  auto P = [&](float lx, float ly, int &ox, int &oy) { ox = (int)(x + c * lx - sn * ly); oy = (int)(y + sn * lx + c * ly); };
+  int ax, ay, bx, by, hx, hy;
+  P(0, 0, ax, ay); P(0, -12 * s, bx, by); canvas.drawLine(ax, ay, bx, by, g); canvas.drawLine(ax + 1, ay, bx + 1, by, g);
+  P(0, -16 * s, hx, hy); canvas.fillTriangle(hx - (int)(5 * s), hy - (int)(3 * s), hx + (int)(5 * s), hy - (int)(3 * s), hx, hy + (int)(3 * s), g);
+  canvas.fillCircle(hx - (int)(3 * s), hy - (int)(3 * s), (int)fmaxf(1, 1.6f * s), rgb565(10, 10, 20)); canvas.fillCircle(hx + (int)(3 * s), hy - (int)(3 * s), (int)fmaxf(1, 1.6f * s), rgb565(10, 10, 20));
+  for (int side = -1; side <= 1; side += 2) {                                   // arms: 0 down/forward .. 1 up ("woo!")
+    int ex, ey, tx, ty; P(side * 6 * s, -10 * s - arms * 6 * s, ex, ey); P(side * (6 + 4 * arms) * s, -10 * s - arms * 14 * s, tx, ty);
+    canvas.drawLine(bx, by, ex, ey, g); canvas.drawLine(ex, ey, tx, ty, d);
+  }
+  int a1, a2; P(-2 * s, -19 * s, a1, a2); canvas.drawLine(hx, hy - (int)(3 * s), a1 - (int)(3 * s), a2 - (int)(5 * s), g);
+}
+static void spray(float x, float y, int n, float up) {
+  for (int k = 0; k < n; k++) for (auto &d : s_spray) if (!d.live) { d = {x, y, (frand() - 0.5f) * 120.f, -40.f - frand() * up, 1, 1}; break; }
+}
+static void riders(float dt, bool night) {
+  Rider &r = s_rd;
+  r.t += dt;
+  float sy = surfY(r.x), sl = surfSlope(r.x);
+  int lx = (int)clampf(r.x * 0.5f, 0.f, 159.f);
+  if (s_boatType == 1 || s_boatType == 2) {
+    bool heavy = s_boatType == 2;
+    if (r.crashT > 0) {                                                          // wrecked: debris, then drop back in
+      r.crashT -= dt;
+      for (auto &d : s_deb) if (d.live) { d.vy += 500.f * dt; d.x += d.vx * dt; d.y += d.vy * dt; d.a += dt * 8.f; if (d.y > 240) d.live = false;
+        canvas.drawLine((int)d.x, (int)d.y, (int)(d.x + cosf(d.a) * 6), (int)(d.y + sinf(d.a) * 6), rgb565(240, 240, 250)); }
+      if (r.crashT <= 0) { r.x = 160; r.y = 20; r.vy = 0; r.vx = (frand() < 0.5f ? -1 : 1) * 30.f; r.air = true; }
+      return;
+    }
+    float thr = heavy ? 55.f : 90.f, acc = heavy ? 35.f : 140.f;
+    float dir = r.vx >= 0 ? 1.f : -1.f;
+    r.vx += dir * acc * dt; if (fabsf(r.vx) > thr) r.vx = dir * thr;
+    r.vx += -sl * (heavy ? 20.f : 40.f) * dt;                                  // waves push you around
+    if (!r.air) {
+      float launch = -sl * r.vx * 0.9f + s_v[lx] * 2.2f;                        // riding up a steep face at speed = air
+      if (launch > (heavy ? 170.f : 60.f)) { r.air = true; r.vy = -launch * (heavy ? 0.5f : 0.9f); r.spin = (!heavy && launch > 120.f) ? dir * 9.f : 0.f; spray(r.x, sy, 6, 90); }
+      else { r.y = sy; r.ang = atan2f(-sl, 2.f); r.vy = 0; }
+      if (heavy && fabsf(r.vx) > 25.f) s_v[lx] += dir * 1.2f;                    // the heavy hull plows a wake
+    }
+    if (r.air) {
+      r.vy += 520.f * dt; r.y += r.vy * dt; r.ang += r.spin * dt;
+      if (r.y >= sy && r.vy > 0) {
+        r.air = false; r.spin = 0; r.ang = atan2f(-sl, 2.f); spray(r.x, sy, heavy ? 12 : 8, 120);
+        s_v[lx] += r.vy * 0.05f; hap((uint8_t)clampf(80.f + r.vy * 0.3f, 0.f, 230.f), 30);
+      }
+    }
+    r.x += r.vx * dt;
+    if (r.x < 16 || r.x > W - 16) {                                              // the wall
+      if (heavy && fabsf(r.vx) > 48.f) {                                         // too fast: crash!
+        r.crashT = 2.6f; hapGesture(HG_CRACK); spray(r.x, sy, 20, 200);
+        for (auto &d : s_deb) d = {r.x, sy - 6, (r.x < 160 ? 1.f : -1.f) * (40.f + frand() * 140.f), -80.f - frand() * 200.f, frand() * 6.f, true};
+        r.vx = 0; return;
+      }
+      r.x = clampf(r.x, 16.f, W - 16.f); r.vx = -r.vx * (heavy ? 0.5f : 0.9f); spray(r.x, sy, 5, 70); hap(90, 18);
+      if (!heavy && !r.air) { r.air = true; r.vy = -120.f; r.spin = (r.vx > 0 ? 1.f : -1.f) * 12.f; }   // jet ski: bounce and flip
+    }
+    // draw
+    float c = cosf(r.ang), s = sinf(r.ang); float d2 = r.vx >= 0 ? 1.f : -1.f;
+    const float K = 1.35f;                                                    // readable size
+    auto Pt = [&](float lx2, float ly2, int &ox, int &oy) { lx2 *= K; ly2 *= K; ox = (int)(r.x + (c * lx2 - s * ly2) * d2); oy = (int)(r.y + s * lx2 * d2 + c * ly2); };
+    int a0, b0, a1, b1, a2, b2, a3, b3;
+    if (!heavy) {
+      Pt(-14, -2, a0, b0); Pt(14, -2, a1, b1); Pt(9, 5, a2, b2); Pt(-12, 5, a3, b3);
+      canvas.fillTriangle(a0, b0, a1, b1, a2, b2, wire::LIME); canvas.fillTriangle(a0, b0, a2, b2, a3, b3, rgb565(0, 115, 115));
+      Pt(6, -2, a0, b0); Pt(8, -12, a1, b1); canvas.drawLine(a0, b0, a1, b1, rgb565(200, 200, 210));
+      int mx, my; Pt(-2, -3, mx, my);
+      miniMantis(mx, my, 1.25f, r.ang * d2, r.air ? 1.f : 0.2f, night);
+    } else {
+      Pt(-24, -4, a0, b0); Pt(22, -4, a1, b1); Pt(14, 7, a2, b2); Pt(-22, 7, a3, b3);
+      canvas.fillTriangle(a0, b0, a1, b1, a2, b2, rgb565(240, 240, 245)); canvas.fillTriangle(a0, b0, a2, b2, a3, b3, rgb565(240, 240, 245));
+      Pt(-22, 2, a0, b0); Pt(16, 2, a1, b1); canvas.drawLine(a0, b0, a1, b1, rgb565(93, 0, 93)); Pt(-22, 3, a0, b0); Pt(16, 3, a1, b1); canvas.drawLine(a0, b0, a1, b1, rgb565(93, 0, 93));
+      Pt(2, -4, a0, b0); Pt(10, -12, a1, b1); canvas.drawLine(a0, b0, a1, b1, rgb565(150, 200, 230));
+      int mx, my; Pt(-6, -4, mx, my);
+      miniMantis(mx, my, 1.25f, r.ang * d2, r.air ? 0.8f : 0.f, night);
+      if (fabsf(r.vx) > 30.f && !r.air && frand() < 0.5f) spray(r.x - d2 * 22, sy, 1, 40);
+    }
+  } else {                                                                      // SURFBOARD
+    // find the biggest wave
+    int best = 0; float bh = -1e9f;
+    for (int x = 4; x < 156; x += 2) if (s_h[x] > bh) { bh = s_h[x]; best = x; }
+    float target = best * 2.f;
+    float face = fabsf(sl), waveMove = s_v[lx];
+    if (r.state == 0) {                                                         // paddling toward it
+      r.vx += (clampf((target - r.x) * 0.6f, -40.f, 40.f) - r.vx) * dt * 1.5f;
+      r.y = sy; r.ang = atan2f(-sl, 2.f);
+      if (face > 1.2f && fabsf(waveMove) > 8.f && fabsf(r.x - target) < 50.f) { if (frand() < 0.6f) { r.state = 1; r.t = 0; hap(90, 20); } else { r.state = 2; r.t = 0; r.vy = -90.f; spray(r.x, sy, 10, 100); hap(140, 30); } }
+    } else if (r.state == 1) {                                                  // standing up: ride the face
+      r.vx += (-sl * 60.f - r.vx * 0.3f) * dt;
+      r.y = sy; r.ang = atan2f(-sl, 2.f);
+      float wobble = sinf(r.t * 7.f) * (face < 0.4f ? 1.f : 0.3f);
+      r.ang += wobble * 0.2f;
+      if ((face < 0.25f && r.t > 1.2f) || face > 4.f || r.t > 6.f) { r.state = face > 4.f ? 2 : 0; r.t = 0; r.vy = -110.f; if (r.state == 2) { spray(r.x, sy, 12, 120); hap(150, 30); } }
+    } else {                                                                    // wipeout: tumble, splash, climb back on
+      r.vy += 400.f * dt; r.y += r.vy * dt; r.ang += dt * 12.f;
+      if (r.y > sy + 6) { r.y = sy + 6; r.vy = 0; }
+      if (r.t > 1.6f) { r.state = 0; r.ang = 0; }
+    }
+    r.x = clampf(r.x + r.vx * dt, 14.f, W - 14.f);
+    float c = cosf(r.ang), s = sinf(r.ang);
+    int x0 = (int)(r.x - c * 25), y0 = (int)(r.y - s * 25), x1 = (int)(r.x + c * 25), y1 = (int)(r.y + s * 25);
+    canvas.drawLine(x0, y0, x1, y1, wire::LIME); canvas.drawLine(x0, y0 + 1, x1, y1 + 1, rgb565(93, 0, 93)); canvas.drawLine(x0, y0 - 1, x1, y1 - 1, wire::LIME);
+    if (r.state == 0) {                                                         // lying down, paddling
+      miniMantis(r.x - c * 2, r.y - 4, 1.15f, r.ang - 1.45f, 0.5f + 0.5f * sinf(r.t * 10.f), night);
+    } else if (r.state == 1) miniMantis(r.x, r.y - 3, 1.3f, r.ang, 0.6f + 0.4f * sinf(r.t * 9.f), night);   // arms balancing
+    else miniMantis(r.x + 14, r.y - 8, 1.15f, r.ang * 1.5f, 1.f, night);
+  }
+}
+void calmBoatNext() { s_boatType = (uint8_t)((s_boatType + 1) % 4); s_rd = {160, 80, 60, 0, 0, 0, 0, 0, true, 0}; }
+bool calmIsWaves() { return s_room == R_WAVES; }
+
 static void roomWaves() {
   float dt = g_dt;
   bool night = s_var[R_WAVES];
@@ -737,21 +864,23 @@ static void roomWaves() {
   }
   fx::palFlash(s_flash * 0.45f);
   fx::present(canvas);
+  if (s_boatType == 0) {
   // a little paper boat rides the swell
-  int bx = (int)s_boatX;
-  float sl = s_h[bx < 158 ? bx + 1 : 159] - s_h[bx > 0 ? bx - 1 : 0];
-  s_boatV += (-sl * 40.f + slope * 12.f) * dt; s_boatV *= 0.985f;
-  s_boatX = clampf(s_boatX + s_boatV * dt, 8.f, 152.f);
-  if (s_boatX <= 8.f || s_boatX >= 152.f) s_boatV *= -0.5f;
-  float by = (66.f - s_h[bx]) * 2.f, ang = atan2f(-sl, 2.f);
-  float ca_ = cosf(ang), sa = sinf(ang), X = s_boatX * 2.f;
-  auto P = [&](float lx, float ly, int &ox, int &oy) { ox = (int)(X + ca_ * lx - sa * ly); oy = (int)(by + sa * lx + ca_ * ly); };
-  int x0, y0, x1, y1, x2, y2, x3, y3;
-  P(-12, -3, x0, y0); P(12, -3, x1, y1); P(8, 3, x2, y2); P(-8, 3, x3, y3);
-  uint16_t hull = night ? rgb565(170, 190, 200) : rgb565(245, 240, 225);
-  canvas.fillTriangle(x0, y0, x1, y1, x2, y2, hull); canvas.fillTriangle(x0, y0, x2, y2, x3, y3, hull);
-  P(0, -3, x0, y0); P(0, -18, x1, y1); P(9, -4, x2, y2);
-  canvas.fillTriangle(x0, y0, x1, y1, x2, y2, night ? rgb565(120, 255, 220) : rgb565(255, 120, 110));
+    int bx = (int)s_boatX;
+    float sl = s_h[bx < 158 ? bx + 1 : 159] - s_h[bx > 0 ? bx - 1 : 0];
+    s_boatV += (-sl * 40.f + slope * 12.f) * dt; s_boatV *= 0.985f;
+    s_boatX = clampf(s_boatX + s_boatV * dt, 8.f, 152.f);
+    if (s_boatX <= 8.f || s_boatX >= 152.f) s_boatV *= -0.5f;
+    float by = (66.f - s_h[bx]) * 2.f, ang = atan2f(-sl, 2.f);
+    float ca_ = cosf(ang), sa = sinf(ang), X = s_boatX * 2.f;
+    auto P = [&](float lx, float ly, int &ox, int &oy) { ox = (int)(X + ca_ * lx - sa * ly); oy = (int)(by + sa * lx + ca_ * ly); };
+    int x0, y0, x1, y1, x2, y2, x3, y3;
+    P(-12, -3, x0, y0); P(12, -3, x1, y1); P(8, 3, x2, y2); P(-8, 3, x3, y3);
+    uint16_t hull = night ? rgb565(170, 190, 200) : rgb565(245, 240, 225);
+    canvas.fillTriangle(x0, y0, x1, y1, x2, y2, hull); canvas.fillTriangle(x0, y0, x2, y2, x3, y3, hull);
+    P(0, -3, x0, y0); P(0, -18, x1, y1); P(9, -4, x2, y2);
+    canvas.fillTriangle(x0, y0, x1, y1, x2, y2, night ? rgb565(120, 255, 220) : rgb565(255, 120, 110));
+  } else riders(dt, night);
   // rain streaks: each drop that lands rings the surface
   for (auto &r : s_rain) {
     if (!r.live) continue;
@@ -1036,7 +1165,7 @@ const char *calmName() {
     case R_FLOW: { static const char *v[] = {"flow: neon", "flow: honey", "flow: mercury"}; return v[s_var[R_FLOW] % 3]; }
     case R_SPLASH: return s_var[R_SPLASH] ? "splash: rain" : "splash";
     case R_SAND: return "sand";
-    case R_WAVES: return s_var[R_WAVES] ? "waves: night" : "waves";
+    case R_WAVES: { static const char *bt[4] = {"waves", "waves: jet ski", "waves: speedboat", "waves: surf"}; return s_var[R_WAVES] && s_boatType == 0 ? "waves: night" : bt[s_boatType]; }
     default: return s_var[R_BUBBLES] ? "aquarium: uv" : "aquarium";
   }
 }

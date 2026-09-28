@@ -38,6 +38,18 @@ static int s_echoN = 0, s_echoFxI = 0, s_echoState = 0;     // 0 listening, 1 re
 static uint32_t s_echoQuietAt = 0, s_echoPlayAt = 0, s_echoPlayMs = 0;
 static float s_echoRate = 1.f;
 static uint8_t s_env[256];
+// ---- lip-sync: 4 ms speech envelope (dB above the room floor) + width from zero-crossings ----
+static float s_msub[8], s_mwid[8]; static uint32_t s_mAt = 0;
+// ---- the echo cave ----
+static bool s_caveOn = false, s_caveRec = false, s_caveHeard = false;
+static int s_caveState = 0;                 // 0 idle, 1 recording, 2 mantis speaking, 3 cave echoing
+static uint32_t s_caveQuietAt = 0, s_caveStart = 0;
+static int s_caveVoiceLen = 0, s_caveTotal = 0;
+static inline float dbMouth(float rms, float floor_) {
+  float r = rms / (floor_ * 1.3f + 30.f);
+  if (r <= 1.f) return 0.f;
+  return clampf(20.f * log10f(r) / 26.f, 0.f, 1.f);
+}
 
 bool speakerLive() { return s_spk; }
 static inline float clampf_(float v, float a, float b) { return v < a ? a : (v > b ? b : v); }
@@ -153,6 +165,22 @@ static void micBlock(float dt) {
   float z = clampf_((float)zc / (MIC_REC * 0.35f), 0.f, 1.f);
   zcr = zcr * 0.6f + z * 0.4f;
   analyze(scope, true, dt);
+  for (int k = 0; k < 8; k++) {                                  // 8 x 64-sample windows (4 ms each)
+    float acc = 0; int zc = 0, pv = 0;
+    for (int i = k * 64; i < k * 64 + 64; i++) { int v = s_micBuf[i] - dc; acc += (float)v * v; if (i > k * 64 && ((v ^ pv) < 0) && abs(v) > 150) zc++; pv = v; }
+    s_msub[k] = dbMouth(sqrtf(acc / 64.f), s_floor);
+    s_mwid[k] = clampf((zc / 64.f - 0.05f) / 0.2f, 0.f, 1.f);
+  }
+  s_mAt = millis();
+  if (s_caveRec && s_echo) {
+    uint32_t now = millis();
+    int n = MIC_REC; if (s_echoN + n > ECHO_MAX) n = ECHO_MAX - s_echoN;
+    for (int i = 0; i < n; i++) s_echo[s_echoN + i] = (int16_t)clampf_((s_micBuf[i] - dc) * 2.f, -32000.f, 32000.f);
+    s_echoN += n;
+    if (level > 0.1f) { s_caveHeard = true; s_caveQuietAt = now; }
+    bool done = s_echoN >= SR * 3 || (s_caveHeard && now - s_caveQuietAt > 700 && s_echoN > SR / 3) || (!s_caveHeard && now - s_caveStart > 4000);
+    if (done) { s_caveRec = false; s_caveState = s_caveHeard ? 4 : 0; }   // 4 = build the playback
+  }
   if (s_echoOn && s_echo) {
     uint32_t now = millis();
     if (s_echoState == 0 && level > 0.14f) { s_echoState = 1; s_echoN = 0; }
@@ -216,6 +244,28 @@ void playBuf(const int16_t *d, int n, uint32_t rate, uint8_t vol) { s_pbBuf = d;
 void bell(int which, uint8_t vol) { if (s_bell[which % 3]) playBuf(s_bell[which % 3], s_bellLen, SR, vol); }
 void speakerHold(bool on) { s_hold = on; if (!on && s_spk) s_sfxUntil = millis(); }
 void echo(bool on) { s_echoOn = on; s_echoState = 0; }
+void cave(bool on) { s_caveOn = on; s_caveRec = false; s_caveState = 0; }
+void caveRecord() { if (s_caveState == 0 && s_echo) { s_caveRec = true; s_caveHeard = false; s_echoN = 0; s_caveStart = s_caveQuietAt = millis(); s_caveState = 1; } }
+int caveState() { return s_caveState == 4 ? 1 : s_caveState; }
+static float bufEnv(int pos, float *wide) {                        // the envelope right at the playback head
+  if (pos < 0 || pos + 64 >= s_caveTotal) { if (wide) *wide = 0; return 0.f; }
+  float acc = 0; int zc = 0, pv = 0;
+  for (int i = pos; i < pos + 64; i++) { int v = s_echoOut[i]; acc += (float)v * v; if (i > pos && ((v ^ pv) < 0) && abs(v) > 300) zc++; pv = v; }
+  if (wide) *wide = clampf((zc / 64.f - 0.05f) / 0.2f, 0.f, 1.f);
+  return clampf(20.f * log10f(sqrtf(acc / 64.f) / 400.f + 1e-3f) / 30.f, 0.f, 1.f);
+}
+float mouthNow(float *wide) {
+  uint32_t now = millis();
+  if (s_caveState == 2) return bufEnv((int)((now - s_caveStart) * (SR / 1000.f)), wide);
+  if (s_caveState == 3) { if (wide) *wide = 0; return 0.f; }
+  if (s_echoState == 2) { if (wide) *wide = 0.3f; return clampf(level * 1.2f, 0.f, 1.f); }
+  if (!s_mic) { if (wide) *wide = 0; return 0.f; }
+  float k = (now - s_mAt) / 4.f; int i = (int)k; if (i > 7) i = 7; if (i < 0) i = 0;
+  int j = i < 7 ? i + 1 : 7; float f = clampf(k - i, 0.f, 1.f);
+  if (wide) *wide = s_mwid[i] + (s_mwid[j] - s_mwid[i]) * f;
+  return s_msub[i] + (s_msub[j] - s_msub[i]) * f;
+}
+float caveEcho() { if (s_caveState != 3) return 0.f; return bufEnv((int)((millis() - s_caveStart) * (SR / 1000.f)), nullptr); }
 int echoState() { return s_echoState == 3 ? 2 : s_echoState; }
 int echoFx() { return s_echoFxI; }
 void calibrateAmbient(float cap) { s_calN = CAL_BLOCKS; s_calAcc = 0; s_calMin = 1e9f; s_calCap = cap; }
@@ -236,6 +286,37 @@ void service(float dt) {
     M5.Speaker.setVolume(170);
     s_spk = true;
     M5.Speaker.playRaw(s_sfx, (size_t)s_sfxLen, s_sfxRate, false, 1, 0, true);
+  }
+  if (s_caveState == 4 && s_echoOut) {
+    // the mantis says it into the cave (its own voice: pitched up), then the cave answers
+    const float PF = 1.35f;
+    int vl = (int)(s_echoN / PF); if (vl > ECHO_MAX / 2) vl = ECHO_MAX / 2;
+    for (int i = 0; i < vl; i++) { float x = i * PF; int a = (int)x; float f = x - a; int b = a + 1 < s_echoN ? a + 1 : a; s_echoOut[i] = (int16_t)(s_echo[a] + (s_echo[b] - s_echo[a]) * f); }
+    const int D[3] = {SR * 33 / 100, SR * 66 / 100, SR}; const float G[3] = {0.55f, 0.33f, 0.2f}, LPK[3] = {0.5f, 0.35f, 0.24f};
+    int total = vl + D[2] + SR * 35 / 100; if (total > ECHO_MAX) total = ECHO_MAX;
+    static float *mixb = nullptr; if (!mixb) mixb = (float *)heap_caps_malloc(ECHO_MAX * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (mixb) {
+      for (int i = 0; i < total; i++) mixb[i] = i < vl ? s_echoOut[i] : 0.f;
+      for (int k = 0; k < 3; k++) {                                  // each echo darker and quieter, with a little diffusion
+        float lp = 0;
+        for (int i = 0; i < total; i++) {
+          int j = i - D[k]; float x = (j >= 0 && j < vl) ? s_echoOut[j] : 0.f;
+          int j2 = j - SR * 23 / 1000; if (j2 >= 0 && j2 < vl) x += 0.45f * s_echoOut[j2];
+          lp += (x - lp) * LPK[k];
+          mixb[i] += lp * G[k];
+        }
+      }
+      float pk = 1.f; for (int i = 0; i < total; i++) pk = fmaxf(pk, fabsf(mixb[i]));
+      float g = fminf(1.f, 30000.f / pk);
+      for (int i = 0; i < total; i++) s_echoOut[i] = (int16_t)(mixb[i] * g);
+      s_caveVoiceLen = vl; s_caveTotal = total;
+      playBuf(s_echoOut, total, SR, 210);
+      s_caveStart = now; s_caveState = 2;
+    } else s_caveState = 0;
+  }
+  if (s_caveState == 2 || s_caveState == 3) {
+    int pos = (int)((now - s_caveStart) * (SR / 1000.f));
+    if (pos >= s_caveTotal) s_caveState = 0; else s_caveState = pos < s_caveVoiceLen ? 2 : 3;
   }
   if (s_echoState == 3 && s_echoOut) {                          // build the playback: chipmunk / monster / backwards
     s_echoFxI = (s_echoFxI + 1) % 3;

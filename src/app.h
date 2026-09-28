@@ -33,7 +33,7 @@ void hap(uint8_t level, uint16_t ms);
 void kickSubHaptic();
 void hapRumble(float amount, float rateHz, float grit);   // continuous layer; call every frame while it should play
 void hapGesture(uint8_t id);                              // designed envelopes:
-enum : uint8_t { HG_THREAD = 0, HG_CHAIN, HG_MISS, HG_THUNDER, HG_SETTLE, HG_REBIRTH, HG_PAIN, HG_CRACK, HG_LUBDUB, HG_THREE };
+enum : uint8_t { HG_THREAD = 0, HG_CHAIN, HG_MISS, HG_THUNDER, HG_SETTLE, HG_REBIRTH, HG_PAIN, HG_CRACK, HG_LUBDUB, HG_THREE, HG_POP };
 void hapCut(uint16_t quietMs);                            // instant silence, held for quietMs
 
 // ---- colour helpers ----
@@ -61,6 +61,7 @@ static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (
 void mantisBegin();
 void mantisDraw(bool sing);
 void mantisTap(int x, int y);
+void mantisDrawCave();                  // the echo cave (MANTIS third mode)
 // calm.cpp — the physics room
 void calmBegin();
 void calmDraw();
@@ -68,6 +69,8 @@ void calmNext();                       // B: next room
 void calmLongPress();                  // long-press: this room's variant
 void calmTouch(int x, int y, bool down);
 const char *calmName();
+void calmBoatNext();                   // wave tank: next boat (long-press B)
+bool calmIsWaves();
 // rooms.cpp — the puzzle rooms (always start at Mantis NRG)
 void roomsBegin();
 void roomsEnter();

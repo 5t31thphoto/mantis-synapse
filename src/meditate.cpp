@@ -107,7 +107,7 @@ void medSample(float ax, float ay, float az, float dt) {
 
 namespace {
 // ---------- the haptic words ----------
-void swell(float u) { hapRumble(0.06f + 0.28f * clampf(u, 0.f, 1.f), 40.f, 0.f); }   // smooth, no throb
+void swell(float u) { u = clampf(u, 0.f, 1.f); if (u > 0.02f) hapRumble(0.12f + 0.68f * u * u * (3.f - 2.f * u), 45.f, 0.f); }   // clearly felt; silent at empty lungs
 const char *CARD_T[5] = {"breathe in", "breathe out", "well done", "your heartbeat", "we're finishing"};
 void cardFeel(int c, float t) {
   float cyc = fmodf(t, 4.f);
@@ -201,10 +201,15 @@ void medDraw() {
     }
     case P_PLACE: {
       scene(0.3f + 0.2f * sinf(s_total), 0, 1.f);
-      text("lie down somewhere quiet", 34, rgb565(200, 210, 220));
-      text("and place me flat", 50, rgb565(200, 210, 220));
-      text("on your chest", 66, rgb565(200, 210, 220));
-      text(onChest && still ? "...I can feel you breathing" : "I'll begin when I feel you breathing", 196, onChest && still ? wire::LIME : rgb565(110, 120, 130));
+      text("1  lie on your back somewhere quiet", 30, rgb565(200, 210, 220));
+      text("2  put me flat on your chest, screen up", 46, onChest ? wire::LIME : rgb565(200, 210, 220));
+      text("3  breathe normally and stay still", 62, onChest && still ? wire::LIME : rgb565(200, 210, 220));
+      {                                                                   // learning your breath: a ring that fills
+        float u = clampf(s_breathSeen / 10.f, 0.f, 1.f);
+        for (int k = 0; k < 40; k++) if (k < (int)(u * 40)) { float a = -1.5708f + k * 0.157f; canvas.fillCircle(160 + (int)(cosf(a) * 30), 150 + (int)(sinf(a) * 30), 2, wire::LIME); }
+      }
+      text(onChest && still ? "learning your breath..." : "waiting for you to settle", 196, onChest && still ? wire::LIME : rgb565(110, 120, 130));
+      text("then follow the buzz: in as it grows, out as it fades", 210, rgb565(90, 100, 110));
       if (onChest && still && s_breathSeen > 10.f) {
         aud::speakerHold(true); aud::bell(0, 110); setDim(true); go(P_TUNE);
       }
@@ -224,7 +229,9 @@ void medDraw() {
     case P_MIRROR: {
       float open = 0.5f + 0.5f * s_bn;
       scene(open, 0, 0.6f);
-      swell(open * 0.8f);                                                 // the motor follows your breath
+      static float prevBn = 0; bool inhaling = s_bn > prevBn + 0.002f; prevBn = s_bn;
+      if (inhaling) swell(open);                                          // it swells with your inhale, rests on your exhale
+      if (s_pt < 6.f) text("I'm breathing with you", 30, rgb565(120, 150, 150));
       if (s_pt > 60.f) go(P_GUIDE);
       break;
     }
@@ -239,9 +246,10 @@ void medDraw() {
       if (ph < dt / cueP * 1.5f) {                                        // each new cycle
         if (sync > 0.35f) { goodRun++; if (cueP < 10.f) cueP = fminf(10.f, cueP * 1.06f); }   // follow along -> slower, deeper
         else { goodRun = 0; cueP += (clampf(s_period, 3.5f, 10.f) - cueP) * 0.3f; }          // lost you -> meet you where you are
-        if (goodRun > 0 && goodRun % 4 == 0) hapGesture(HG_SETTLE);                          // well done
+        if (goodRun > 0 && goodRun % 6 == 0 && cue < 0.1f) hapGesture(HG_SETTLE);          // well done (at the bottom of a breath)
       }
       scene(cue, 0, 0.6f);
+      if (s_pt < 8.f) text("now follow me: in as it grows, out as it fades", 30, rgb565(120, 150, 150));
       if (s_pt > 180.f) { aud::bell(2, 70); go(P_LISTEN); }
       break;
     }

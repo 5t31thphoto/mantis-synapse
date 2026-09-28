@@ -28,7 +28,8 @@ Everything listens (mic spectrum, beats, voice), everything feels (IMU tilt, sha
 (centre, colour). Their interference is the hypnosis. Curved lids blink, squint and startle at loud sounds.
 Poke it and it flinches, squeals, goes bloodshot and **squirts tears**; hit the pupil for extra outrage.
 Shake: random iris colour and a dizzy eye-roll that recovers. B: gaze tracking on / off.
-**Long-press B** changes the eye: basic → cat (a slit that opens with sound) → dragon (molten iris, knife slit).
+**Long-press B** changes the eye: basic → cat (a slit that opens with sound, slow blinks when it's quiet) → dragon
+(molten iris, knife slit; poke it a few times and it smoulders, throwing embers, sparks and smoke).
 
 **TUNNEL** — B cycles four sub-modes:
 * **dive** — fly down a tube generated from the live spectrum (each depth slice is a moment of sound; beats become
@@ -60,6 +61,9 @@ changes the room's variant:
   Lightning strikes at a distance: close strikes show a bolt and hit with an instant crack, far ones flash in the
   clouds; either way the thunder arrives later the further away it was, and rolls through the motor.
   Go quiet and the storm slowly passes.
+  **Hold B** for another boat: the paper boat (classic), the mantis on a jet ski (jumps, flips off the walls), in a
+  speedboat (heavy; hit the wall too fast and it wrecks, then drops back in), or on a surfboard (paddles to the
+  biggest wave, tries to stand up and ride it... or wipes out).
   Long-press: night, with moon glitter and bioluminescent crests.
 * **aquarium** — blacklight pebbles that pulse with the bass, plankton you can stir, a pulsing jellyfish, fish that
   wander, dart from taps and loud sounds and come to look at a held finger, bubbles that wobble, merge and pop.
@@ -69,7 +73,13 @@ changes the room's variant:
 dancing beat-locked moves chosen by energy. Tap its head to pet it (happy eyes, blush, hearts). Idle, it breathes,
 looks around and waves. **B: sing** — close-up, holding a mic, mouth lip-syncing your voice (open with loudness,
 wide on bright sounds), notes floating out.
-**B** cycles dance → sing → **echo**: say something and the mantis says it back as a chipmunk, a monster or backwards.
+**The dancer** reads the music: it picks a style for each phrase (groove, pop & lock, hype, smooth), switches to
+fast footwork (running man, T-step) when it hears a flurry of quick hits, and lands an emote now and then on the
+fourth beat after three strong ones (claw clap, pinch-snap, point, flex, air guitar, peace claws; a prayer bow to
+close a phrase). Its pincers open and close.
+**B** cycles dance → sing → **cave**: the mantis stands at the mouth of a cave and mouths along as you talk. Press
+**B** and it leans in, claws cupped, and records you; then it says your message into the cave in its own voice, and
+the cave echoes it back. Hold **B** to leave the cave.
 
 ## Drums moved
 
@@ -78,6 +88,11 @@ dancing mantis). Synapse keeps the microphone on permanently, so every mode hear
 the per-pixel effects render on both CPU cores.
 
 ## Portal flights
+
+Every dimension is deeper than the last: you start in real space (black sky, dusty nebulae, white-blue stars)
+and it grows stranger with every portal, all the way to witch-space. Between gates you fly past stellar
+landmarks: suns, ringed planets, gas giants, rarely a white dwarf or a pulsar, and very rarely a black hole whose
+lensing bends the view (and the gates).
 
 Fly the ether and steer through the hoops that appear in the distance (tilt, drag, or hold a finger where you
 want to go; the reticle leans with your steering, and lining up close to a hoop gets a gentle assist). Thread **three in a row** (the dots at the
@@ -113,18 +128,18 @@ room it loops back there.
 
 | room | what it wants |
 |---|---|
-| nrg | shake the Mantis NRG soda until it blows (the pressure is hidden - it calms down if you stop). Pop the foam. |
-| breeze | blow on the pinwheel |
-| arcade | mash the big red button until the mantis on the TV strikes |
-| wrap | pop every bubble (roll a finger across) |
-| clap | clap along with the mantis - three in time |
-| seed | tip the Core2 to pour the watering can |
-| shade | drag the cloud off the sun |
-| align | tip to slide the rows into line; hold level to lock each one |
-| knock | knock on the door - knocking on the Core2's case works too |
-| globe | shake the snow globe, then hold it perfectly still |
-| hum | hum a steady note at the crystal glass |
-| hush | be quiet until the firefly lands |
+| nrg · popcorn · ketchup | shake it: the soda blows / the kernels pop until the lid flies / turn the ketchup upside down AND shake |
+| breeze · candles · dandelion | blow: the pinwheel / out every candle / every seed away |
+| arcade · pump · drumroll | mash: the red button / pump the balloon until it floats off / keep a drum roll going for the crash |
+| wrap · soap · stars | poke them all: bubble wrap / drifting soap bubbles / light every star (a constellation appears) |
+| clap · echo · clapper | clap: along with the mantis / repeat its pattern / clap-clap for the lamp |
+| seed · fishbowl · marble | tip: pour the can / fill the fishbowl / roll the marble through the maze |
+| shade · burrow · window | drag: the cloud off the sun / the rock off the burrow / wipe the foggy window |
+| align · level · mirror | tilt precisely: lock the rows / centre the bubble / bounce the beam into the crystal |
+| knock · coconut · egg | knock (the Core2's case counts): the door / crack the coconut / hatch the egg |
+| globe · 8-ball · kitten | shake, then keep still: the snow globe / the magic 8-ball's answer / rock the kitten to sleep |
+| hum · pitch · levitate | hum: shatter the glass / match the mantis's note / lift the stone |
+| hush · sneak · snowfall | be quiet: the firefly lands / the ant sneaks past the guard / the snow builds a snowman |
 
 ## Haptics
 

@@ -13,6 +13,9 @@
 #include "audio.h"
 #include "wire.h"
 #include <string.h>
+#ifdef HOST
+extern float g_dbgMarbleX, g_dbgMarbleY;
+#endif
 
 namespace {
 
@@ -283,13 +286,15 @@ void tap(int, int) {}
 //  3  ARCADE — mash the red button until the mantis on the TV strikes
 // ============================================================
 namespace arcade {
-float charge = 0, press = 0, bx = 120, by = 70, bvx = 60, bvy = 40, strike = 0;
+float charge = 0, press = 0, bx = 120, by = 70, bvx = 60, bvy = 40, strike = 0, jolt = 0;
 bool caught = false;
 void enter() { charge = 0; caught = false; strike = 0; bx = 120; by = 70; }
 void draw(float dt) {
   bg(rgb565(30, 20, 40), rgb565(12, 8, 18));
-  // TV
-  canvas.fillRoundRect(62, 20, 196, 118, 14, rgb565(70, 40, 30));
+  // TV (it jolts with every press)
+  jolt = fmaxf(0.f, jolt - dt * 8.f);
+  int jx = (int)(sinf(s_t * 90.f) * jolt * 3.f);
+  canvas.fillRoundRect(62 + jx, 20, 196, 118, 14, rgb565(70, 40, 30));
   canvas.fillRoundRect(72, 28, 176, 100, 10, rgb565(8, 30, 14));
   for (int y = 30; y < 126; y += 3) canvas.drawFastHLine(74, y, 172, rgb565(4, 22, 10));
   if (!caught) {                                                              // the bug buzzes about
@@ -301,7 +306,7 @@ void draw(float dt) {
   }
   float tense = clampf(charge, 0.f, 1.f);
   float arm = caught ? 0.2f : (strike > 0 ? 1.f : 0.1f + tense * 0.5f);
-  mantisV(222, 96 + tense * 3.f, 0.9f, arm * 0.3f, arm, tense, rgb565(90, 230, 110));
+  mantisV(222 + jx, 96 + tense * 6.f, 0.9f, arm * 0.3f, arm, tense, mix565(rgb565(90, 230, 110), rgb565(255, 230, 90), tense));
   if (caught) { bx = 222 - 18; by = 64; }
   canvas.fillCircle((int)bx, (int)by, 3, rgb565(20, 20, 20));
   canvas.drawLine((int)bx - 4, (int)by - 3 + (int)(sinf(s_t * 60.f) * 2), (int)bx, (int)by, rgb565(200, 230, 255));
@@ -317,13 +322,22 @@ void draw(float dt) {
   canvas.fillCircle(160, 188 + d, 28, rgb565(90, 10, 14));
   canvas.fillCircle(160, 184 + d, 26 - d / 2, mix565(rgb565(200, 20, 30), rgb565(255, 70, 70), glow * 0.4f));
   canvas.fillCircle(152, 176 + d, 7, rgb565(255, 150, 150));
-  charge = fmaxf(0.f, charge - dt * 0.38f);
+  charge = fmaxf(0.f, charge - dt * 0.22f);
+  for (int k = 0; k < 10; k++) {                                                  // power meter on the controller
+    bool on = charge * 10.f > k;
+    uint16_t c = k < 6 ? wire::LIME : (k < 8 ? rgb565(255, 200, 40) : rgb565(255, 60, 40));
+    canvas.fillRoundRect(112 + k * 10, 156, 8, 8, 2, on ? c : rgb565(50, 50, 60));
+  }
   if (!caught && charge >= 1.f) { strike = 0.35f; caught = true; s_solved = true; hapGesture(HG_CRACK); burst(222, 64, 30, 120); }
   strike = fmaxf(0.f, strike - dt);
   if (charge > 0.2f && !caught) hapRumble(charge * 0.35f, 6.f + charge * 12.f, 0.3f);
 }
 void tap(int x, int y) {
-  if ((x - 160) * (x - 160) + (y - 186) * (y - 186) < 34 * 34) { press = 1.f; charge += 0.1f; hap(120, 14); }
+  if ((x - 160) * (x - 160) + (y - 186) * (y - 186) < 36 * 36) {
+    press = 1.f; charge += 0.085f; jolt = 1.f;
+    hap((uint8_t)(90 + fminf(charge, 1.f) * 160.f), 16);                         // it gets stronger as it builds
+    for (int k = 0; k < 6; k++) spark(160, 176, (fr() - 0.5f) * 160.f, -fr() * 140.f, k & 1 ? rgb565(255, 220, 80) : rgb565(255, 90, 60), 0.35f);
+  }
 }
 }  // namespace arcade
 
@@ -339,7 +353,7 @@ bool pos(int i, int &x, int &y) { int r = i / C, c = i % C; x = 34 + c * 36 + (r
 void pop(int i) {
   if (popped[i]) return;
   int x, y; pos(i, x, y);
-  popped[i] = true; left--; hap(170, 12);
+  popped[i] = true; left--; hapGesture(HG_POP);
   for (int k = 0; k < 6; k++) spark(x, y, (fr() - 0.5f) * 90.f, (fr() - 0.5f) * 90.f, rgb565(230, 250, 255), 0.3f);
   if (left <= 0 && !s_solved) { s_solved = true; hapGesture(HG_SETTLE); }
 }
@@ -348,8 +362,13 @@ void draw(float dt) {
   canvas.fillRoundRect(12, 22, 296, 196, 10, rgb565(170, 200, 210));
   canvas.fillRoundRect(14, 24, 292, 192, 9, rgb565(200, 225, 232));
   int tx, ty;
-  if (touchNow(tx, ty))                                                          // rolling a finger pops too
-    for (int i = 0; i < C * R; i++) { int x, y; if (pos(i, x, y) && (x - tx) * (x - tx) + (y - ty) * (y - ty) < 15 * 15) pop(i); }
+  static bool was = false;
+  bool now = touchNow(tx, ty);
+  if (now) {                                                                      // first contact pops; rolling pops too
+    int rr = was ? 15 : 19;
+    for (int i = 0; i < C * R; i++) { int x, y; if (pos(i, x, y) && (x - tx) * (x - tx) + (y - ty) * (y - ty) < rr * rr) { pop(i); if (!was) break; } }
+  }
+  was = now;
   for (int i = 0; i < C * R; i++) {
     int x, y; if (!pos(i, x, y)) { if (!popped[i]) { popped[i] = true; left--; } continue; }
     if (!popped[i]) {
@@ -363,7 +382,7 @@ void draw(float dt) {
     }
   }
 }
-void tap(int x, int y) { for (int i = 0; i < C * R; i++) { int bx, by; if (pos(i, bx, by) && (bx - x) * (bx - x) + (by - y) * (by - y) < 15 * 15) pop(i); } }
+void tap(int x, int y) { for (int i = 0; i < C * R; i++) { int bx, by; if (pos(i, bx, by) && (bx - x) * (bx - x) + (by - y) * (by - y) < 19 * 19) { pop(i); break; } } }
 }  // namespace wrap
 
 // ============================================================
@@ -371,26 +390,34 @@ void tap(int x, int y) { for (int i = 0; i < C * R; i++) { int bx, by; if (pos(i
 // ============================================================
 namespace clap {
 const float BEAT = 0.625f;                          // 96 bpm
-int streak = 0; float lastGood = -9, flash = 0, lastBeatIdx = -1;
+int streak = 0; float lastGood = -9, flash = 0, lastBeatIdx = -1; uint8_t hist = 0;
 bool wantBeat = false;
-void enter() { streak = 0; lastGood = -9; lastBeatIdx = -1; }
+void enter() { streak = 0; lastGood = -9; lastBeatIdx = -1; hist = 0; }
 void draw(float dt) {
   bg(rgb565(20, 6, 30), rgb565(6, 4, 10));
   canvas.fillTriangle(160, 14, 60, 226, 260, 226, rgb565(40, 22, 56));        // spotlight
   float ph = fmodf(s_t, BEAT) / BEAT;
   float arm = ph < 0.12f ? 0.f : 0.25f + 0.75f * sinf((ph - 0.12f) / 0.88f * 3.1416f);   // arms snap together on the beat
   int bi = (int)(s_t / BEAT);
-  if (bi != lastBeatIdx) { lastBeatIdx = (float)bi; flash = 1.f; if (streak > 0 && s_t - lastGood > BEAT * 1.6f && !s_solved) streak = 0; }
+  if (bi != lastBeatIdx) { lastBeatIdx = (float)bi; flash = 1.f; if (streak > 0 && s_t - lastGood > BEAT * 4.5f && !s_solved) { streak = 0; hist = 0; } }
   flash = fmaxf(0.f, flash - dt * 5.f);
   if (s_solved) arm = 1.f;
   mantisV(160, 132, 1.6f, arm, arm, s_solved ? 1.f : flash * 0.6f);
   if (flash > 0.3f && !s_solved) for (int k = 0; k < 6; k++) { float a = k * 1.047f; canvas.drawLine(160 + (int)(cosf(a) * 14), 96 + (int)(sinf(a) * 14), 160 + (int)(cosf(a) * 24), 96 + (int)(sinf(a) * 24), rgb565(255, 240, 150)); }
   // your clap: a sharp, bright transient near the beat
   if (!s_solved && aud::onset > 0.4f && (aud::treble > 0.3f || aud::zcr > 0.3f)) {
-    float err = fmodf(s_t + BEAT * 0.5f, BEAT) - BEAT * 0.5f;                   // distance to nearest beat
-    if (fabsf(err) < 0.16f && s_t - lastGood > BEAT * 0.5f) { streak++; lastGood = s_t; hap(110, 18); burst(160, 90, 8, 60); }
-    else if (fabsf(err) >= 0.16f) streak = 0;
-    if (streak >= 3) { s_solved = true; hapGesture(HG_CHAIN); burst(160, 90, 50, 180); }
+    static float lastClap = -9;
+    if (s_t - lastClap > 0.2f) {                                                  // one clap = one event
+      lastClap = s_t;
+      float heard = s_t - 0.06f;                                                  // the mic hears it a moment late
+      float err = fmodf(heard + BEAT * 0.5f, BEAT) - BEAT * 0.5f;                 // distance to the nearest beat
+      bool good = fabsf(err) < 0.27f;
+      hist = (uint8_t)(((hist << 1) | (good ? 1 : 0)) & 0x0F);
+      int n = 0; for (int k = 0; k < 4; k++) n += (hist >> k) & 1;
+      streak = n;
+      if (good) { lastGood = s_t; hap(110, 18); burst(160, 90, 8, 60); }
+      if (n >= 3) { s_solved = true; hapGesture(HG_CHAIN); burst(160, 90, 50, 180); }
+    }
   }
   for (int k = 0; k < 3; k++) {
     int x = 136 + k * 24;
@@ -734,14 +761,434 @@ void draw(float dt) {
 void tap(int, int) {}
 }  // namespace hush
 
+// ============================================================
+//  24 MORE ROOMS — two more for every formula
+// ============================================================
+// ---- shared sensing helpers ----
+bool clapEvent() { static float last = -9; if (s_t < last) last = -9; if (aud::onset > 0.4f && (aud::treble > 0.3f || aud::zcr > 0.3f) && s_t - last > 0.2f) { last = s_t; return true; } return false; }
+bool knockEvent() { static float last = -9; if (s_t < last) last = -9; int tx, ty; if (!touchNow(tx, ty) && g_jolt > 0.22f && fabsf(g_gyroX) + fabsf(g_gyroY) + fabsf(g_gyroZ) < 90.f && s_t - last > 0.14f) { last = s_t; return true; } return false; }
+float blowAmt() { return clampf((aud::level - 0.3f) * 2.f, 0.f, 1.f) * (aud::zcr > 0.3f ? 1.f : 0.25f); }
+int humBand(bool &steady) {
+  static int lastPk = -1; int pk = 1; float pv = 0;
+  for (int b = 1; b < 20; b++) if (aud::bands[b] > pv) { pv = aud::bands[b]; pk = b; }
+  bool tonal = aud::level > 0.18f && aud::zcr < 0.3f && pv > 0.35f;
+  steady = tonal && lastPk >= 0 && abs(pk - lastPk) <= 1; lastPk = tonal ? pk : -1; return tonal ? pk : -1;
+}
+bool quietNow() { return aud::level < 0.06f && !aud::calibrating(); }
+void win(float x, float y) { s_solved = true; hapGesture(HG_CHAIN); burst(x, y, 50, 170); }
+
+// ---------------- SHAKE ----------------
+namespace popcorn {   // shake the pot: kernels pop; enough pops and the lid blows
+int pops = 0; float lid = 0, fly = 0; struct K { float x, y, vx, vy; bool live; }; K k[40];
+void enter() { pops = 0; lid = 0; fly = 0; for (auto &q : k) q.live = false; }
+void draw(float dt) {
+  bg(rgb565(60, 30, 20), rgb565(20, 10, 10));
+  canvas.fillRect(90, 200, 140, 12, rgb565(40, 40, 44)); for (int i = 0; i < 5; i++) canvas.fillTriangle(110 + i * 25, 200, 118 + i * 25, 200, 114 + i * 25, 186 - (int)(fr() * 8), rgb565(255, 120 + i * 20, 30));
+  float ag = agitation();
+  if (!s_solved && ag > 0.3f && fr() < ag * 0.35f) { pops++; hap(120, 8); for (auto &q : k) if (!q.live) { q = {130 + fr() * 60, 170, (fr() - 0.5f) * 80, -60 - fr() * 80, true}; break; } }
+  int ox = (int)(sinf(s_t * 50.f) * ag * 3.f);
+  canvas.fillRoundRect(100 + ox, 130, 120, 70, 12, rgb565(150, 150, 160)); canvas.fillRect(84 + ox, 150, 16, 6, rgb565(60, 40, 30)); canvas.fillRect(220 + ox, 150, 16, 6, rgb565(60, 40, 30));
+  if (pops >= 45 && !s_solved) { win(160, 110); fly = 1.f; }
+  if (fly > 0) { fly += dt; lid = fminf(200.f, lid + dt * 400.f); if (fr() < 0.8f) for (auto &q : k) if (!q.live) { q = {140 + fr() * 40, 128, (fr() - 0.5f) * 220, -200 - fr() * 150, true}; break; } }
+  else lid = (pops % 3 == 0 && ag > 0.3f) ? 3.f : 0.f;
+  canvas.fillRoundRect(96 + ox, 122 - (int)lid, 128, 12, 6, rgb565(190, 190, 200)); canvas.fillCircle(160 + ox, 118 - (int)lid, 5, rgb565(60, 40, 30));
+  for (auto &q : k) { if (!q.live) continue; q.vy += 400 * dt; q.x += q.vx * dt; q.y += q.vy * dt; if (q.y > 215) q.live = false;
+    canvas.fillCircle((int)q.x, (int)q.y, 4, rgb565(255, 245, 210)); canvas.fillCircle((int)q.x + 3, (int)q.y - 2, 3, rgb565(255, 250, 225)); }
+}
+void tap(int, int) {}
+}
+namespace ketchup {   // upside down AND shake: the glop finally lets go
+float glop = 0; bool out = false; float splatR = 0;
+void enter() { glop = 0; out = false; splatR = 0; }
+void draw(float dt) {
+  bg(rgb565(230, 230, 220), rgb565(200, 190, 170));
+  canvas.fillEllipse(160, 210, 90, 12, rgb565(250, 250, 250)); canvas.fillEllipse(160, 206, 40, 6, rgb565(230, 190, 120));   // a plate of fries
+  for (int i = 0; i < 6; i++) canvas.fillRect(130 + i * 10, 196 - (i % 3) * 3, 5, 14, rgb565(240, 190, 70));
+  bool upside = g_gravY < -0.3f; float ag = agitation();
+  if (!out && upside && ag > 0.3f) glop += ag * dt * 0.35f; else glop = fmaxf(0.f, glop - dt * 0.05f);
+  float ang = upside ? 3.14159f : 0.f; int by = upside ? 70 : 90;
+  canvas.fillRoundRect(140, by - 40, 40, 80, 10, rgb565(200, 30, 30)); canvas.fillRect(150, upside ? by + 40 : by - 52, 20, 12, rgb565(240, 240, 240));
+  canvas.fillRect(144, by - 10, 32, 18, rgb565(250, 250, 250)); canvas.setTextColor(rgb565(200, 30, 30)); canvas.setCursor(146, by - 4); canvas.print("MNTS");
+  if (upside && glop > 0.1f && !out) canvas.fillCircle(160, by + 54, (int)(2 + glop * 6), rgb565(190, 20, 20));
+  if (glop >= 1.f && !out) { out = true; hapGesture(HG_CRACK); }
+  if (out) { splatR = fminf(30.f, splatR + dt * 120.f); canvas.fillEllipse(160, 200, (int)splatR, (int)(splatR * 0.4f), rgb565(190, 20, 20)); if (splatR >= 30.f && !s_solved) win(160, 190); }
+  (void)ang;
+}
+void tap(int, int) {}
+}
+// ---------------- BLOW ----------------
+namespace candles {   // blow out every candle on the cake
+float fl[5]; int left = 5;
+void enter() { for (auto &f : fl) f = 1.f; left = 5; }
+void draw(float dt) {
+  bg(rgb565(30, 16, 40), rgb565(60, 30, 50));
+  canvas.fillRoundRect(70, 140, 180, 70, 10, rgb565(240, 200, 220)); canvas.fillRect(70, 150, 180, 8, rgb565(200, 80, 150));
+  float b = blowAmt(); left = 0;
+  for (int i = 0; i < 5; i++) {
+    int x = 96 + i * 32; canvas.fillRect(x - 3, 110, 6, 30, i & 1 ? wire::LIME : rgb565(0, 150, 150));
+    if (fl[i] > 0) { left++; float resist = 0.35f + i * 0.08f; if (b > resist) fl[i] -= dt * (b - resist) * 2.5f;
+      int fh = (int)(10 * fl[i] * (1.f - b * 0.6f)); int sway = (int)(b * 6.f + sinf(s_t * 12 + i) * 1.5f);
+      canvas.fillTriangle(x - 4 + sway, 108, x + 4 + sway, 108, x + sway * 2, 108 - fh - 4, rgb565(255, 200, 60)); canvas.fillCircle(x + sway, 106, 3, rgb565(255, 240, 180)); }
+    else canvas.drawLine(x, 108, x + (int)(sinf(s_t * 2 + i) * 4), 90, rgb565(120, 120, 130));
+  }
+  if (left == 0 && !s_solved) win(160, 100);
+}
+void tap(int, int) {}
+}
+namespace dandelion {   // blow the seeds off
+struct S { float x, y, vx, vy, a; bool on; }; S sd[40];
+void enter() { for (int i = 0; i < 40; i++) { float a = i * 0.157f; sd[i] = {160 + cosf(a) * 26, 90 + sinf(a) * 26, 0, 0, a, true}; } }
+void draw(float dt) {
+  bg(rgb565(120, 190, 240), rgb565(200, 240, 200)); canvas.fillRect(0, 200, W, 26, rgb565(90, 170, 70));
+  canvas.drawLine(160, 96, 160, 210, rgb565(70, 150, 60)); canvas.fillCircle(160, 92, 5, rgb565(170, 160, 110));
+  float b = blowAmt(); int left = 0;
+  for (auto &s : sd) {
+    if (s.on) { left++; if (b > 0.2f && fr() < b * dt * 3.f) { s.on = false; s.vx = 60 + fr() * 80; s.vy = -20 - fr() * 40; }
+      canvas.drawLine(160, 92, (int)s.x, (int)s.y, rgb565(240, 240, 240)); canvas.fillCircle((int)s.x, (int)s.y, 2, rgb565(255, 255, 255)); }
+    else { s.x += s.vx * dt; s.y += (s.vy + sinf(s_t * 3 + s.a) * 10) * dt; s.vy += 5 * dt; if (s.x < W + 10) { canvas.drawLine((int)s.x, (int)s.y, (int)s.x - 4, (int)s.y + 4, rgb565(250, 250, 250)); canvas.fillCircle((int)s.x, (int)s.y, 2, rgb565(255, 255, 255)); } }
+  }
+  if (left == 0 && !s_solved) win(160, 90);
+}
+void tap(int, int) {}
+}
+// ---------------- MASH ----------------
+namespace pump {   // pump the balloon up until it floats away
+float size = 0.1f, press = 0; bool gone = false; float gy = 0;
+void enter() { size = 0.1f; gone = false; gy = 0; }
+void draw(float dt) {
+  bg(rgb565(250, 220, 200), rgb565(220, 190, 170));
+  size = fmaxf(0.1f, size - dt * 0.03f); press = fmaxf(0.f, press - dt * 6.f);
+  int ph = (int)(press * 20);
+  canvas.fillRect(60, 120 + ph, 8, 60, rgb565(80, 80, 90)); canvas.fillRect(44, 118 + ph, 40, 8, rgb565(40, 40, 50));
+  canvas.fillRect(52, 170, 24, 50, rgb565(200, 40, 40)); canvas.drawLine(76, 200, 150, 190, rgb565(40, 40, 40));
+  if (!gone) { int r = (int)(12 + size * 60); canvas.fillEllipse(170, 170 - r, r, (int)(r * 1.15f), rgb565(93, 0, 93)); canvas.fillCircle(170 - r / 3, 160 - r, r / 5, rgb565(180, 90, 180)); if (size >= 1.f) { gone = true; win(170, 100); } }
+  else { gy += dt * 60; canvas.fillEllipse(170, (int)(98 - gy), 72, 83, rgb565(93, 0, 93)); canvas.drawLine(170, (int)(180 - gy), 170, (int)(240 - gy), rgb565(40, 40, 40)); }
+  for (int k = 0; k < 10; k++) canvas.fillRoundRect(40 + k * 12, 30, 9, 6, 2, k < size * 10 ? wire::LIME : rgb565(90, 90, 100));
+}
+void tap(int x, int y) { if (x < 110 && !gone) { press = 1.f; size += 0.06f; hap((uint8_t)(100 + size * 120), 14); } }
+}
+namespace drumroll {   // a fast roll on the drum fills the crowd; keep it going for the crash
+float roll = 0, hitT = 0, crash = 0;
+void enter() { roll = 0; crash = 0; }
+void draw(float dt) {
+  bg(rgb565(20, 10, 30), rgb565(40, 20, 20));
+  roll = fmaxf(0.f, roll - dt * 0.16f); hitT = fmaxf(0.f, hitT - dt * 10.f);
+  for (int i = 0; i < 12; i++) { int x = 20 + i * 26; int jump = (int)(roll * 10 * fabsf(sinf(s_t * 9 + i))); canvas.fillCircle(x, 60 - jump, 8, rgb565(60, 50, 70)); }
+  canvas.fillEllipse(160, 170, 70, 22, rgb565(220, 220, 230)); canvas.fillRect(90, 170, 140, 40, rgb565(200, 40, 60)); canvas.fillEllipse(160, 210, 70, 16, rgb565(150, 30, 40));
+  canvas.fillEllipse(160, 170, 66 - (int)(hitT * 4), 19, rgb565(245, 245, 250));
+  mantisV(270, 150, 0.9f, 0.3f + hitT * 0.5f, 0.3f + (1 - hitT) * 0.5f, roll);
+  canvas.fillRect(20, 100, (int)(roll * 280), 6, wire::LIME);
+  if (roll >= 0.95f && !s_solved) { win(160, 120); crash = 1.f; }
+  if (crash > 0) { crash = fmaxf(0.f, crash - dt); canvas.fillEllipse(60, 120, 30, 6, rgb565(255, 220, 80)); }
+}
+void tap(int x, int y) { if (y > 140) { hitT = 1.f; roll = fminf(1.f, roll + 0.07f); hap((uint8_t)(90 + roll * 150), 10); } }
+}
+// ---------------- POKE-ALL ----------------
+namespace soap {   // pop every drifting soap bubble
+struct B { float x, y, r, ph; bool on; }; B bb[14];
+void enter() { for (auto &b : bb) b = {30 + fr() * 260, 40 + fr() * 160, 10 + fr() * 12, fr() * 6, true}; }
+void draw(float dt) {
+  bg(rgb565(120, 180, 230), rgb565(220, 230, 250)); int left = 0;
+  for (auto &b : bb) { if (!b.on) continue; left++; b.ph += dt; b.x += sinf(b.ph * 0.9f) * 12 * dt; b.y += cosf(b.ph * 0.7f) * 8 * dt - 4 * dt; if (b.y < 30) b.y = 200;
+    canvas.drawCircle((int)b.x, (int)b.y, (int)b.r, hsv565(fmodf(b.ph * 60, 360), 0.4f, 1.f)); canvas.fillCircle((int)(b.x - b.r * 0.4f), (int)(b.y - b.r * 0.4f), 2, 0xFFFF); }
+  if (left == 0 && !s_solved) win(160, 120);
+}
+void tap(int x, int y) { for (auto &b : bb) if (b.on && (b.x - x) * (b.x - x) + (b.y - y) * (b.y - y) < (b.r + 8) * (b.r + 8)) { b.on = false; hapGesture(HG_POP); burst(b.x, b.y, 8, 60); break; } }
+}
+namespace stars {   // light every star and a mantis constellation appears
+const int N = 9; const int SX[N] = {130, 190, 115, 205, 160, 160, 125, 195, 160}, SY[N] = {50, 50, 85, 85, 100, 140, 180, 180, 205};
+bool lit[N];
+void enter() { memset(lit, 0, sizeof(lit)); }
+void draw(float dt) {
+  bg(rgb565(4, 6, 24), rgb565(14, 10, 40)); int n = 0;
+  for (int i = 0; i < N; i++) n += lit[i];
+  if (n == N) { static const int E[][2] = {{0, 2}, {1, 3}, {2, 4}, {3, 4}, {4, 5}, {5, 6}, {5, 7}, {5, 8}}; for (auto &e : E) canvas.drawLine(SX[e[0]], SY[e[0]], SX[e[1]], SY[e[1]], wire::TEAL); if (!s_solved) win(160, 120); }
+  for (int i = 0; i < N; i++) { float tw = 0.5f + 0.5f * sinf(s_t * 3 + i); canvas.fillCircle(SX[i], SY[i], lit[i] ? 4 : 2, lit[i] ? rgb565(255, 250, 200) : mix565(rgb565(40, 40, 70), rgb565(90, 90, 120), tw)); }
+}
+void tap(int x, int y) { for (int i = 0; i < N; i++) if (!lit[i] && (SX[i] - x) * (SX[i] - x) + (SY[i] - y) * (SY[i] - y) < 20 * 20) { lit[i] = true; hap(90, 12); burst(SX[i], SY[i], 6, 40); break; } }
+}
+// ---------------- CLAP ----------------
+namespace echoclap {   // the mantis claps a pattern; clap it back
+const float PAT[3] = {0.f, 0.4f, 0.8f}; float t0 = 0; int got = 0; float gotT[3]; bool listen = false;
+void enter() { t0 = 0; got = 0; listen = false; }
+void draw(float dt) {
+  bg(rgb565(30, 10, 40), rgb565(10, 10, 20));
+  float c = fmodf(s_t, 5.f); float arm = 1.f;
+  for (float p : PAT) if (c > p && c < p + 0.12f) arm = 0.f;
+  bool mine = c > 1.6f && c < 4.2f;
+  if (mine && !listen) { listen = true; got = 0; }
+  if (!mine && listen) { listen = false; if (got == 3) { float a = gotT[1] - gotT[0], b = gotT[2] - gotT[1]; if (fabsf(a - 0.4f) < 0.18f && fabsf(b - 0.4f) < 0.18f && !s_solved) win(160, 100); } }
+  if (listen && clapEvent() && got < 3) { gotT[got++] = s_t; hap(110, 14); }
+  mantisV(160, 130, 1.5f, s_solved ? 1.f : arm * 0.8f, s_solved ? 1.f : arm * 0.8f, mine ? 0.2f : 0.8f);
+  for (int k = 0; k < 3; k++) { if (listen && k < got) canvas.fillCircle(136 + k * 24, 30, 7, wire::LIME); else canvas.drawCircle(136 + k * 24, 30, 7, mine ? wire::LIME : rgb565(80, 80, 100)); }
+}
+void tap(int, int) {}
+}
+namespace clapper {   // clap-clap turns the lamp on
+bool on = false; float last = -9;
+void enter() { on = false; last = -9; }
+void draw(float dt) {
+  bg(on ? rgb565(90, 80, 60) : rgb565(10, 10, 16), on ? rgb565(60, 50, 40) : rgb565(6, 6, 10));
+  if (clapEvent()) { if (s_t - last < 0.6f && s_t - last > 0.15f) { on = !on; hap(140, 20); if (on && !s_solved) win(160, 70); } last = s_t; }
+  canvas.fillRect(155, 90, 10, 110, rgb565(90, 80, 70)); canvas.fillEllipse(160, 205, 40, 8, rgb565(70, 60, 50));
+  canvas.fillTriangle(120, 90, 200, 90, 160, 50, on ? rgb565(255, 230, 150) : rgb565(60, 50, 40));
+  if (on) for (int k = 0; k < 5; k++) canvas.drawLine(160, 90, 90 + k * 35, 200, rgb565(120, 110, 80));
+}
+void tap(int, int) {}
+}
+// ---------------- TIP / POUR ----------------
+namespace fishbowl {   // tip the jug to fill the fishbowl
+float fill = 0, jug = 0; struct D { float x, y, vy; bool on; }; D d[40];
+void enter() { fill = 0; for (auto &q : d) q.on = false; }
+void draw(float dt) {
+  bg(rgb565(200, 230, 240), rgb565(240, 240, 230)); canvas.fillRect(0, 214, W, 12, rgb565(150, 110, 80));
+  float target = clampf(g_gravX * 80.f, -10.f, 80.f) * 0.01745f; jug += (target - jug) * clampf(dt * 8, 0, 1);
+  float cx = 132, cy = 66, c = cosf(jug), s = sinf(jug);
+  auto P = [&](float lx, float ly, int &ox, int &oy) { ox = (int)(cx + c * lx - s * ly); oy = (int)(cy + s * lx + c * ly); };
+  int a0, b0, a1, b1, a2, b2, a3, b3; P(-20, -20, a0, b0); P(20, -20, a1, b1); P(20, 22, a2, b2); P(-20, 22, a3, b3);
+  canvas.fillTriangle(a0, b0, a1, b1, a2, b2, rgb565(200, 220, 240)); canvas.fillTriangle(a0, b0, a2, b2, a3, b3, rgb565(200, 220, 240));
+  int sx, sy; P(26, -18, sx, sy);
+  if (jug > 0.5f && fill < 1.f) for (auto &q : d) if (!q.on) { q = {(float)sx, (float)sy, 20, true}; break; }
+  for (auto &q : d) { if (!q.on) continue; q.vy += 500 * dt; q.y += q.vy * dt; q.x += 20 * dt; if (q.y > 140 && q.x > 150 && q.x < 250) { fill = fminf(1.f, fill + 0.008f); q.on = false; continue; } if (q.y > 214) { q.on = false; continue; } canvas.fillCircle((int)q.x, (int)q.y, 2, rgb565(90, 160, 255)); }
+  canvas.fillEllipse(200, 175, 50, 40, rgb565(210, 235, 245)); int wy = (int)(210 - fill * 70);
+  canvas.fillRect(152, wy, 96, 212 - wy, rgb565(110, 180, 240)); canvas.drawEllipse(200, 175, 50, 40, rgb565(150, 190, 210));
+  if (fill > 0.3f) { int fx = 200 + (int)(sinf(s_t) * 20), fy = (int)fmaxf((float)wy + 12, 180.f); canvas.fillEllipse(fx, fy, 9, 5, rgb565(255, 130, 40)); canvas.fillTriangle(fx - 9, fy, fx - 16, fy - 5, fx - 16, fy + 5, rgb565(255, 130, 40)); }
+  if (fill >= 1.f && !s_solved) win(200, 140);
+}
+void tap(int, int) {}
+}
+namespace marble {   // roll the marble through the maze to the hole
+float mx = 40, my = 40, vx = 0, vy = 0;
+const int WL[][4] = {{20, 20, 300, 26}, {20, 20, 26, 220}, {294, 20, 300, 220}, {20, 214, 300, 220}, {20, 80, 220, 86}, {100, 140, 300, 146}};
+void enter() { mx = 40; my = 45; vx = vy = 0; }
+void draw(float dt) {
+  bg(rgb565(120, 90, 60), rgb565(90, 70, 50));
+  for (auto &w : WL) canvas.fillRect(w[0], w[1], w[2] - w[0], w[3] - w[1], rgb565(60, 40, 30));
+  canvas.fillCircle(270, 190, 10, rgb565(10, 10, 10));
+  vx += g_gravX * 400 * dt; vy += g_gravY * 400 * dt; vx *= 0.99f; vy *= 0.99f;
+  float nx = mx + vx * dt, ny = my + vy * dt;
+  for (auto &w : WL) { if (nx + 6 > w[0] && nx - 6 < w[2] && my + 6 > w[1] && my - 6 < w[3]) { nx = mx; vx = -vx * 0.4f; }
+                       if (nx + 6 > w[0] && nx - 6 < w[2] && ny + 6 > w[1] && ny - 6 < w[3]) { ny = my; vy = -vy * 0.4f; } }
+  mx = nx; my = ny;
+#ifdef HOST
+  ::g_dbgMarbleX = mx; ::g_dbgMarbleY = my;
+#endif
+  canvas.fillCircle((int)mx, (int)my, 6, rgb565(90, 200, 230)); canvas.fillCircle((int)mx - 2, (int)my - 2, 2, 0xFFFF);
+  if ((mx - 270) * (mx - 270) + (my - 190) * (my - 190) < 64 && !s_solved) { win(270, 190); vx = vy = 0; }
+}
+void tap(int, int) {}
+}
+// ---------------- DRAG ----------------
+namespace burrow {   // drag the rock off the burrow; a critter pops out
+float rx = 160, ry = 170, pop = 0; bool drag = false; float dX = 0, dY = 0;
+void enter() { rx = 160; ry = 170; pop = 0; drag = false; }
+void draw(float dt) {
+  bg(rgb565(150, 200, 240), rgb565(210, 200, 150)); canvas.fillRect(0, 180, W, 46, rgb565(140, 110, 70)); canvas.fillEllipse(160, 184, 22, 8, rgb565(40, 25, 15));
+  int x, y;
+  if (touchNow(x, y)) { if (!drag && (x - rx) * (x - rx) + (y - ry) * (y - ry) < 40 * 40) { drag = true; dX = rx - x; dY = ry - y; } if (drag) { rx = x + dX; ry = y + dY; } } else drag = false;
+  bool clear = fabsf(rx - 160) > 45;
+  if (clear) { pop = fminf(1.f, pop + dt); int py = 184 - (int)(pop * 26); mantisV(160, (float)py, 0.6f, 0.2f, 0.9f * pop, pop); if (pop >= 1 && !s_solved) win(160, 150); }
+  canvas.fillEllipse((int)rx, (int)ry, 34, 24, rgb565(120, 120, 125)); canvas.fillEllipse((int)rx - 8, (int)ry - 8, 14, 8, rgb565(160, 160, 165));
+}
+void tap(int, int) {}
+}
+namespace window {   // wipe the fog off the window: someone's waving outside
+uint8_t fog[40 * 30]; int left = 0;
+void enter() { memset(fog, 1, sizeof(fog)); left = 40 * 30; }
+void draw(float dt) {
+  bg(rgb565(120, 180, 230), rgb565(180, 220, 160));
+  mantisV(160, 140, 1.4f, 0.2f, 0.6f + 0.4f * fabsf(sinf(s_t * 5)), 0.5f);
+  int x, y;
+  if (touchNow(x, y)) for (int oy = -2; oy <= 2; oy++) for (int ox = -2; ox <= 2; ox++) { int gx = x / 8 + ox, gy = (y - 14) / 7 + oy; if (gx >= 0 && gx < 40 && gy >= 0 && gy < 30 && fog[gy * 40 + gx]) { fog[gy * 40 + gx] = 0; left--; if ((left & 15) == 0) hapRumble(0.15f, 30, 0.8f); } }
+  for (int gy = 0; gy < 30; gy++) for (int gx = 0; gx < 40; gx++) if (fog[gy * 40 + gx]) canvas.fillRect(gx * 8, 14 + gy * 7, 8, 7, rgb565(200, 210, 215));
+  canvas.drawRect(0, 14, W, H - 28, rgb565(120, 90, 60)); canvas.drawFastVLine(160, 14, H - 28, rgb565(120, 90, 60));
+  if (left < 60 && !s_solved) win(160, 100);
+}
+void tap(int, int) {}
+}
+// ---------------- TILT / ALIGN ----------------
+namespace level {   // centre the bubble and hold it: the wobbly shelf settles
+float bx = 0, holdT = 0;
+void enter() { bx = 0; holdT = 0; }
+void draw(float dt) {
+  bg(rgb565(230, 220, 200), rgb565(200, 190, 170));
+  float target = clampf(-g_gravX * 400.f, -110.f, 110.f); bx += (target - bx) * clampf(dt * 5, 0, 1);
+  float wob = s_solved ? 0.f : sinf(s_t * 3.f) * 6.f * (1.f - holdT / 2.f);
+  canvas.fillRect(60, 80 + (int)wob, 200, 10, rgb565(140, 100, 60)); canvas.fillRect(90, 60 + (int)wob, 20, 20, rgb565(200, 80, 80)); canvas.fillRect(200, 55 + (int)wob, 16, 25, rgb565(80, 120, 200));
+  canvas.fillRoundRect(40, 150, 240, 30, 15, rgb565(240, 220, 90)); canvas.fillRoundRect(46, 156, 228, 18, 9, rgb565(220, 250, 180));
+  canvas.drawFastVLine(150, 154, 22, rgb565(60, 60, 60)); canvas.drawFastVLine(170, 154, 22, rgb565(60, 60, 60));
+  canvas.fillEllipse(160 + (int)bx, 165, 14, 7, rgb565(250, 255, 250));
+  holdT = fabsf(bx) < 9.f ? holdT + dt : 0.f;
+  if (holdT > 2.f && !s_solved) win(160, 80);
+}
+void tap(int, int) {}
+}
+namespace mirror {   // aim the mirror so the beam hits the crystal
+float ang = 0, onT = 0;
+void enter() { ang = 0; onT = 0; }
+void draw(float dt) {
+  bg(rgb565(10, 10, 24), rgb565(20, 16, 40));
+  float target = clampf(g_gravX, -0.8f, 0.8f); ang += (target - ang) * clampf(dt * 4, 0, 1);
+  float mx = 160, my = 180, a = -1.5708f + ang;                       // mirror normal
+  canvas.drawLine(20, 60, (int)mx, (int)my, rgb565(255, 240, 150));  // incoming beam
+  float ix = (mx - 20), iy = (my - 60), il = sqrtf(ix * ix + iy * iy); ix /= il; iy /= il;
+  float nx = cosf(a), ny = sinf(a), d = ix * nx + iy * ny, rx = ix - 2 * d * nx, ry = iy - 2 * d * ny;
+  int ex = (int)(mx + rx * 300), ey = (int)(my + ry * 300);
+  canvas.drawLine((int)mx, (int)my, ex, ey, rgb565(255, 240, 150));
+  float cx = 260, cy = 50, t = (cx - mx) * rx + (cy - my) * ry, px = mx + rx * t - cx, py = my + ry * t - cy;
+  bool hitC = t > 0 && px * px + py * py < 14 * 14;
+  onT = hitC ? onT + dt : 0.f;
+  canvas.fillTriangle((int)cx - 10, (int)cy + 10, (int)cx + 10, (int)cy + 10, (int)cx, (int)cy - 16, hitC ? wire::LIME : rgb565(80, 90, 110));
+  canvas.drawLine((int)(mx - cosf(a + 1.5708f) * 26), (int)(my - sinf(a + 1.5708f) * 26), (int)(mx + cosf(a + 1.5708f) * 26), (int)(my + sinf(a + 1.5708f) * 26), rgb565(200, 220, 240));
+  if (onT > 1.f && !s_solved) win(cx, cy);
+}
+void tap(int, int) {}
+}
+// ---------------- KNOCK ----------------
+namespace coconut {   // knock until it cracks open
+int n = 0; float shake = 0;
+void enter() { n = 0; }
+void hitIt() { n++; shake = 1.f; hap(200, 16); if (n >= 7 && !s_solved) win(160, 120); }
+void draw(float dt) {
+  bg(rgb565(250, 220, 150), rgb565(80, 190, 200)); canvas.fillEllipse(160, 240, 260, 40, rgb565(240, 220, 170));
+  if (knockEvent()) hitIt();
+  shake = fmaxf(0.f, shake - dt * 6); int sx = (int)(sinf(s_t * 70) * shake * 4);
+  if (!s_solved) { canvas.fillCircle(160 + sx, 130, 46, rgb565(110, 70, 40)); for (int k = 0; k < n; k++) canvas.drawLine(150 + sx + k * 3, 100 + k * 6, 170 + sx - k * 2, 110 + k * 7, rgb565(40, 25, 10)); }
+  else { canvas.fillEllipse(130, 140, 34, 30, rgb565(110, 70, 40)); canvas.fillEllipse(130, 138, 26, 22, rgb565(250, 250, 245)); canvas.fillEllipse(196, 140, 34, 30, rgb565(110, 70, 40)); canvas.fillEllipse(196, 138, 26, 22, rgb565(250, 250, 245)); }
+}
+void tap(int x, int y) { if ((x - 160) * (x - 160) + (y - 130) * (y - 130) < 50 * 50 && !s_solved) hitIt(); }
+}
+namespace egg {   // tap-tap on the egg... something's inside
+int n = 0; float shake = 0, hatch = 0;
+void enter() { n = 0; hatch = 0; }
+void hitIt() { n++; shake = 1.f; hap(120, 12); if (n >= 5 && hatch == 0) hatch = 0.001f; }
+void draw(float dt) {
+  bg(rgb565(250, 240, 210), rgb565(220, 200, 160)); canvas.fillEllipse(160, 200, 80, 16, rgb565(200, 170, 110));
+  if (knockEvent()) hitIt();
+  shake = fmaxf(0.f, shake - dt * 6); int sx = (int)(sinf(s_t * 60) * shake * 3);
+  if (hatch > 0) { hatch = fminf(1.f, hatch + dt * 0.7f); mantisV(160, 170 - hatch * 30, 0.7f, 0.9f * hatch, 0.9f * hatch, hatch); if (hatch >= 1 && !s_solved) win(160, 130); }
+  if (hatch < 0.5f) { canvas.fillEllipse(160 + sx, 150, 36, 46, rgb565(250, 250, 240)); for (int k = 0; k < n; k++) canvas.drawLine(140 + sx + k * 8, 140 + (k & 1) * 6, 148 + sx + k * 8, 146 - (k & 1) * 6, rgb565(120, 110, 100)); }
+  else { canvas.fillTriangle(124, 170, 196, 170, 160, 196, rgb565(250, 250, 240)); canvas.fillTriangle(130, 110, 170, 110, 150, 96, rgb565(250, 250, 240)); }
+}
+void tap(int x, int y) { if ((x - 160) * (x - 160) + (y - 150) * (y - 150) < 50 * 50 && hatch == 0) hitIt(); }
+}
+// ---------------- SHAKE, THEN STILL ----------------
+namespace eightball {   // shake the magic 8-ball, then hold still for the answer
+float shook = 0, still = 0; int ans = 0;
+const char *A[] = {"YES", "SURELY", "ASK AGAIN", "DEFINITELY", "OF COURSE"};
+void enter() { shook = 0; still = 0; }
+void draw(float dt) {
+  bg(rgb565(20, 20, 40), rgb565(40, 10, 50));
+  float ag = agitation(); if (ag > 0.5f) { shook = fminf(1.f, shook + dt); still = 0; ans = esp_random() % 5; } else if (shook > 0.6f) still += dt;
+  int sx = (int)(sinf(s_t * 50) * fminf(ag, 1.f) * 4);
+  canvas.fillCircle(160 + sx, 120, 80, rgb565(20, 20, 24)); canvas.fillCircle(140 + sx, 96, 22, rgb565(60, 60, 70));
+  canvas.fillCircle(160 + sx, 124, 34, rgb565(10, 20, 70));
+  float up = clampf(still / 2.f, 0.f, 1.f);
+  if (up > 0.05f) { canvas.fillTriangle(160 + sx - (int)(26 * up), 110, 160 + sx + (int)(26 * up), 110, 160 + sx, 110 + (int)(34 * up), rgb565(40, 60, 200));
+    if (up > 0.7f) { canvas.setTextColor(0xFFFF); canvas.setCursor(160 + sx - (int)strlen(A[ans]) * 3, 116); canvas.print(A[ans]); } }
+  else { canvas.setTextColor(0xFFFF); canvas.setTextSize(3); canvas.setCursor(151 + sx, 70); canvas.print("8"); canvas.setTextSize(1); }
+  if (up >= 1.f && !s_solved) win(160, 120);
+}
+void tap(int, int) {}
+}
+namespace kitten {   // rock the kitten gently, then keep still until it sleeps
+float rocked = 0, sleepT = 0;
+void enter() { rocked = 0; sleepT = 0; }
+void draw(float dt) {
+  bg(rgb565(40, 30, 60), rgb565(20, 20, 40));
+  float ag = agitation();
+  if (ag > 0.15f && ag < 0.9f) rocked = fminf(1.f, rocked + dt * 0.4f); else if (ag >= 0.9f) { rocked = fmaxf(0.f, rocked - dt); sleepT = 0; }
+  if (rocked > 0.6f && ag < 0.08f) sleepT += dt; else if (ag > 0.15f) sleepT = 0;
+  float sway = sinf(s_t * 2.f) * ag * 10.f;
+  canvas.fillEllipse(160 + (int)sway, 180, 90, 22, rgb565(120, 80, 60));
+  int cx = 160 + (int)sway; canvas.fillEllipse(cx, 160, 40, 24, rgb565(230, 150, 70)); canvas.fillCircle(cx - 30, 146, 18, rgb565(230, 150, 70));
+  canvas.fillTriangle(cx - 44, 136, cx - 38, 118, cx - 30, 132, rgb565(230, 150, 70)); canvas.fillTriangle(cx - 24, 132, cx - 18, 118, cx - 14, 136, rgb565(230, 150, 70));
+  bool asleep = sleepT > 3.f;
+  if (asleep) { canvas.drawLine(cx - 38, 146, cx - 32, 146, 0); canvas.drawLine(cx - 28, 146, cx - 22, 146, 0); canvas.setTextColor(rgb565(200, 200, 255)); canvas.setCursor(cx, 110 - (int)fmodf(s_t * 10, 20)); canvas.print("z z"); }
+  else { canvas.fillCircle(cx - 36, 145, 3, 0); canvas.fillCircle(cx - 24, 145, 3, 0); }
+  if (asleep && !s_solved) win(cx, 120);
+}
+void tap(int, int) {}
+}
+// ---------------- HUM ----------------
+namespace pitch {   // the mantis sings a note; hum along until you match it
+int target = 6; float match = 0;
+void enter() { target = 4 + esp_random() % 6; match = 0; }
+void draw(float dt) {
+  bg(rgb565(16, 10, 30), rgb565(10, 20, 30));
+  bool st; int pk = humBand(st);
+  bool ok = pk >= 0 && abs(pk - target) <= 1;
+  match = ok ? fminf(1.f, match + dt * 0.5f) : fmaxf(0.f, match - dt * 0.3f);
+  mantisV(90, 150, 1.1f, 0.3f, 0.5f, 0.5f);
+  int ty = 200 - target * 8; canvas.drawFastHLine(40, ty, 240, wire::TEAL);
+  if (pk >= 0) canvas.drawFastHLine(160, 200 - pk * 8, 120, ok ? wire::LIME : rgb565(200, 80, 80));
+  canvas.fillRect(20, 220, (int)(280 * match), 4, wire::LIME);
+  if (match >= 1.f && !s_solved) win(200, ty);
+}
+void tap(int, int) {}
+}
+namespace levitate {   // a steady hum lifts the stone
+float h = 0;
+void enter() { h = 0; }
+void draw(float dt) {
+  bg(rgb565(20, 30, 40), rgb565(30, 20, 40)); canvas.fillRect(0, 200, W, 26, rgb565(50, 50, 60));
+  bool st; int pk = humBand(st);
+  h = st ? fminf(1.f, h + dt * 0.25f) : fmaxf(0.f, h - dt * 0.35f);
+  int y = 190 - (int)(h * 140) + (int)(sinf(s_t * 3) * 3 * h);
+  if (h > 0.05f) for (int k = 0; k < 3; k++) canvas.drawEllipse(160, y + 22 + k * 6, 30 + k * 8, 4, mix565(wire::TEAL, 0, k * 0.3f));
+  canvas.fillEllipse(160, y, 30, 18, rgb565(110, 110, 120)); canvas.drawLine(150, y - 6, 164, y + 4, wire::LIME);
+  if (h >= 1.f && !s_solved) win(160, 50); (void)pk;
+}
+void tap(int, int) {}
+}
+// ---------------- SILENCE ----------------
+namespace sneak {   // an ant carries the cookie past the sleeping guard: stay quiet
+float ax = 20; bool woke = false; float wokeT = 0;
+void enter() { ax = 20; woke = false; }
+void draw(float dt) {
+  bg(rgb565(30, 20, 40), rgb565(20, 20, 30)); canvas.fillRect(0, 196, W, 30, rgb565(60, 40, 30));
+  if (!quietNow() && !s_solved) { woke = true; wokeT = 1.2f; ax = fmaxf(20.f, ax - 60.f * dt); }
+  wokeT -= dt; if (wokeT <= 0) woke = false;
+  if (!woke && !s_solved) ax += dt * 14.f;
+  mantisV(160, 150, 1.1f, woke ? 0.9f : 0.1f, woke ? 0.9f : 0.1f, woke ? 1.f : 0.f);
+  if (!woke) { canvas.setTextColor(rgb565(160, 160, 220)); canvas.setCursor(180, 100 - (int)fmodf(s_t * 8, 16)); canvas.print("z"); }
+  canvas.fillCircle((int)ax, 190, 6, rgb565(200, 150, 80)); canvas.fillCircle((int)ax - 8, 193, 3, rgb565(20, 20, 20)); canvas.fillCircle((int)ax - 13, 193, 3, rgb565(20, 20, 20));
+  if (ax > 300 && !s_solved) win(300, 180);
+}
+void tap(int, int) {}
+}
+namespace snowfall {   // silence lets the snow fall; it builds a snowman
+float snow = 0; struct F { float x, y; }; F f[50];
+void enter() { snow = 0; for (auto &q : f) q = {fr() * W, fr() * 200}; }
+void draw(float dt) {
+  bg(rgb565(20, 30, 60), rgb565(60, 70, 100)); canvas.fillRect(0, 206, W, 20, rgb565(230, 235, 245));
+  bool q = quietNow();
+  if (q) snow = fminf(1.f, snow + dt * 0.12f);
+  for (auto &p : f) { if (q) { p.y += 20 * dt; p.x += sinf(s_t + p.y * 0.05f) * 8 * dt; } if (p.y > 206) p = {fr() * W, 14}; if (q) canvas.fillCircle((int)p.x, (int)p.y, 1, 0xFFFF); }
+  if (snow > 0.2f) canvas.fillCircle(160, 190, (int)(10 + 16 * fminf(1.f, snow * 2)), 0xFFFF);
+  if (snow > 0.5f) canvas.fillCircle(160, 158, (int)(8 + 10 * fminf(1.f, (snow - 0.5f) * 3)), 0xFFFF);
+  if (snow > 0.8f) { canvas.fillCircle(160, 136, 10, 0xFFFF); canvas.fillCircle(156, 134, 1, 0); canvas.fillCircle(164, 134, 1, 0); canvas.fillTriangle(160, 137, 160, 139, 168, 138, rgb565(255, 140, 40)); }
+  if (snow >= 1.f && !s_solved) win(160, 120);
+}
+void tap(int, int) {}
+}
+
 struct Room { const char *name; void (*enter)(); void (*draw)(float); void (*tap)(int, int); };
 const Room ROOMS[] = {
-  {"nrg", nrg::enter, nrg::draw, nrg::tap},          {"breeze", breeze::enter, breeze::draw, breeze::tap},
-  {"arcade", arcade::enter, arcade::draw, arcade::tap}, {"wrap", wrap::enter, wrap::draw, wrap::tap},
-  {"clap", clap::enter, clap::draw, clap::tap},       {"seed", seed::enter, seed::draw, seed::tap},
-  {"shade", shade::enter, shade::draw, shade::tap},   {"align", align::enter, align::draw, align::tap},
-  {"knock", knock::enter, knock::draw, knock::tap},   {"globe", globe::enter, globe::draw, globe::tap},
-  {"hum", hum::enter, hum::draw, hum::tap},           {"hush", hush::enter, hush::draw, hush::tap},
+#define RM(n, ns) {n, ns::enter, ns::draw, ns::tap}
+  RM("nrg", nrg), RM("popcorn", popcorn), RM("ketchup", ketchup),
+  RM("breeze", breeze), RM("candles", candles), RM("dandelion", dandelion),
+  RM("arcade", arcade), RM("pump", pump), RM("drumroll", drumroll),
+  RM("wrap", wrap), RM("soap", soap), RM("stars", stars),
+  RM("clap", clap), RM("echo", echoclap), RM("clapper", clapper),
+  RM("seed", seed), RM("fishbowl", fishbowl), RM("marble", marble),
+  RM("shade", shade), RM("burrow", burrow), RM("window", window),
+  RM("align", align), RM("level", level), RM("mirror", mirror),
+  RM("knock", knock), RM("coconut", coconut), RM("egg", egg),
+  RM("globe", globe), RM("8-ball", eightball), RM("kitten", kitten),
+  RM("hum", hum), RM("pitch", pitch), RM("levitate", levitate),
+  RM("hush", hush), RM("sneak", sneak), RM("snowfall", snowfall),
+#undef RM
 };
 const int NROOM = sizeof(ROOMS) / sizeof(ROOMS[0]);
 int s_room = 0;
@@ -767,6 +1214,7 @@ void roomsDraw() {
   }
 }
 #ifdef HOST
+__attribute__((weak)) float g_dbgMarbleX = 0, g_dbgMarbleY = 0;
 float roomsAlignPos(int i) { return align::lock[i] ? 999.f : align::pos[i]; }
 void roomsDebugSolve() { s_solved = true; }
 int roomsIndex() { return s_room; }

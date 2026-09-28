@@ -28,4 +28,9 @@ void speakerHold(bool on);             // keep the speaker (mic off) - meditatio
 void echo(bool on);                    // yakback: records when you talk, plays you back funny
 int echoState();                       // 0 listening, 1 recording, 2 playing
 int echoFx();                          // 0 chipmunk, 1 monster, 2 backwards
+float mouthNow(float *wide);           // lip-sync: 0..1 open (4 ms speech envelope), width 0..1
+void cave(bool on);                    // the echo cave
+void caveRecord();                     // lean in and record (stops after you finish, max 3 s)
+int caveState();                       // 0 idle, 1 recording, 2 mantis speaking, 3 cave echoing
+float caveEcho();                      // loudness of the cave's answer (for its glow)
 }
