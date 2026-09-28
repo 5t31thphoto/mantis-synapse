@@ -74,10 +74,19 @@ changes the room's variant:
 dancing beat-locked moves chosen by energy. Tap its head to pet it (happy eyes, blush, hearts). Idle, it breathes,
 looks around and waves. **B: sing** — close-up, holding a mic, mouth lip-syncing your voice (open with loudness,
 wide on bright sounds), notes floating out.
-**The dancer** reads the music: it picks a style for each phrase (groove, pop & lock, hype, smooth), switches to
-fast footwork (running man, T-step) when it hears a flurry of quick hits, and lands an emote now and then on the
-fourth beat after three strong ones (claw clap, pinch-snap, point, flex, air guitar, peace claws; a prayer bow to
-close a phrase). Its pincers open and close.
+**The dancer** reads the music with a handful of cheap, robust abstractions - hit density, sustain (wall of sound vs
+punchy), tonality, loudness, kick-on-every-beat, backbeat, syncopation, brightness, sub-bass wobble - and blends them
+into a feel: hip-hop, metal, country, pop/EDM, dubstep, soft, or a general groove (it re-reads the music at every
+8-beat phrase and needs two phrases of agreement to switch). Each feel has its own moves: head-nod bounce, two-step,
+cabbage patch, King Tut tutting, shoulder lean, toprock; windmill headbang, power stomp, mosh; heel-toe, grapevine,
+hoedown, thumbs-in-belt swagger; claw pumps, jump-ups, arm waves, Melbourne shuffle, hands-up sway; half-time wobble,
+stutter glitch, slow-mo, liquid arms; and pure mantis: twig-sway, prayer, stalking. On top of the older moves.
+Song shape: a sudden silence freezes it in a pose and the drop explodes it back; build-ups crouch it in anticipation;
+breakdowns go half-time; hi-hat trills trigger a ridiculously fast shuffle flourish; syncopated grooves favour
+isolations. After three strong beats the fourth may land an emote from the feel's own set (devil horns, lasso, overhead
+clap, strike, grooming, head swivel, threat display, shrug, and more). When a clear vocal line comes through (voice-band
+energy + harmonic + syllable-rate modulation + moving pitch), it sometimes sings along. Its pincers open and close, and
+the serrations face down and inward unless it's straining overhead (or popping its elbows).
 **B** cycles dance → sing → **cave**: the mantis stands at the mouth of a cave and mouths along as you talk. Press
 **B** and it leans in, claws cupped, and records you; then it says your message into the cave in its own voice, and
 the cave echoes it back. Hold **B** to leave the cave.

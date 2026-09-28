@@ -11,6 +11,8 @@ static const int SR = 16000;
 static const int MIC_REC = 512;
 
 float level = 0, peak = 0, calm = 0, zcr = 0, onset = 0, beatPos = 0, beatConf = 0;
+float kick = 0, snare = 0, hat = 0, flat = 0, vocal = 0, vocalEnv = 0;
+static float s_fl[3] = {0.1f, 0.1f, 0.1f}, s_prevG[3], s_evLp = 0, s_evMod = 0, s_evPow = 1e-6f, s_modPow = 0, s_evMin = 1e9f, s_evMax = 1.f;
 float bands[32];
 float bass = 0, mid = 0, treble = 0, centroid = 0;
 int16_t scope[256];
@@ -107,6 +109,44 @@ static void analyze(const int16_t *x, bool fromMic, float dt) {
     s_prevBands[b] = v;
     bands[b] = v > bands[b] ? bands[b] * 0.35f + v * 0.65f : bands[b] * 0.78f + v * 0.22f;
     wsum += bands[b] * b; tot += bands[b];
+  }
+  // ---- band-group onsets: kick (62-250 Hz), snare (560 Hz-3.2 kHz), hats (3.7-7.5 kHz) ----
+  if (fromMic) {
+    static const int G0[3] = {0, 8, 27}, G1[3] = {3, 25, 32};
+    for (int g = 0; g < 3; g++) {
+      float e = 0; for (int b = G0[g]; b < G1[g]; b++) e += bands[b]; e /= (G1[g] - G0[g]);
+      float d = e - s_prevG[g]; s_prevG[g] = e;
+      float thr = s_fl[g] * 1.8f + 0.04f;
+      float hit = (d > thr && level > 0.04f) ? clampf_((d - thr) * 3.f + 0.3f, 0.f, 1.f) : 0.f;
+      if (g == 0) kick = fmaxf(kick, hit); else if (g == 1) snare = fmaxf(snare, hit); else hat = fmaxf(hat, hit);
+      s_fl[g] = s_fl[g] * 0.9f + fmaxf(d, 0.f) * 0.1f;
+    }
+    // ---- spectral flatness (geometric / arithmetic mean): broadband fuzz = distortion ----
+    float lg = 0, ar = 0;
+    for (int b = 8; b < 32; b++) { lg += logf(raw[b] + 1.f); ar += raw[b] + 1.f; }
+    float fl = expf(lg / 24.f) / (ar / 24.f);
+    flat += (fl - flat) * 0.1f;
+    // ---- vocals: energy in the speech/singing band (250 Hz-3.2 kHz), harmonic (low flatness there),
+    //      and an envelope modulated at syllable rate (2-8 Hz; speech/song peak near 4 Hz) ----
+    float ev = 0, et = 1.f, vl = 0, va = 0;
+    for (int b = 3; b < 26; b++) { ev += raw[b]; vl += logf(raw[b] + 1.f); va += raw[b] + 1.f; }
+    for (int b = 0; b < 32; b++) et += raw[b];
+    float vflat = expf(vl / 23.f) / (va / 23.f);
+    float share = ev / et;
+    float evl = logf(ev + 1.f);                                   // log envelope, ~31 Hz block rate
+    float lp = s_evLp; s_evLp += (evl - s_evLp) * 0.28f;          // ~1.5 Hz low-pass (the slow part)
+    float hp = evl - lp;                                          // ... removed
+    s_evMod += (hp - s_evMod) * 0.75f;                            // ~8 Hz low-pass -> 2-8 Hz band
+    s_modPow += (s_evMod * s_evMod - s_modPow) * 0.06f;
+    float modK = clampf_(sqrtf(s_modPow) * 3.f, 0.f, 1.f);
+    static int pPrev = -1; static float pMove = 0;
+    int pk = 2; for (int b = 3; b < 10; b++) if (raw[b] > raw[pk]) pk = b;       // dominant low harmonic (~f0 range)
+    pMove += (((pPrev >= 0 && pk != pPrev) ? 1.f : 0.f) - pMove) * 0.03f; pPrev = pk;
+    float melodic = clampf_((pMove - 0.045f) * 14.f, 0.f, 1.f);                    // a voice moves in pitch; a looped pluck doesn't
+    float v = clampf_((share - 0.45f) / 0.3f, 0.f, 1.f) * clampf_((0.8f - vflat) / 0.45f, 0.f, 1.f) * modK * melodic * clampf_(level * 3.f, 0.f, 1.f);
+    vocal += (v - vocal) * (v > vocal ? 0.08f : 0.03f);
+    s_evMin = fminf(s_evMin * 0.999f + evl * 0.001f, evl); s_evMax = fmaxf(s_evMax * 0.998f + evl * 0.002f, evl);
+    vocalEnv = clampf_((evl - s_evMin - 0.6f) / fmaxf(0.5f, s_evMax - s_evMin - 0.6f), 0.f, 1.f);
   }
   bass = (bands[0] + bands[1] + bands[2] + bands[3] + bands[4] + bands[5]) / 6.f;
   mid = 0; for (int b = 8; b < 18; b++) mid += bands[b]; mid /= 10.f;
@@ -234,6 +274,7 @@ static void synthBells() {
     }
   }
 }
+float bpm() { return 60000.f / s_period; }
 void begin() {
   fftInit(); synthSfx(); synthBells();
   s_echo = (int16_t *)heap_caps_malloc(ECHO_MAX * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -348,7 +389,7 @@ void service(float dt) {
     if (k < 256) level = s_env[k] / 180.f; else { s_echoState = 0; level = 0; }
   }
   if (s_spk && now > s_sfxUntil && !s_hold) toMic();
-  onset = 0;
+  onset = 0; kick = snare = hat = 0;
   if (s_mic) {
     if (!s_micBusy) { M5.Mic.record(s_micBuf, MIC_REC, SR); s_micBusy = true; s_micAt = now; }
     else if (now - s_micAt >= 30 && M5.Mic.isRecording() == 0) {

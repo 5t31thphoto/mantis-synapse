@@ -18,6 +18,10 @@ extern float beatPos, beatConf;        // beat PLL
 extern int16_t scope[256];
 extern float bands[32];
 extern float bass, mid, treble, centroid;
+extern float kick, snare, hat;         // band-group onset strength this frame (0 = none)
+extern float flat;                     // spectral flatness 0..1 (broadband fuzz / distortion)
+extern float vocal, vocalEnv;          // how clearly a voice is present (0..1) and its envelope (0..1)
+float bpm();                           // tempo estimate
 bool speakerLive();                    // true only while an sfx is sounding
 void sfx(float pitch);                 // comic squeak
 void calibrateAmbient(float cap = 1000.f);   // listen ~0.9 s to learn the room's noise floor (capped)

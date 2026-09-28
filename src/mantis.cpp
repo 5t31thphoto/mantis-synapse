@@ -93,6 +93,7 @@ struct Pose {
   float fx[4], fy[4];
   float sq, mouth;
   float claw[2];                       // pincers: 0 shut .. 0.4 resting .. 1 wide open
+  float strain;                        // 1 = straining overhead like a hype man: spines may face up
 };
 static const int NPF = sizeof(Pose) / sizeof(float);
 static void lerpPose(Pose &o, const Pose &a, const Pose &b, float t) {
@@ -105,7 +106,18 @@ enum Move { M_IDLE, M_BOB, M_SWAY, M_WAVE_L, M_WAVE_R, M_CHEER, M_BANG, M_SPREAD
             // styles
             M_POP, M_ROBOT, M_RUNMAN, M_TSTEP, M_MOON, M_BODYWAVE, M_HYPE,
             // emotes (one beat, on accents)
-            M_E_CLAP, M_E_SNAP, M_E_POINT, M_E_FLEX, M_E_GUITAR, M_E_PEACE, M_E_BOW, M_COUNT };
+            M_E_CLAP, M_E_SNAP, M_E_POINT, M_E_FLEX, M_E_GUITAR, M_E_PEACE, M_E_BOW,
+            // ---- V25: the big vocabulary ----
+            M_NOD, M_TWOSTEP, M_CABBAGE, M_TUT, M_SHLEAN, M_TOPROCK,          // hip-hop
+            M_WINDMILL, M_STOMP, M_MOSH,                                     // metal
+            M_HEELTOE, M_GRAPEVINE, M_HOEDOWN, M_SWAGGER,                    // country
+            M_PUMP, M_JUMPUP, M_ARMWAVE, M_SHUFFLE2, M_SWAYUP,               // pop / EDM
+            M_WOBBLE, M_GLITCH, M_SLOWMO, M_LIQUID,                          // dubstep
+            M_TWIG, M_PRAY, M_STALK,                                         // soft / pure mantis
+            M_TRILL, M_FREEZE,                                               // flourish, freeze
+            M_E_HORNS, M_E_LASSO, M_E_OVERCLAP, M_E_STRIKE, M_E_GROOM, M_E_SWIVEL, M_E_THREAT, M_E_SHRUG, M_E_DROP,
+            M_COUNT };
+static int s_freezeVar = 0;
 static bool s_cave = false;                 // the echo cave scene
 #ifdef HOST
 __attribute__((weak)) int g_dbgMove = -1;
@@ -164,7 +176,7 @@ static void evalMove(int m, float b, float e, Pose &p) {
     }
     case M_WAVE_L: case M_WAVE_R: {
       int a = (m == M_WAVE_L) ? 0 : 1; float d = a ? 1.f : -1.f;
-      p.au[a] = 150.f + 6.f * sinf(6.2831853f * b);
+      p.au[a] = 150.f + 6.f * sinf(6.2831853f * b); p.strain = 1.f;
       p.as[a] = -15.f + 40.f * sinf(6.2831853f * b);
       p.au[1 - a] = 12.f; p.as[1 - a] = 6.f * dip(f);
       p.torso = 6.f * d; p.head = 10.f * d + 5.f * sinf(3.14159f * b); p.x = 5.f * d;
@@ -182,6 +194,7 @@ static void evalMove(int m, float b, float e, Pose &p) {
       p.head = 7.f * sinf(3.14159f * b); p.mouth = 0.55f + 0.3f * air;
       p.abd = 12.f * sinf(6.2831853f * b);
       p.claw[0] = p.claw[1] = 0.9f;                            // hands up, claws wide
+      p.strain = 1.f;
       break;
     }
     case M_BANG: {
@@ -234,6 +247,7 @@ static void evalMove(int m, float b, float e, Pose &p) {
       p.head = PA[k][4] * ov + (k & 1 ? 6.f : -6.f); p.torso = PA[k][5] * 2.f; p.hx = (k & 1) ? 2.f : -2.f;
       p.y = 2.f * h; p.sq = 0.6f * h;
       p.claw[0] = (k == 2) ? 0.95f : 0.1f; p.claw[1] = (k == 3) ? 0.95f : 0.1f;
+      p.strain = 1.f;                                              // elbow pops: spines up is the look
       break;
     }
     case M_ROBOT: {                                               // a wave travelling arm -> scythe -> claw, stiff torso
@@ -241,7 +255,7 @@ static void evalMove(int m, float b, float e, Pose &p) {
       p.au[0] = 60.f + 50.f * sinf(w); p.as[0] = 40.f + 50.f * sinf(w - 1.2f); p.claw[0] = 0.4f + 0.5f * sinf(w - 2.4f);
       p.au[1] = 60.f + 50.f * sinf(w + 3.14f); p.as[1] = 40.f + 50.f * sinf(w + 1.94f); p.claw[1] = 0.4f + 0.5f * sinf(w + 0.74f);
       p.head = 8.f * ((((int)floorf(b * 4.f)) & 1) ? 1.f : -1.f);     // head ticks in quarter steps
-      p.torso = 0; p.y = 1.5f * dip(f);
+      p.torso = 0; p.y = 1.5f * dip(f); p.strain = 1.f;
       break;
     }
     // ---------------- FOOTWORK: fast feet (2x the beat), cool upper body ----------------
@@ -286,6 +300,7 @@ static void evalMove(int m, float b, float e, Pose &p) {
       p.y = -16.f * e * air; for (int i = 0; i < 4; i++) p.fy[i] = p.y * 0.95f;
       p.au[0] = p.au[1] = 120.f + 40.f * h; p.as[0] = p.as[1] = 20.f + 60.f * air;
       p.claw[0] = p.claw[1] = 0.1f + 0.8f * h;                    // claw pump on the kick
+      p.strain = 1.f;
       p.head = -10.f * h; p.hy = 5.f * h; p.sq = 1.1f * h - 0.4f * air; p.mouth = 0.6f * air;
       break;
     }
@@ -308,7 +323,7 @@ static void evalMove(int m, float b, float e, Pose &p) {
       break;
     case M_E_FLEX: {
       float h = hit(f);
-      p.au[0] = p.au[1] = 100.f; p.as[0] = p.as[1] = 140.f; p.claw[0] = p.claw[1] = 0.05f;
+      p.au[0] = p.au[1] = 100.f; p.as[0] = p.as[1] = 140.f; p.claw[0] = p.claw[1] = 0.05f; p.strain = 1.f;
       p.y = 2.f + 2.f * h; p.sq = 0.8f * h; p.head = 3.f * sinf(12.f * b); p.mouth = 0.2f;
       break;
     }
@@ -320,13 +335,257 @@ static void evalMove(int m, float b, float e, Pose &p) {
       break;
     }
     case M_E_PEACE:
-      p.au[0] = p.au[1] = 140.f; p.as[0] = p.as[1] = 30.f; p.claw[0] = p.claw[1] = 1.f;
+      p.au[0] = p.au[1] = 140.f; p.as[0] = p.as[1] = 30.f; p.claw[0] = p.claw[1] = 1.f; p.strain = 1.f;
       p.head = 5.f * sinf(6.2831853f * b); p.mouth = 0.5f; p.y = -2.f;
       break;
     case M_E_BOW:                                                 // the mantis prayer bow
       p.au[0] = p.au[1] = 70.f; p.as[0] = p.as[1] = 120.f; p.claw[0] = p.claw[1] = 0.05f;
       p.torso = 0; p.head = 0; p.hy = 7.f * sinf(3.14159f * f); p.y = 3.f * sinf(3.14159f * f); p.mouth = 0.f;
       break;
+
+    // ======================= V25 moves =======================
+    // ---- hip-hop ----
+    case M_NOD: {                                                 // head nod + knee bounce, arms loose
+      float d = dip(f);
+      p.head = 9.f * (1.f - d) - 3.f; p.hy = 3.f * (1.f - d); p.y = 5.f * (1.f - d); p.sq = 0.5f * hit(f);
+      p.au[0] = 22.f + 6.f * sgn; p.au[1] = 22.f - 6.f * sgn; p.as[0] = p.as[1] = 35.f; p.claw[0] = p.claw[1] = 0.25f;
+      p.torso = 3.f * sgn; p.abd = 6.f * sgn;
+      break;
+    }
+    case M_TWOSTEP: {                                             // step out, step back, shoulders ride it
+      float s = sinf(3.14159f * b), up = sinf(3.14159f * f);
+      p.x = 9.f * s; p.torso = -5.f * s; p.head = 6.f * s + 4.f * up;
+      int side = (bi & 1); p.fx[side * 2] = p.fx[side * 2 + 1] = 7.f * (side ? 1.f : -1.f) * up; p.fy[side * 2] = -6.f * up;
+      p.au[0] = 30.f + 20.f * fmaxf(0.f, s); p.au[1] = 30.f + 20.f * fmaxf(0.f, -s); p.as[0] = p.as[1] = 50.f; p.y = 3.f * dip(f);
+      break;
+    }
+    case M_CABBAGE: {                                             // cabbage patch: claws churn in circles at chest height
+      float w = 6.2831853f * b * 0.5f;
+      p.au[0] = 70.f + 25.f * cosf(w); p.as[0] = 80.f + 30.f * sinf(w);
+      p.au[1] = 70.f + 25.f * cosf(w + 3.14f); p.as[1] = 80.f + 30.f * sinf(w + 3.14f);
+      p.claw[0] = p.claw[1] = 0.2f; p.torso = 5.f * sinf(w); p.x = 6.f * sinf(w); p.y = 3.f * dip(f); p.head = -4.f * sinf(w);
+      break;
+    }
+    case M_TUT: {                                                 // King Tut: crisp 90-degree geometry, a new shape every half beat
+      static const float T[6][4] = {{90, 0, 90, 90}, {0, 90, 90, 90}, {90, 90, 0, 90}, {150, 60, 30, 120}, {30, 120, 150, 60}, {90, 180, 90, 0}};
+      int k = ((int)floorf(b * 2.f)) % 6; float h = hit(fmodf(b * 2.f, 1.f));
+      p.au[0] = T[k][0]; p.as[0] = T[k][1]; p.au[1] = T[k][2]; p.as[1] = T[k][3];
+      p.claw[0] = p.claw[1] = 0.f; p.head = (k & 1 ? 8.f : -8.f); p.hx = (k & 1 ? 3.f : -3.f); p.y = 1.5f * h; p.strain = 1.f;
+      break;
+    }
+    case M_SHLEAN: {                                              // shoulder lean: lean, hold, lean back
+      float l = sgn * (0.6f + 0.4f * (1.f - hit(f)));
+      p.torso = 11.f * l; p.x = 8.f * l; p.head = -6.f * l; p.hx = -2.f * l; p.abd = -10.f * l;
+      p.au[0] = 25.f; p.au[1] = 25.f; p.as[0] = p.as[1] = 40.f; p.claw[0] = p.claw[1] = 0.2f; p.y = 2.f * dip(f);
+      break;
+    }
+    case M_TOPROCK: {                                             // b-boy toprock: cross-step in front, arms open-close
+      float q = fmodf(b, 2.f) / 2.f; int ph = (int)(q * 4.f);
+      p.fx[ph & 3] = (ph & 1 ? 8.f : -8.f) * sinf(3.14159f * fmodf(q * 4.f, 1.f)); p.fy[ph & 3] = -8.f * sinf(3.14159f * fmodf(q * 4.f, 1.f));
+      float open = sinf(3.14159f * q * 2.f);
+      p.au[0] = p.au[1] = 40.f + 40.f * open; p.as[0] = p.as[1] = 70.f - 40.f * open; p.claw[0] = p.claw[1] = 0.3f + 0.5f * open;
+      p.torso = 6.f * sinf(6.2831853f * q); p.y = 3.f * dip(f); p.head = 5.f * sgn;
+      break;
+    }
+    // ---- metal ----
+    case M_WINDMILL: {                                            // windmill headbang: the whole top half circles
+      float w = 6.2831853f * b * 0.5f;
+      p.head = 22.f * sinf(w); p.hy = 6.f + 5.f * cosf(w); p.torso = 10.f * sinf(w); p.abd = -12.f * sinf(w);
+      p.au[0] = p.au[1] = 30.f; p.as[0] = p.as[1] = 20.f; p.claw[0] = p.claw[1] = 0.1f; p.y = 4.f + 2.f * dip(f); p.sq = 0.4f;
+      break;
+    }
+    case M_STOMP: {                                               // power stance: wide, stomp on the kick, claws pumping low
+      float h = hit(f);
+      p.fx[0] = p.fx[1] = -6.f; p.fx[2] = p.fx[3] = 6.f; p.fy[(bi & 1) * 2] = -9.f * (1.f - h) * (f < 0.5f ? 1.f : 0.f);
+      p.y = 5.f + 3.f * h; p.sq = 1.f * h; p.head = 8.f * h; p.hy = 4.f * h;
+      p.au[0] = p.au[1] = 55.f + 20.f * h; p.as[0] = p.as[1] = 60.f - 30.f * h; p.claw[0] = p.claw[1] = 0.05f + 0.6f * (1.f - h);
+      break;
+    }
+    case M_MOSH: {                                                // chaotic jump, limbs everywhere
+      float air = sinf(3.14159f * f);
+      p.y = -12.f * air * e; for (int i = 0; i < 4; i++) p.fy[i] = p.y * (i & 1 ? 0.8f : 1.f) - 3.f * air * ((bi + i) & 1);
+      p.au[0] = 60.f + 70.f * air * ((bi & 1) ? 1.f : 0.3f); p.au[1] = 60.f + 70.f * air * ((bi & 1) ? 0.3f : 1.f);
+      p.as[0] = p.as[1] = 40.f + 40.f * air; p.head = 14.f * sgn * air; p.torso = 8.f * sgn * air; p.claw[0] = p.claw[1] = 0.8f * air;
+      p.mouth = 0.5f * air; p.strain = air;
+      break;
+    }
+    // ---- country ----
+    case M_HEELTOE: {                                             // heel, toe, heel, toe
+      int q = ((int)floorf(b * 2.f)) & 3; float u = sinf(3.14159f * fmodf(b * 2.f, 1.f));
+      int foot = (q < 2) ? 0 : 2; p.fx[foot] = (q & 1 ? 5.f : -5.f) * u; p.fy[foot] = -5.f * u;
+      p.au[0] = p.au[1] = 18.f; p.as[0] = p.as[1] = 95.f; p.claw[0] = p.claw[1] = 0.05f;      // claws hooked in the "belt"
+      p.head = 5.f * sgn; p.torso = 3.f * sgn; p.y = 2.f * dip(f);
+      break;
+    }
+    case M_GRAPEVINE: {                                           // side, behind, side, touch - travelling
+      float s = sinf(3.14159f * b * 0.5f); p.x = 14.f * s;
+      int q = ((int)floorf(b)) & 3; float u = sinf(3.14159f * f);
+      p.fx[q] = (q & 1 ? -7.f : 7.f) * u; p.fy[q] = -6.f * u;
+      p.au[0] = 25.f + 25.f * fmaxf(0.f, s); p.au[1] = 25.f + 25.f * fmaxf(0.f, -s); p.as[0] = p.as[1] = 35.f;
+      p.head = 7.f * s; p.torso = -4.f * s; p.claw[0] = p.claw[1] = 0.35f;
+      break;
+    }
+    case M_HOEDOWN: {                                             // arms swinging like a fiddle tune, hips going
+      float s = sinf(6.2831853f * b);
+      p.au[0] = 45.f + 45.f * s; p.au[1] = 45.f - 45.f * s; p.as[0] = 40.f - 20.f * s; p.as[1] = 40.f + 20.f * s;
+      p.torso = 4.f * s; p.abd = 14.f * s; p.x = 3.f * s; p.y = 3.f * dip(f); p.head = 6.f * s;
+      p.fy[(bi & 1) * 2] = -7.f * sinf(3.14159f * f); p.claw[0] = p.claw[1] = 0.45f;
+      break;
+    }
+    case M_SWAGGER: {                                             // thumbs-in-belt strut: slow, cocky side-to-side
+      float s = sinf(3.14159f * b);
+      p.x = 7.f * s; p.torso = -6.f * s; p.head = 8.f * s + 3.f; p.hx = 2.f * s;
+      p.au[0] = p.au[1] = 16.f; p.as[0] = p.as[1] = 100.f; p.claw[0] = p.claw[1] = 0.05f;
+      p.fy[s > 0 ? 0 : 2] = -4.f * fabsf(s); p.y = 2.f * dip(f);
+      break;
+    }
+    // ---- pop / EDM ----
+    case M_PUMP: {                                                // fist (claw) pump on every beat
+      float h = hit(f); int a = bi & 1;
+      p.au[a] = 130.f + 25.f * h; p.as[a] = 20.f; p.claw[a] = 0.05f;
+      p.au[1 - a] = 30.f; p.as[1 - a] = 50.f; p.claw[1 - a] = 0.3f;
+      p.y = 4.f * h; p.sq = 0.6f * h; p.head = -6.f * h; p.mouth = 0.4f * h; p.strain = 1.f;
+      break;
+    }
+    case M_JUMPUP: {                                              // jump on every beat, claws up
+      float air = sinf(3.14159f * f);
+      p.y = -10.f * air * (0.6f + 0.4f * e); for (int i = 0; i < 4; i++) p.fy[i] = p.y;
+      p.au[0] = p.au[1] = 120.f + 30.f * air; p.as[0] = p.as[1] = 10.f; p.claw[0] = p.claw[1] = 0.6f + 0.4f * air;
+      p.sq = 0.8f * hit(f) - 0.4f * air; p.strain = 1.f;
+      break;
+    }
+    case M_ARMWAVE: {                                             // the wave: rolls from one claw tip, across, to the other
+      float w = 6.2831853f * b * 0.5f;
+      p.as[0] = 40.f + 50.f * sinf(w); p.au[0] = 70.f + 30.f * sinf(w - 0.8f);
+      p.au[1] = 70.f + 30.f * sinf(w - 2.0f); p.as[1] = 40.f + 50.f * sinf(w - 2.8f);
+      p.head = 8.f * sinf(w - 1.4f); p.torso = 4.f * sinf(w - 1.4f); p.claw[0] = 0.4f + 0.4f * sinf(w + 0.8f); p.claw[1] = 0.4f + 0.4f * sinf(w - 3.6f);
+      break;
+    }
+    case M_SHUFFLE2: {                                            // Melbourne shuffle: running man + T-step at double time
+      float q = b * 2.f, qf = q - floorf(q); int qi = ((int)floorf(q)) & 3; float u = sinf(3.14159f * qf);
+      if (qi < 2) { p.fy[qi * 2] = -9.f * u; p.fx[qi * 2] = (qi ? 6.f : -6.f) * u; } else { p.fx[(qi - 2) * 2 + 1] = (qi & 1 ? 8.f : -8.f) * u; }
+      p.x = 6.f * sinf(3.14159f * b * 0.5f); p.y = 2.f * u;
+      p.au[0] = 45.f + 25.f * u; p.au[1] = 45.f + 25.f * (1.f - u); p.as[0] = p.as[1] = 70.f; p.claw[0] = p.claw[1] = 0.2f;
+      break;
+    }
+    case M_SWAYUP: {                                              // hands in the air, swaying
+      float s = sinf(3.14159f * b * 0.5f);
+      p.au[0] = p.au[1] = 150.f; p.as[0] = p.as[1] = -10.f + 15.f * s; p.claw[0] = p.claw[1] = 0.7f;
+      p.torso = 8.f * s; p.x = 8.f * s; p.head = 10.f * s; p.y = 2.f * dip(f); p.strain = 1.f;
+      break;
+    }
+    // ---- dubstep ----
+    case M_WOBBLE: {                                              // the whole body wobbles with the sub, half-time
+      float wob = sinf(6.2831853f * b * 2.f) * (0.5f + aud::bass);
+      p.x = 5.f * wob; p.torso = 7.f * wob; p.abd = -14.f * wob; p.head = -9.f * wob; p.y = 5.f + 2.f * fabsf(wob); p.sq = 0.5f;
+      p.au[0] = p.au[1] = 55.f; p.as[0] = p.as[1] = 90.f + 20.f * wob; p.claw[0] = p.claw[1] = 0.3f + 0.3f * wob;
+      p.fx[0] = p.fx[1] = -5.f; p.fx[2] = p.fx[3] = 5.f;
+      break;
+    }
+    case M_GLITCH: {                                              // stutter: snaps between micro-poses on 1/8ths, freezes on 1/16ths
+      int k = ((int)floorf(b * 4.f)) & 7; uint32_t hsh = (uint32_t)(k * 2654435761u + ((int)floorf(b)) * 97u);
+      p.au[0] = 30.f + (hsh % 110); p.au[1] = 30.f + ((hsh >> 8) % 110); p.as[0] = 20.f + ((hsh >> 16) % 100); p.as[1] = 20.f + ((hsh >> 4) % 100);
+      p.head = (float)((int)(hsh % 30) - 15); p.torso = (float)((int)((hsh >> 12) % 12) - 6);
+      p.claw[0] = (hsh & 1) ? 1.f : 0.f; p.claw[1] = (hsh & 2) ? 1.f : 0.f; p.strain = 1.f;
+      break;
+    }
+    case M_SLOWMO: {                                              // everything in slow motion (it takes 4 beats to do one thing)
+      float w = 6.2831853f * b * 0.25f;
+      p.au[0] = 60.f + 50.f * sinf(w); p.au[1] = 60.f + 50.f * sinf(w + 1.5f); p.as[0] = 60.f + 40.f * sinf(w + 0.7f); p.as[1] = 60.f + 40.f * sinf(w + 2.2f);
+      p.head = 10.f * sinf(w + 0.4f); p.torso = 6.f * sinf(w); p.x = 6.f * sinf(w); p.y = 2.f * sinf(w * 2.f); p.claw[0] = p.claw[1] = 0.5f + 0.4f * sinf(w);
+      break;
+    }
+    case M_LIQUID: {                                              // liquid arms: waves travelling through both arms, opposite phase
+      float w = 6.2831853f * b * 0.5f;
+      p.au[0] = 50.f + 35.f * sinf(w); p.as[0] = 60.f + 45.f * sinf(w - 1.2f); p.claw[0] = 0.4f + 0.5f * sinf(w - 2.4f);
+      p.au[1] = 50.f - 35.f * sinf(w); p.as[1] = 60.f - 45.f * sinf(w - 1.2f); p.claw[1] = 0.4f - 0.5f * sinf(w - 2.4f);
+      p.torso = 4.f * sinf(w - 0.6f); p.head = 7.f * sinf(w - 1.8f); p.abd = -8.f * sinf(w - 0.6f);
+      break;
+    }
+    // ---- soft / pure mantis ----
+    case M_TWIG: {                                                // a real mantis trick: rocking like a twig in the breeze
+      float s = sinf(6.2831853f * b * 0.25f) + 0.3f * sinf(6.2831853f * b * 0.61f);
+      p.x = 7.f * s; p.torso = 8.f * s; p.head = 4.f * s; p.abd = 6.f * s; p.y = -1.f;
+      p.au[0] = p.au[1] = 12.f + 3.f * s; p.as[0] = p.as[1] = 6.f; p.claw[0] = p.claw[1] = 0.05f;   // raptorial legs folded, poised
+      break;
+    }
+    case M_PRAY: {                                                // the praying pose, bowing gently on the beat
+      float d = dip(f);
+      p.au[0] = p.au[1] = 10.f + 4.f * d; p.as[0] = p.as[1] = 4.f; p.claw[0] = p.claw[1] = 0.05f;
+      p.hy = 3.f * (1.f - d); p.head = 3.f * sinf(3.14159f * b * 0.5f); p.y = 1.f * (1.f - d); p.torso = 2.f * sinf(3.14159f * b * 0.5f);
+      break;
+    }
+    case M_STALK: {                                               // stalking: slow, careful steps, head locked on something
+      float q = fmodf(b, 4.f) / 4.f; int step = ((int)floorf(b)) & 3; float u = sinf(3.14159f * fmodf(b, 1.f));
+      p.fy[step] = -5.f * u; p.fx[step] = 3.f * u; p.x = -10.f + 20.f * q;
+      p.au[0] = p.au[1] = 26.f; p.as[0] = p.as[1] = 18.f; p.claw[0] = p.claw[1] = 0.3f;              // poised, a little forward
+      p.head = -p.x * 0.6f; p.torso = 2.f; p.y = 3.f;
+      break;
+    }
+    // ---- flourish + freeze ----
+    case M_TRILL: {                                               // a ridiculously fast little shuffle (hi-hat trills)
+      float q = b * 8.f, qf = q - floorf(q); int qi = ((int)floorf(q)) & 3; float u = sinf(3.14159f * qf);
+      p.fy[qi] = -6.f * u; p.fx[qi] = (qi & 1 ? 4.f : -4.f) * u; p.x = 3.f * sinf(6.2831853f * b);
+      p.au[0] = p.au[1] = 35.f; p.as[0] = p.as[1] = 60.f; p.claw[0] = p.claw[1] = 0.3f; p.y = 1.5f * u; p.head = 2.f * sinf(6.2831853f * b * 4.f);
+      break;
+    }
+    case M_FREEZE: {                                              // held pose on a silence break
+      static const float FZ[5][7] = {                             // au0 au1 as0 as1 claw torso head
+        {150, 60, 20, 120, 1.f, 8, -10}, {90, 90, 0, 0, 0.f, 0, 0}, {140, 140, 40, 40, 1.f, 0, 12}, {12, 12, 5, 5, 0.05f, 0, 0}, {160, 20, -20, 30, 0.f, -10, 8}};
+      const float *z = FZ[s_freezeVar % 5];
+      p.au[0] = z[0]; p.au[1] = z[1]; p.as[0] = z[2]; p.as[1] = z[3]; p.claw[0] = p.claw[1] = z[4]; p.torso = z[5]; p.head = z[6];
+      p.y = 3.f; p.sq = 0.3f; p.strain = 1.f;
+      break;
+    }
+    // ---- new emotes ----
+    case M_E_HORNS:                                               // devil horns, both claws open overhead
+      p.au[0] = p.au[1] = 145.f; p.as[0] = p.as[1] = 10.f; p.claw[0] = p.claw[1] = 1.f; p.head = 10.f * sinf(12.f * b); p.hy = 3.f; p.mouth = 0.7f; p.strain = 1.f;
+      break;
+    case M_E_LASSO: {                                             // one claw twirls a lasso overhead
+      float w = 6.2831853f * b * 2.f;
+      p.au[1] = 150.f + 10.f * cosf(w); p.as[1] = 20.f + 40.f * sinf(w); p.claw[1] = 0.8f;
+      p.au[0] = 18.f; p.as[0] = 100.f; p.claw[0] = 0.05f; p.head = 6.f; p.mouth = 0.5f; p.x = 3.f * sinf(w * 0.5f); p.strain = 1.f;
+      break;
+    }
+    case M_E_OVERCLAP: {                                          // clap overhead, twice
+      float c = fmodf(b * 2.f, 1.f), cl = hit(c);
+      p.au[0] = p.au[1] = 150.f; p.as[0] = p.as[1] = 60.f - 30.f * (1.f - cl); p.claw[0] = p.claw[1] = 0.2f; p.y = 2.f * cl; p.mouth = 0.4f; p.strain = 1.f;
+      break;
+    }
+    case M_E_STRIKE: {                                            // lightning-fast mantis strike and snap back
+      float h = f < 0.15f ? f / 0.15f : fmaxf(0.f, 1.f - (f - 0.15f) * 2.f);
+      int a = bi & 1;
+      p.au[a] = 12.f + 78.f * h; p.as[a] = 5.f - 15.f * h; p.claw[a] = h > 0.8f ? 1.f : 0.f;
+      p.au[1 - a] = 12.f; p.as[1 - a] = 5.f; p.claw[1 - a] = 0.05f; p.head = (a ? 10.f : -10.f) * h; p.torso = (a ? 6.f : -6.f) * h;
+      break;
+    }
+    case M_E_GROOM: {                                             // grooming: a claw wipes across the big eyes
+      float w = sinf(6.2831853f * b * 2.f);
+      p.au[0] = 115.f + 10.f * w; p.as[0] = 125.f + 15.f * w; p.claw[0] = 0.3f;
+      p.au[1] = 30.f; p.as[1] = 70.f; p.claw[1] = 0.2f; p.head = -8.f + 6.f * w; p.hx = -2.f;
+      break;
+    }
+    case M_E_SWIVEL: {                                            // that iconic mantis head swivel: snap, hold, snap
+      int k = ((int)floorf(b * 3.f)) % 3; static const float SV[3] = {-24.f, 24.f, 0.f};
+      p.head = SV[k]; p.hx = SV[k] * 0.15f; p.au[0] = p.au[1] = 12.f; p.as[0] = p.as[1] = 5.f; p.claw[0] = p.claw[1] = 0.05f;
+      break;
+    }
+    case M_E_THREAT: {                                            // threat display: rears up, arms high and wide, claws open
+      float r2 = sinf(3.14159f * fminf(1.f, f * 2.f));
+      p.y = -4.f * r2; p.au[0] = p.au[1] = 120.f + 20.f * r2; p.as[0] = p.as[1] = 30.f; p.claw[0] = p.claw[1] = 1.f;
+      p.abd = 20.f * r2; p.head = 0; p.mouth = 0.8f * r2; p.strain = 1.f;
+      break;
+    }
+    case M_E_SHRUG:
+      p.au[0] = p.au[1] = 50.f; p.as[0] = p.as[1] = -10.f; p.claw[0] = p.claw[1] = 0.8f; p.hy = -3.f * sinf(3.14159f * f); p.head = 10.f; p.mouth = 0.2f;
+      break;
+    case M_E_DROP: {                                              // the drop hits: explode outward
+      float h = hit(f);
+      p.au[0] = p.au[1] = 100.f + 50.f * (1.f - h); p.as[0] = p.as[1] = 20.f; p.claw[0] = p.claw[1] = 1.f;
+      p.y = -8.f * (1.f - h); for (int i = 0; i < 4; i++) p.fy[i] = p.y; p.fx[0] = p.fx[1] = -8.f; p.fx[2] = p.fx[3] = 8.f;
+      p.mouth = 0.9f; p.sq = -0.5f; p.strain = 1.f;
+      break;
+    }
     case M_TALK:                                                  // chatting at the cave mouth
       p.head = sinf(t * 1.7f) * 5.f + s_look * 8.f; p.hy = -1.5f * s_mouthOpen;
       p.torso = sinf(t * 0.6f) * 2.f; p.abd = sinf(t * 1.1f) * 5.f;
@@ -399,6 +658,89 @@ static uint8_t chooseStyle(float e) {
   if (e < 0.3f) return (esp_random() % 3 == 0) ? ST_GROOVE : ST_SMOOTH;
   static const uint8_t mix[] = {ST_GROOVE, ST_POPLOCK, ST_SMOOTH, ST_GROOVE};
   return mix[esp_random() % 4];
+}
+// ---------------- V25: the feel model. Not a genre classifier - abstractions that moves can hang on ----------------
+enum Fam : uint8_t { F_GROOVE = 0, F_HIPHOP, F_METAL, F_COUNTRY, F_EDM, F_DUBSTEP, F_SOFT, F_COUNT };
+struct Feel {
+  float four = 0, back = 0, off = 0, hatRate = 0, dist = 0, wob = 0, eSlow = 0, eFast = 0, eBar = 0, ePrevBar = 0;
+  float dens = 0, sus = 0.5f, tonal = 0, beatMin = 9, beatMax = 0, drops = 0;
+  bool kickEarly = false, snareBeat = false, offHit = false; float bassPrev = 0, wobAcc = 0;
+};
+static Feel s_feel;
+static uint8_t s_fam = F_GROOVE, s_famCand = F_GROOVE; static int s_famVotes = 0;
+static float s_quietT = 0;
+static bool s_frozen = false; static float s_dropT = -9, s_build = 0, s_breakdown = 0, s_singAlong = 0, s_singCool = 0, s_vocalT = 0, s_trillT = -9;
+static inline float gauss(float x, float mu, float sd) { float z = (x - mu) / sd; return expf(-0.5f * z * z); }
+static void feelFrame(float dt, float b) {
+  Feel &F = s_feel;
+  float fr = b - floorf(b);
+  if (aud::kick > 0 && (fr < 0.22f || fr > 0.85f)) F.kickEarly = true;
+  if (aud::snare > 0.2f) F.snareBeat = true;
+  if (aud::onset > 0.2f && fr > 0.35f && fr < 0.65f) F.offHit = true;
+  F.hatRate += ((aud::hat > 0 ? 1.f / fmaxf(dt, 0.01f) : 0.f) - F.hatRate) * clampf(dt * 1.2f, 0.f, 1.f);
+  F.dist += (clampf((aud::flat - 0.35f) * 2.2f, 0.f, 1.f) * clampf(aud::level * 2.f, 0.f, 1.f) - F.dist) * clampf(dt * 0.3f, 0.f, 1.f);
+  float db = fabsf(aud::bass - F.bassPrev) / fmaxf(dt, 0.01f); F.bassPrev = aud::bass;   // sub wobble: bass that keeps moving
+  F.wob += (clampf(db * 0.25f, 0.f, 1.f) * clampf(aud::bass * 2.f, 0.f, 1.f) - F.wob) * clampf(dt * 0.4f, 0.f, 1.f);
+  F.eSlow += (aud::level - F.eSlow) * clampf(dt * 0.25f, 0.f, 1.f);
+  F.eFast += (aud::level - F.eFast) * clampf(dt * 5.f, 0.f, 1.f);
+  F.eBar = fmaxf(F.eBar, F.eFast);
+  F.dens += ((aud::onset > 0 ? 1.f / fmaxf(dt, 0.01f) : 0.f) - F.dens) * clampf(dt * 0.5f, 0.f, 1.f);   // hits per second
+  F.tonal += ((1.f - aud::flat) - F.tonal) * clampf(dt * 0.3f, 0.f, 1.f);
+  F.beatMin = fminf(F.beatMin, aud::level); F.beatMax = fmaxf(F.beatMax, aud::level);
+}
+static void feelBeat(int bi) {                                  // once per beat
+  Feel &F = s_feel;
+  F.four += ((F.kickEarly ? 1.f : 0.f) - F.four) * 0.12f;
+  F.drops *= 0.995f;
+  bool twoFour = (bi & 1) == 1;
+  if (F.snareBeat) F.back += ((twoFour ? 1.f : -0.6f) - F.back) * 0.12f; else F.back *= 0.97f;
+  F.off += ((F.offHit ? 1.f : 0.f) - F.off) * 0.1f;
+  F.kickEarly = F.snareBeat = F.offHit = false;
+  if (F.beatMax > 0.05f) F.sus += (F.beatMin / F.beatMax - F.sus) * 0.1f;     // sustain: how full it stays between hits
+  F.beatMin = 9; F.beatMax = 0;
+  if ((bi & 3) == 0) { s_build = clampf(s_build + (F.eBar > F.ePrevBar * 1.08f && F.eBar > 0.25f ? 0.25f : -0.35f), 0.f, 1.f); F.ePrevBar = F.eBar; F.eBar = 0; }
+}
+static uint8_t scoreFamily() {
+  // Abstractions that generalise: hit density, sustain (wall of sound vs punchy), tonality, loudness,
+  // kick-on-every-beat, backbeat, syncopation, brightness. No single cue decides; each family is a blend.
+  Feel &F = s_feel;
+  float loud = clampf(F.eSlow * 1.6f, 0.f, 1.f), dense = clampf((F.dens - 2.f) / 4.f, 0.f, 1.f), sparse = 1.f - clampf((F.dens - 1.f) / 3.f, 0.f, 1.f);
+  float wall = clampf((F.sus - 0.25f) / 0.45f, 0.f, 1.f), punchy = 1.f - wall, tonal = clampf((F.tonal - 0.3f) / 0.4f, 0.f, 1.f);
+  float dark = clampf((0.3f - aud::centroid) / 0.2f, 0.f, 1.f), back = clampf(F.back * 2.f, 0.f, 1.f);
+  float sc[F_COUNT];
+  sc[F_GROOVE] = 0.3f;
+  sc[F_METAL] = wall * loud * (1.f - tonal) * (0.6f + 0.4f * dense) * (1.f - 0.6f * dark) * 1.6f;
+  sc[F_DUBSTEP] = wall * loud * (0.5f + 0.5f * sparse) * (0.3f + 0.7f * dark) * (1.f - tonal) * 1.3f + 0.2f * F.wob + 0.8f * F.drops * (0.3f + 0.7f * dark);
+  sc[F_EDM] = F.four * (0.4f + 0.6f * punchy) * (1.f - dense * 0.5f) * (1.f - tonal * 0.5f) * 1.1f;
+  sc[F_HIPHOP] = punchy * (1.f - F.four) * (0.4f + back) * (1.f - tonal * 0.6f) * (0.5f + 0.5f * loud) * 1.2f;
+  sc[F_COUNTRY] = tonal * (0.3f + back + 0.4f * F.off) * (1.f - dense) * (1.f - dark * 0.5f) * 1.1f;
+  sc[F_SOFT] = clampf(0.45f - F.eSlow, 0.f, 0.3f) * 3.2f * (0.5f + 0.5f * tonal);
+  int best = 0; for (int k = 1; k < F_COUNT; k++) if (sc[k] > sc[best]) best = k;
+  return (uint8_t)best;
+}
+static const uint8_t FAM_MOVES[F_COUNT][10] = {
+  {M_BOB, M_SWAY, M_SHUFFLE, M_NOD, M_TWOSTEP, M_ARMWAVE, M_WAVE_L, M_WAVE_R, M_BODYWAVE, M_POP},
+  {M_NOD, M_TWOSTEP, M_CABBAGE, M_TUT, M_SHLEAN, M_TOPROCK, M_POP, M_ROBOT, M_RUNMAN, M_NOD},
+  {M_BANG, M_WINDMILL, M_STOMP, M_MOSH, M_HYPE, M_BANG, M_STOMP, M_WINDMILL, M_MOSH, M_CHEER},
+  {M_HEELTOE, M_GRAPEVINE, M_HOEDOWN, M_SWAGGER, M_SHUFFLE, M_TSTEP, M_HEELTOE, M_HOEDOWN, M_SWAY, M_BOB},
+  {M_PUMP, M_JUMPUP, M_ARMWAVE, M_SHUFFLE2, M_SWAYUP, M_HYPE, M_CHEER, M_RUNMAN, M_TSTEP, M_PUMP},
+  {M_WOBBLE, M_GLITCH, M_SLOWMO, M_LIQUID, M_POP, M_ROBOT, M_BODYWAVE, M_WOBBLE, M_GLITCH, M_TUT},
+  {M_TWIG, M_PRAY, M_SWAY, M_BODYWAVE, M_MOON, M_STALK, M_SPREAD, M_TWIG, M_LIQUID, M_SLOWMO},
+};
+static const uint8_t FAM_EMOTES[F_COUNT][6] = {
+  {M_E_CLAP, M_E_SNAP, M_E_POINT, M_E_PEACE, M_E_SWIVEL, M_E_GROOM},
+  {M_E_POINT, M_E_FLEX, M_E_SNAP, M_E_SHRUG, M_E_SWIVEL, M_E_STRIKE},
+  {M_E_HORNS, M_E_GUITAR, M_E_THREAT, M_E_STRIKE, M_E_HORNS, M_E_FLEX},
+  {M_E_LASSO, M_E_CLAP, M_E_OVERCLAP, M_E_SHRUG, M_E_LASSO, M_E_POINT},
+  {M_E_OVERCLAP, M_E_PEACE, M_E_POINT, M_E_CLAP, M_E_DROP, M_E_SNAP},
+  {M_E_DROP, M_E_STRIKE, M_E_SWIVEL, M_E_THREAT, M_E_SNAP, M_E_GROOM},
+  {M_E_BOW, M_E_GROOM, M_E_SWIVEL, M_E_BOW, M_E_GROOM, M_E_SWIVEL},
+};
+static int famMove(uint8_t fam) {
+  // syncopated grooves lean toward isolations; build-ups toward the hype end of the list
+  if (s_feel.off > 0.55f && (esp_random() % 3) == 0) { static const uint8_t ISO[] = {M_TUT, M_GLITCH, M_POP, M_ROBOT}; int mv = ISO[esp_random() % 4]; if (mv != s_move) return mv; }
+  for (int k = 0; k < 8; k++) { int mv = FAM_MOVES[fam][esp_random() % 10]; if (mv != s_move) return mv; }
+  return FAM_MOVES[fam][0];
 }
 static int pickMove(float e) {
   static const uint8_t low[] = {M_BOB, M_SWAY, M_BOB, M_SHUFFLE};
@@ -629,44 +971,101 @@ void mantisDraw(bool sing) {
     float lv = clampf(aud::level * 1.8f, 0.f, 1.f);
     s_sustain += ((lv > 0.35f ? 1.f : 0.f) - s_sustain) * clampf(dt * (lv > 0.35f ? 0.9f : 2.5f), 0.f, 1.f);
     if (s_move != M_SING) setMove(M_SING);
+  } else if (s_frozen || s_quietT > 0.18f) {
+    // silence break: freeze in a pose (even though the groove has stopped)... explode when it comes back
+    Feel &F = s_feel;
+    F.eFast += (aud::level - F.eFast) * clampf(dt * 5.f, 0.f, 1.f);
+    static float frozeAt = 0;
+    if (!s_frozen) { s_frozen = true; s_freezeVar = esp_random() % 5; setMove(M_FREEZE); frozeAt = s_t; }
+    if (s_t - frozeAt > 1.2f) F.eSlow += (aud::level - F.eSlow) * clampf(dt * 0.8f, 0.f, 1.f);   // a quieter song: re-normalise
+    if (F.eFast > F.eSlow * 0.55f) {
+      bool realDrop = s_t - frozeAt < 3.f && F.eFast > 0.3f;                         // it came back loud, fast: a drop
+      s_frozen = false; s_quietT = 0;
+      if (realDrop) {
+        s_dropT = s_t; F.drops += (1.f - F.drops) * 0.3f;
+        s_emote = M_E_DROP; s_emoteUntilBeat = (int)floorf(b) + 1; setMove(M_E_DROP); hapGesture(HG_CRACK);
+      } else setMove(famMove(s_fam));
+    }
+    if (s_t - s_dropT > 12.f && F.eSlow < 0.12f) s_frozen = false;                  // the song really ended
   } else if (grooving) {
-    // bright fast transients repeating -> footwork takes over
+    feelFrame(dt, b);
+    // hi-hat trills -> the ridiculously fast shuffle flourish
+    static float hatT[10] = {-9, -9, -9, -9, -9, -9, -9, -9, -9, -9}; static int hatI = 0;
+    if (aud::hat > 0.15f) { hatT[hatI] = s_t; hatI = (hatI + 1) % 10; }
+    int hats = 0; for (float ht : hatT) if (s_t - ht < 0.6f) hats++;
+    // bright fast transients repeating -> footwork (as before)
     static float lastOn = -9;
     if (aud::onset > 0.15f && (aud::treble > 0.2f || aud::zcr > 0.3f) && s_t - lastOn > 0.06f) { lastOn = s_t; s_onsetT[s_onsetI] = s_t; s_onsetI = (s_onsetI + 1) % 12; }
     int recent = 0; for (float ot : s_onsetT) if (s_t - ot < 1.f) recent++;
     if (recent >= 4) s_footUntil = s_t + 2.6f;
-    // accents: count strong beats; after three, the fourth gets an emote
+    Feel &F = s_feel;
+    // breakdown: quieter than the song has been, but not silent -> half-time, liquid
+    s_breakdown += ((F.eSlow > 0.3f && F.eFast < F.eSlow * 0.6f && F.eFast > F.eSlow * 0.22f ? 1.f : 0.f) - s_breakdown) * clampf(dt * 0.8f, 0.f, 1.f);
+    // a clear vocal line -> sometimes it sings along
+    s_vocalT = aud::vocal > 0.45f ? s_vocalT + dt : 0.f;
+    s_singCool -= dt;
+    if (s_vocalT > 1.2f && s_singCool <= 0 && s_singAlong <= 0 && (esp_random() % 3) == 0) { s_singAlong = 6.f; s_singCool = 16.f; }
+    s_singAlong -= dt;
     s_beatAcc = fmaxf(s_beatAcc, aud::onset);
     int bi = (int)floorf(b);
-    if (bi != s_lastBeatI) {
+    if (bi != s_lastBeatI && !s_frozen) {
+      feelBeat(bi);
       s_strong = s_beatAcc > 0.45f ? s_strong + 1 : 0;
       s_beatAcc = 0; s_lastBeatI = bi;
       int bar = bi / 4, inPhrase = bi % 8;
       bool foot = s_t < s_footUntil;
-      if (foot && s_style != ST_FOOTWORK) { s_style = ST_FOOTWORK; setMove(styleMove(s_style)); }
-      else if (!foot && s_style == ST_FOOTWORK) { s_style = chooseStyle(e); setMove(styleMove(s_style)); }
-      if (s_emote >= 0 && bi >= s_emoteUntilBeat) { s_emote = -1; setMove(styleMove(s_style)); }
+      if (s_emote >= 0 && bi >= s_emoteUntilBeat) { s_emote = -1; setMove(famMove(s_fam)); }
       if (s_emoteCool > 0) s_emoteCool--;
-      if (s_strong >= 3 && (bi & 3) == 3 && s_emoteCool == 0 && s_emote < 0 && !foot && (esp_random() % 10) < 4) {   // 3 strong beats -> the bar's 4th lands an emote
-        static const uint8_t E[] = {M_E_CLAP, M_E_SNAP, M_E_POINT, M_E_FLEX, M_E_GUITAR, M_E_PEACE};
-        int em; do { em = E[esp_random() % 6]; } while (em == s_lastEmote);
+      if (s_emote < 0 && hats >= 5 && s_t - s_trillT > 3.f) {                       // the trill flourish (one beat)
+        s_trillT = s_t; s_emote = M_TRILL; s_emoteUntilBeat = bi + 1; setMove(M_TRILL);
+      } else if (s_strong >= 3 && (bi & 3) == 3 && s_emoteCool == 0 && s_emote < 0 && !foot && (esp_random() % 10) < 4) {
+        int em; int tries = 0;                                                         // 3 strong beats -> the bar's 4th lands an emote
+        do { em = FAM_EMOTES[s_fam][esp_random() % 6]; } while (em == s_lastEmote && ++tries < 6);
         s_emote = s_lastEmote = em; s_emoteUntilBeat = bi + 1; setMove(em); s_strong = 0; s_emoteCool = 8;
       } else if (s_emote < 0) {
-        if (inPhrase == 0 && !foot) { s_style = chooseStyle(e); setMove(styleMove(s_style)); }   // new phrase, maybe a new style
-        else if (inPhrase == 7 && !foot && (esp_random() % 5) == 0) { s_emote = M_E_BOW; s_emoteUntilBeat = bi + 1; setMove(M_E_BOW); }
-        else if (bar != s_lastBar || s_move == M_IDLE || s_move == M_SING || s_move >= M_TALK && s_move <= M_LISTEN) { s_lastBar = bar; setMove(styleMove(s_style)); }
+        if (inPhrase == 0) {                                                         // phrase boundary: re-read the music
+          uint8_t cand = scoreFamily();
+          if (cand == s_famCand) s_famVotes++; else { s_famCand = cand; s_famVotes = 1; }
+          if (s_famVotes >= 2 && cand != s_fam) s_fam = cand;                        // two phrases of agreement to switch
+        }
+        if (foot && s_fam != F_SOFT) { int fm[] = {M_RUNMAN, M_TSTEP, M_SHUFFLE2}; if (bar != s_lastBar || s_move < M_RUNMAN) { s_lastBar = bar; setMove(fm[esp_random() % 3]); } }
+        else if (inPhrase == 0 || bar != s_lastBar || s_move == M_IDLE || s_move == M_SING || s_move == M_FREEZE || (s_move >= M_TALK && s_move <= M_LISTEN)) {
+          s_lastBar = bar;
+          if (s_breakdown > 0.6f) { int bd[] = {M_SLOWMO, M_LIQUID, M_TWIG, M_BODYWAVE}; setMove(bd[esp_random() % 4]); }
+          else setMove(famMove(s_fam));
+          if (inPhrase == 7 && (esp_random() % 6) == 0 && s_emoteCool == 0) {        // sometimes a mantis moment closes a phrase
+            static const uint8_t MM[] = {M_E_BOW, M_E_SWIVEL, M_E_GROOM, M_E_STRIKE}; int em = MM[esp_random() % 4];
+            s_emote = em; s_emoteUntilBeat = bi + 1; setMove(em); s_emoteCool = 6;
+          }
+        }
       }
     }
-  } else {
+    } else {
+    feelFrame(dt, b);
+    static float reread = 0; reread += dt;
+    if (reread > 3.f) { reread = 0; uint8_t c = scoreFamily(); if (c == s_famCand) s_famVotes++; else { s_famCand = c; s_famVotes = 1; } if (s_famVotes >= 2) s_fam = c; }
     s_idleWaveT -= dt;
     if (s_idleWaveT < 0 && s_move == M_IDLE) { setMove((esp_random() & 1) ? M_WAVE_L : M_WAVE_R); s_idleWaveT = 2.5f; }
     else if (s_idleWaveT < 0) { setMove(M_IDLE); s_idleWaveT = 7.f + (esp_random() % 6); }
     else if (s_move != M_IDLE && s_move != M_WAVE_L && s_move != M_WAVE_R) setMove(M_IDLE);
   }
 
+  // the move clock: half-time for dubstep / soft / breakdowns (continuous, so switching never jumps)
+  static float s_mb = 0, s_lastB = 0;
+  float dB = b - s_lastB; if (dB < 0 || dB > 1.f) dB = 0; s_lastB = b;
+  float speedK = (s_fam == F_DUBSTEP || s_fam == F_SOFT || s_breakdown > 0.6f) ? 0.5f : 1.f;
+  s_mb += dB * speedK;
+  auto beatFor = [&](int mv) { return (mv >= M_E_CLAP && mv <= M_E_BOW) || mv >= M_TRILL ? b : s_mb; };
+  { // a real silence break: the song had been going, and it's nearly silent for a quarter second (not just a gap between notes)
+    Feel &F = s_feel;
+    if (!sing && !s_cave && F.eSlow > 0.28f && aud::level < F.eSlow * 0.2f) s_quietT += dt; else s_quietT = 0.f;
+#ifdef FREEZE_LOG
+    static float mn = 9; mn = fminf(mn, aud::level / fmaxf(F.eSlow, 0.01f)); static int fc = 0; if (++fc % 150 == 0) { printf("  [level/eSlow min %.2f eSlow %.2f quietT %.2f]\n", mn, F.eSlow, s_quietT); mn = 9; }
+#endif
+  }
   Pose pa, pb, p;
-  evalMove(s_prevMove, b, e, pa);
-  evalMove(s_move, b, e, pb);
+  evalMove(s_prevMove, beatFor(s_prevMove), e, pa);
+  evalMove(s_move, beatFor(s_move), e, pb);
   s_blend = fminf(1.f, s_blend + dt * 3.2f);
   float k = s_blend * s_blend * (3.f - 2.f * s_blend);
   lerpPose(p, pa, pb, k);
@@ -675,7 +1074,8 @@ void mantisDraw(bool sing) {
     if (g_dbgMove >= 0) evalMove(g_dbgMove, g_dbgBeat, 1.f, p);
     if (g_dbgClaw >= 0) p.claw[0] = p.claw[1] = g_dbgClaw; }
 #endif
-  p.y += 3.f * s_acc; p.sq += 0.7f * s_acc; p.hy += 1.5f * s_acc;
+  p.y += 3.f * s_acc + 4.f * s_build; p.sq += 0.7f * s_acc + 0.3f * s_build; p.hy += 1.5f * s_acc;
+  if (s_singAlong > 0 && !sing && !s_cave) { p.head *= 0.6f; p.hy -= 2.f; }
   if (s_happy > 0) { s_happy -= dt; p.y -= 4.f * sinf(s_t * 18.f) * fminf(1.f, s_happy); p.mouth = fmaxf(p.mouth, 0.35f); }
   if (g_shakeKick) s_dizzy = 1.4f;
   if (s_dizzy > 0) { s_dizzy -= dt; p.head += sinf(s_t * 11.f) * 14.f * s_dizzy; p.torso += sinf(s_t * 7.f) * 5.f * s_dizzy; }
@@ -688,6 +1088,10 @@ void mantisDraw(bool sing) {
 
   // mouth
   float mTarget = p.mouth;
+  if (!sing && !s_cave && s_singAlong > 0) {                      // singing along with the vocal line it hears
+    mTarget = fmaxf(mTarget, powf(aud::vocalEnv, 0.8f) * clampf(aud::vocal * 2.f, 0.f, 1.f));
+    s_mouthWide += (clampf(aud::zcr * 1.4f, 0.f, 1.f) - s_mouthWide) * clampf(dt * 12.f, 0.f, 1.f);
+  }
   if (sing || s_cave) {
     float wide = 0, env = aud::mouthNow(&wide);                  // 4 ms speech envelope: closes between syllables
     mTarget = fmaxf(s_cave ? 0.f : mTarget * 0.3f, powf(env, 0.8f));
@@ -797,9 +1201,20 @@ void mantisDraw(bool sing) {
       scf.x = eX; scf.y = eY;
       scf.a = atan2f(gY - eY, gX - eX) / DEG - boneAngle(SC, RIG_SCYTHE_TIP_X, RIG_SCYTHE_TIP_Y, false);
     }
+    // The spines run along one edge of the femur sprite. Rotating an arm up past ~90 deg would turn that edge
+    // to the sky - upside down for a mantis. Flip the scythe across its length instead, so the spines keep facing
+    // down/inward; only a straining overhead hype pose may show them upward. (Hysteresis: no flicker.)
+    static bool flipped[2] = {false, false};
+    float ny = cosf(scf.a * DEG);                                  // y of the spine-edge normal in the screen
+    bool allowUp = p.strain > 0.5f || (sing && !s_cave && a == 0) || (s_cave && (s_move == M_LEAN || s_move == M_LISTEN));
+    if (allowUp) flipped[a] = false;
+    else if (!flipped[a] && ny < -0.45f) flipped[a] = true;             // only when the spines point strongly skyward
+    else if (flipped[a] && ny > -0.1f) flipped[a] = false;
+    float fz = flipped[a] ? -1.f : 1.f;
+    scf.zy = fz;
     Bone &CL = s_b[r ? B_CLAW_R : B_CLAW_L];
     float hX, hY; fk(scf, SC, RIG_SCYTHE_HINGE_X, RIG_SCYTHE_HINGE_Y, hX, hY, r);
-    Xf clf{hX, hY, scf.a + sgn * (0.4f - clampf(p.claw[a], 0.f, 1.f)) * 112.f, 1.f, 1.f};   // + closes toward the femur
+    Xf clf{hX, hY, scf.a + fz * sgn * (0.4f - clampf(p.claw[a], 0.f, 1.f)) * 112.f, 1.f, fz};   // closes toward the spines
     blit(AR, uf);
     blit(CL, clf);
     blit(SC, scf);
@@ -844,3 +1259,12 @@ void mantisDraw(bool sing) {
     else canvas.fillCircle((int)q.x, (int)q.y, 1 + (int)(q.life * 2.f), c);
   }
 }
+#ifdef HOST
+int mantisFam() { return s_fam; }
+int mantisMove() { return s_move; }
+bool mantisSinging() { return s_singAlong > 0; }
+bool mantisFrozen() { return s_frozen; }
+#endif
+#ifdef HOST
+void mantisFeelDump(char *o) { Feel &F = s_feel; snprintf(o, 200, "four=%.2f back=%+.2f off=%.2f dens=%.1f sus=%.2f tonal=%.2f eS=%.2f cen=%.2f wob=%.2f", F.four, F.back, F.off, F.dens, F.sus, F.tonal, F.eSlow, aud::centroid, F.wob); }
+#endif
