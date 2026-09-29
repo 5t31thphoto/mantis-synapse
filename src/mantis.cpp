@@ -739,6 +739,11 @@ static const uint8_t FAM_EMOTES[F_COUNT][6] = {
 static int famMove(uint8_t fam) {
   // syncopated grooves lean toward isolations; build-ups toward the hype end of the list
   if (s_feel.off > 0.55f && (esp_random() % 3) == 0) { static const uint8_t ISO[] = {M_TUT, M_GLITCH, M_POP, M_ROBOT}; int mv = ISO[esp_random() % 4]; if (mv != s_move) return mv; }
+  if ((esp_random() % 100) < 55) {                                // the spine: groove steps (the body layers make them dance)
+    static const uint8_t CORE[F_COUNT][4] = {{M_BOB, M_SWAY, M_NOD, M_TWOSTEP}, {M_NOD, M_TWOSTEP, M_SHLEAN, M_BOB}, {M_BANG, M_STOMP, M_NOD, M_BANG},
+      {M_SWAGGER, M_HEELTOE, M_SWAY, M_TWOSTEP}, {M_BOB, M_TWOSTEP, M_SWAY, M_NOD}, {M_BODYWAVE, M_NOD, M_SWAY, M_WOBBLE}, {M_SWAY, M_TWIG, M_BODYWAVE, M_PRAY}};
+    for (int k = 0; k < 6; k++) { int mv = CORE[fam][esp_random() % 4]; if (mv != s_move) return mv; }
+  }
   for (int k = 0; k < 8; k++) { int mv = FAM_MOVES[fam][esp_random() % 10]; if (mv != s_move) return mv; }
   return FAM_MOVES[fam][0];
 }
@@ -960,7 +965,9 @@ void mantisDraw(bool sing) {
   float e = clampf(aud::level * 1.5f + aud::beatConf * 0.25f, 0.f, 1.f);
   if (aud::onset > 0.f) s_acc = fmaxf(s_acc, aud::onset);
   s_acc *= expf(-dt * 7.f);
-  bool grooving = aud::beatConf > 0.3f || aud::level > 0.22f;
+  static float s_songOn = 0;                                      // a song has been going: keep dancing through its gaps
+  if (aud::beatConf > 0.3f || aud::level > 0.22f) s_songOn = 3.f; else s_songOn -= dt;
+  bool grooving = s_songOn > 0.f;
   float b = grooving ? aud::beatPos : (s_idleBeat += dt * 0.8f);
 
   if (s_cave) {
@@ -971,12 +978,17 @@ void mantisDraw(bool sing) {
     float lv = clampf(aud::level * 1.8f, 0.f, 1.f);
     s_sustain += ((lv > 0.35f ? 1.f : 0.f) - s_sustain) * clampf(dt * (lv > 0.35f ? 0.9f : 2.5f), 0.f, 1.f);
     if (s_move != M_SING) setMove(M_SING);
-  } else if (s_frozen || s_quietT > 0.18f) {
+  } else if (s_frozen || (s_quietT > 0.18f && s_emote < 0)) {
     // silence break: freeze in a pose (even though the groove has stopped)... explode when it comes back
     Feel &F = s_feel;
     F.eFast += (aud::level - F.eFast) * clampf(dt * 5.f, 0.f, 1.f);
     static float frozeAt = 0;
-    if (!s_frozen) { s_frozen = true; s_freezeVar = esp_random() % 5; setMove(M_FREEZE); frozeAt = s_t; }
+    if (!s_frozen) { s_frozen = true; static const int FV[4] = {0, 1, 2, 4}; s_freezeVar = FV[esp_random() % 4]; setMove(M_FREEZE); frozeAt = s_t; }
+    if (s_t - frozeAt > 0.8f * 60.f / fmaxf(aud::bpm(), 60.f)) {                // hold under a beat... then hit an emote into the gap
+      s_frozen = false; s_quietT = -1.5f;
+      int em = FAM_EMOTES[s_fam][esp_random() % 6];
+      s_emote = s_lastEmote = em; s_emoteUntilBeat = (int)floorf(b) + 2; setMove(em); s_emoteCool = 4;
+    }
     if (s_t - frozeAt > 1.2f) F.eSlow += (aud::level - F.eSlow) * clampf(dt * 0.8f, 0.f, 1.f);   // a quieter song: re-normalise
     if (F.eFast > F.eSlow * 0.55f) {
       bool realDrop = s_t - frozeAt < 3.f && F.eFast > 0.3f;                         // it came back loud, fast: a drop
@@ -1076,6 +1088,36 @@ void mantisDraw(bool sing) {
 #endif
   p.y += 3.f * s_acc + 4.f * s_build; p.sq += 0.7f * s_acc + 0.3f * s_build; p.hy += 1.5f * s_acc;
   if (s_singAlong > 0 && !sing && !s_cave) { p.head *= 0.6f; p.hy -= 2.f; }
+  if (!sing && !s_cave && grooving && s_move != M_FREEZE) {
+    // Body layers run all the time, concurrently, under whatever the move is doing:
+    //   hips + head follow the bass/kick,  legs follow the hats/shakers,  arms rise when a lead line soars.
+    static float kickEnv = 0, hatAct = 0, soar = 0;
+    kickEnv = fmaxf(kickEnv * expf(-dt * 9.f), aud::kick);
+    hatAct += ((aud::hat > 0.1f ? 1.f / fmaxf(dt, 0.01f) : 0.f) + aud::treble * 4.f - hatAct) * clampf(dt * 1.5f, 0.f, 1.f);
+    float soarIn = clampf((aud::centroid - 0.28f) * 3.f, 0.f, 1.f) * clampf(s_feel.tonal * 1.6f - 0.4f, 0.f, 1.f) * clampf(aud::level * 2.f, 0.f, 1.f) * (aud::onset < 0.25f ? 1.f : 0.6f);
+    soar += (soarIn - soar) * clampf(dt * (soarIn > soar ? 0.8f : 0.4f), 0.f, 1.f);        // slow: a line has to sustain
+    bool emote = s_move >= M_E_CLAP && s_move <= M_E_BOW || s_move >= M_E_HORNS;
+    float legBusy = 0; for (int i = 0; i < 4; i++) legBusy += fabsf(pb.fx[i]) + fabsf(pb.fy[i]);
+    float hipW = (s_move == M_WINDMILL || s_move == M_MOSH || s_move == M_BODYWAVE) ? 0.4f : 1.f;
+    float legW = legBusy > 3.f ? 0.25f : 1.f, armW = emote ? 0.25f : 1.f;
+    float bf = b - floorf(b); int bi = (int)floorf(b); float side = (bi & 1) ? 1.f : -1.f;
+    // hips: she sways side to side on the beat, pops on the kick; the head rides it
+    float hipAmt = clampf(0.3f + aud::bass * 1.3f, 0.f, 1.f) * hipW, hs = sinf(3.14159f * bf);
+    p.abd += side * (13.f * hs + 7.f * kickEnv) * hipAmt;
+    p.x += side * 4.f * hs * hipAmt; p.torso -= side * 3.f * hs * hipAmt;
+    p.hy += 2.5f * kickEnv * hipW; p.head += side * 3.f * hs * hipAmt;
+    // legs: always stepping on the beat; hats push it to 8ths, then 16ths
+    float rate = hatAct > 9.f ? 4.f : (hatAct > 4.f ? 2.f : 1.f);
+    float q = b * rate, qf = q - floorf(q); int qi = (int)floorf(q);
+    float lift = sinf(3.14159f * qf) * clampf(0.45f + hatAct * 0.06f, 0.f, 1.f) * legW;
+    int f0 = (qi & 1) ? 2 : 0, f1 = f0 + (rate >= 2.f ? 1 : 0);
+    p.fy[f0] -= 7.f * lift; p.fx[f0] += (f0 ? 3.f : -3.f) * lift;
+    if (f1 != f0) { p.fy[f1] -= 4.f * lift; p.fx[f1] += (f0 ? 2.f : -2.f) * lift; }
+    p.y += 1.2f * lift;
+    // arms: a soaring lead lifts them and opens the claws
+    for (int a = 0; a < 2; a++) { p.au[a] += soar * 45.f * armW; p.claw[a] = fminf(1.f, p.claw[a] + soar * 0.4f * armW); }
+    if (soar > 0.5f) p.strain = fmaxf(p.strain, soar);
+  }
   if (s_happy > 0) { s_happy -= dt; p.y -= 4.f * sinf(s_t * 18.f) * fminf(1.f, s_happy); p.mouth = fmaxf(p.mouth, 0.35f); }
   if (g_shakeKick) s_dizzy = 1.4f;
   if (s_dizzy > 0) { s_dizzy -= dt; p.head += sinf(s_t * 11.f) * 14.f * s_dizzy; p.torso += sinf(s_t * 7.f) * 5.f * s_dizzy; }

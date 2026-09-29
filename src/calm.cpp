@@ -695,7 +695,7 @@ static void riders(float dt, bool night) {
     if (heavy && fabsf(r.vx) > thr) r.vx *= 1.f - dt * 0.6f;                       // momentum: it only slowly bleeds off extra speed
     if (!r.air) {
       float launch = -sl * r.vx * 0.9f + s_v[lx] * 2.2f;                        // riding up a steep face at speed = air
-      if (launch > (heavy ? 62.f : 28.f)) {
+      if (launch > (heavy ? 52.f : 28.f)) {
 #ifdef RIDER_LOG
         printf("%s launch %.0f\n", heavy ? "speedboat" : "jetski", launch);
 #endif
@@ -706,12 +706,34 @@ static void riders(float dt, bool night) {
     if (r.air) {
       r.vy += 520.f * dt; r.y += r.vy * dt; r.ang += r.spin * dt;
       if (r.y >= sy && r.vy > 0) {
+        if (heavy && r.vy > 38.f && s_v[lx] < -10.f) {                          // came down hard onto a rising wave: the hull gives way
+#ifdef RIDER_LOG
+          printf("SPLINTER: hard landing %.0f\n", r.vy);
+#endif
+          r.crashT = 2.6f; hapGesture(HG_CRACK); spray(r.x, sy, 20, 200);
+          for (auto &d : s_deb) d = {r.x, sy - 6, (frand() - 0.5f) * 280.f, -80.f - frand() * 200.f, frand() * 6.f, true};
+          miniMantisFly = 1.f; r.vx = 0; r.air = false; return;
+        }
         r.air = false; r.spin = 0; r.ang = atan2f(-sl, 2.f); spray(r.x, sy, heavy ? 12 : 8, 120);
         s_v[lx] += r.vy * 0.05f; hap((uint8_t)clampf(80.f + r.vy * 0.3f, 0.f, 230.f), 30);
       }
     }
     r.x += r.vx * dt;
-    if (r.x < 16 || r.x > W - 16) {                                              // the wall
+    if (heavy && !r.air && sl * r.vx < 0.f && fabsf(s_v[lx]) * fabsf(sl) > 7.5f) {  // a steep, fast wave smashes into it head-on
+#ifdef RIDER_LOG
+      printf("SPLINTER: wave smash v=%.0f slope=%.1f\n", s_v[lx], sl);
+#endif
+      r.crashT = 2.6f; hapGesture(HG_CRACK); spray(r.x, sy, 20, 200);
+      for (auto &d : s_deb) d = {r.x, sy - 6, (frand() - 0.5f) * 280.f, -80.f - frand() * 200.f, frand() * 6.f, true};
+      miniMantisFly = 1.f; r.vx = 0; return;
+    }
+#ifdef RIDER_LOG
+    if (heavy && !r.air) { static float mh = 0; static int n = 0; if (sl * r.vx < 0.f) mh = fmaxf(mh, fabsf(s_v[lx]) * fabsf(sl));
+      if (++n % 300 == 0) { printf("boat max head-on impact=%.1f\n", mh); mh = 0; } }
+#endif
+    if (heavy) {                                                                  // the speedboat has no wall: off one side, back on the other
+      if (r.x < 0) r.x += W; else if (r.x >= W) r.x -= W;
+    } else if (r.x < 16 || r.x > W - 16) {                                        // the wall
 #ifdef RIDER_LOG
       printf("%s hits the wall at %.0f\n", heavy ? "speedboat" : "jetski", fabsf(r.vx));
 #endif

@@ -1,4 +1,4 @@
-# SYNAPSE — a small green bug on m5 core 2
+# SYNAPSE — a small green bug in a glass panel
 
 Psychedelic praying-mantis fidget toy, calm physics room and dancing / singing mantis puppet for the **M5Stack Core2**.
 Everything listens (mic spectrum, beats, voice), everything feels (IMU tilt, shake, touch, haptics).
@@ -36,8 +36,10 @@ Shake: random iris colour and a dizzy eye-roll that recovers. B: gaze tracking o
   rings). The path winds; tilt (or drag) to stay inside — scrape the wall and you'll feel it.
 * **recede** — fly backwards out of the tube while it is created at your face: tilt / drag bends it, sound paints it,
   and you watch your sculpture trail into the distance.
-* **fractal** — morphing Julia sets with orbit-trap colouring (no flat fields). Tilt to steer, drag for big moves,
-  tap for a new world. The camera is attracted to detail so exploring never sinks into a void. Quality adapts to hold framerate.
+* **fractal** — a true infinite fractal dive. It zooms into a self-similar point of a Julia set (its repelling fixed
+  point, or a point that maps onto it), where the set repeats itself exactly at every depth - so the dive keeps
+  revealing the same structure inside itself forever, spiralling where the fixed point's multiplier turns. The
+  autopilot pulls you into the detail nearest to where you're aiming; tilt or drag to steer, tap for a new world.
 * **portal** — warp speed through a nebula. Aim at the wormhole (tilt / touch), fly in, spiral through, and emerge
   in a new dimension. Chain them for a combo.
 
@@ -62,8 +64,8 @@ changes the room's variant:
   clouds; either way the thunder arrives later the further away it was, and rolls through the motor.
   Go quiet and the storm slowly passes.
   **Hold B** for another boat: the paper boat (classic), the mantis on a jet ski (hunts steep faces and launches off
-  them, flips off the walls), in a wooden speedboat (drives and shreds; bumps are fine, but charge a wall hard enough
-  and it splinters, then drops back in), or on a surfboard (paddles to the biggest wave, stands up and rides it...
+  them, flips off the walls), in a wooden speedboat (drives and shreds; no walls for it - it wraps around the tank - but
+  a monster wave or a hard landing can still splinter it), or on a surfboard (paddles to the biggest wave, stands up and rides it...
   or wipes out). Rider sprites: src/rider_sprites.h (generated from the sprite sheet).
   Long-press: night, with moon glitter and bioluminescent crests.
 * **aquarium** — blacklight pebbles that pulse with the bass, plankton you can stir, a pulsing jellyfish, fish that
@@ -74,7 +76,10 @@ changes the room's variant:
 dancing beat-locked moves chosen by energy. Tap its head to pet it (happy eyes, blush, hearts). Idle, it breathes,
 looks around and waves. **B: sing** — close-up, holding a mic, mouth lip-syncing your voice (open with loudness,
 wide on bright sounds), notes floating out.
-**The dancer** reads the music with a handful of cheap, robust abstractions - hit density, sustain (wall of sound vs
+**The dancer** has a groove spine that always runs, with body parts moving at the same time: her hips sway
+side to side on the beat and pop on the kick, her head rides the bass, her feet keep stepping (faster when the
+hats and shakers get busy), and her arms rise when a lead line soars. On top of that, a move chooser adds the
+style:  with a handful of cheap, robust abstractions - hit density, sustain (wall of sound vs
 punchy), tonality, loudness, kick-on-every-beat, backbeat, syncopation, brightness, sub-bass wobble - and blends them
 into a feel: hip-hop, metal, country, pop/EDM, dubstep, soft, or a general groove (it re-reads the music at every
 8-beat phrase and needs two phrases of agreement to switch). Each feel has its own moves: head-nod bounce, two-step,
@@ -171,7 +176,7 @@ The vibration motor is played, not switched: a small mixer shapes taps with soft
 Everything that uses gravity (the calm room's liquids, sand, bubbles, swarm chaos) follows real gravity:
 tip the Core2 and things slide to the side that is really down.
 
-The flying modes (dive, recede, fractal, portal) steer by how far you **rotate the Core2 away from the way you're
+The flying modes (dive, recede, fractal, portal); the tunnel dive is pure steering (no autopilot) steer by how far you **rotate the Core2 away from the way you're
 holding it**: tip a little, steer a little; tip more, steer more - even past 90 degrees - and it keeps steering for as
 long as you hold the tilt. Each time you enter a flying mode it centres on your grip as soon as you hold still for a
 moment ("centered"). To re-centre any time, hold a finger still in the middle of the screen: after 2 s a ring closes

@@ -1,5 +1,5 @@
 // ============================================================
-//  SYNAPSE — a small green god in a glass panel · M5Stack Core2
+//  SYNAPSE — a small green bug in a glass panel · M5Stack Core2
 //  main.cpp: frame pipeline, input, visual modes.
 //  audio.cpp: always-on listening. calm.cpp: the physics room.
 //  fx.cpp: indexed-colour demo engine. mantis.cpp: the puppet.
@@ -1007,9 +1007,7 @@ static void tunnelRender(bool dive) {
     s_camX += (g_flyX * 1.9f + dragX * 8.f) * dt * (1.f + g_level * 0.5f);
     s_camY += (g_flyY * 1.6f + dragY * 8.f) * dt * (1.f + g_level * 0.5f);
     float nx = s_sl[(s_zi + 6) & 255].ox / 50.f, ny = s_sl[(s_zi + 6) & 255].oy / 50.f;
-    if (fabsf(g_flyX) + fabsf(g_flyY) < 0.05f) {            // hands level: drift gently back to the middle of the tube
-      s_camX += (nx - s_camX) * clampf(dt * 0.5f, 0, 1); s_camY += (ny - s_camY) * clampf(dt * 0.5f, 0, 1);
-    }
+
     float ex = s_camX - nx, ey = s_camY - ny, er = sqrtf(ex * ex + ey * ey);
     if (er > 0.62f) {
       s_camX = nx + ex / er * 0.6f; s_camY = ny + ey / er * 0.6f;
@@ -1120,29 +1118,75 @@ static void fractalRender() {
   float tr = s_cTr * s_cTr * (3.f - 2.f * s_cTr);
   s_cr0 = s_crP + (PRESETS[s_preset][0] - s_crP) * tr;
   s_ci0 = s_ciP + (PRESETS[s_preset][1] - s_ciP) * tr;
-  float cr = s_cr0 + 0.035f * cosf(g_t * 0.31f) + aud::bass * 0.03f * sinf(g_t * 2.f);
-  float ci = s_ci0 + 0.035f * sinf(g_t * 0.23f) + aud::treble * 0.02f;
+  float cr = s_cr0 + 0.006f * cosf(g_t * 0.31f), ci = s_ci0 + 0.006f * sinf(g_t * 0.23f);   // near-steady: keeps the self-similarity exact
 
-  // steer with tilt, rotate with twist, breathe zoom with bass
+  // ======== a TRUE fractal dive ========
+  // The Julia set of z^2+c has a repelling fixed point z* = (1 + sqrt(1-4c))/2 with multiplier L = f'(z*) = 2 z*.
+  // Near z* the set is exactly self-similar: scaled by |L| and rotated by arg(L) it maps onto itself, and every
+  // escape count shifts by one. So: zoom into z* by one factor of |L| while rotating by -arg(L), then wrap the
+  // camera back (offset from z* multiplied by L) and shift the colours one step. The picture continues exactly:
+  // an infinite dive that keeps revealing the same structure inside itself, never running out of float precision.
+  // Preimages of z* (the points that map onto it) are self-similar with the same L: the autopilot pulls you toward
+  // whichever of them is nearest to where YOU are aiming.
+  auto csq = [](float ar, float ai, float &rr, float &ri) {        // principal complex square root
+    float m = sqrtf(ar * ar + ai * ai); rr = sqrtf(fmaxf(0.f, (m + ar) * 0.5f)); ri = copysignf(sqrtf(fmaxf(0.f, (m - ar) * 0.5f)), ai);
+  };
+  float wr, wi; csq(1.f - 4.f * cr, -4.f * ci, wr, wi);
+  float zsr = (1.f + wr) * 0.5f, zsi = wi * 0.5f;
+  if (zsr * zsr + zsi * zsi < 0.25f) { zsr = (1.f - wr) * 0.5f; zsi = -wi * 0.5f; }        // the repelling one (|2z*| > 1)
+  float lr = 2.f * zsr, li = 2.f * zsi, lAbs = sqrtf(lr * lr + li * li), lArg = atan2f(li, lr);
+  if (lAbs < 1.05f) { lAbs = 1.05f; }
+  // self-similar targets: z*, -z*, and preimages (+-sqrt(p - c)), breadth-first
+  float TX[15], TY[15]; int nT = 0;
+  TX[nT] = zsr; TY[nT++] = zsi; TX[nT] = -zsr; TY[nT++] = -zsi;
+  for (int q = 1; q < 7 && nT < 15; q++) {
+    float pr, pi; csq(TX[q] - cr, TY[q] - ci, pr, pi);
+    if (nT < 15) { TX[nT] = pr; TY[nT++] = pi; }
+    if (nT < 15) { TX[nT] = -pr; TY[nT++] = -pi; }
+  }
+  static int tg = 0; static float s_du = 0; static int s_colOff = 0, s_wraps = 0;
+  const float S0 = 2.2f / 160.f;
+  // steer with tilt / drag (the autopilot only helps, it doesn't fight you)
   float c = cosf(s_frot), s = sinf(s_frot);
   s_fx += (c * g_flyX - s * g_flyY) * s_fs * 140.f * dt;
   s_fy += (s * g_flyX + c * g_flyY) * s_fs * 140.f * dt;
   bool piloting = fabsf(g_flyX) + fabsf(g_flyY) > 0.06f || ptx >= 0;
-  s_frot += (g_gz * 0.004f + 0.05f) * dt;
-  s_fzoomDir = -1.f;                                   // always diving
-  static float s_edgeLast = 1000.f;
-  float zoomK = clampf(s_edgeLast / 900.f, 0.12f, 1.f);        // sparse view: hover while the camera finds structure
-  s_fs *= expf(s_fzoomDir * dt * (0.22f + g_level * 0.5f) * zoomK);
-  s_fx = clampf(s_fx, -1.8f, 1.8f); s_fy = clampf(s_fy, -1.4f, 1.4f);
-  float sc = s_fs * (1.f - aud::bass * 0.12f);
+  {  // target = the self-similar point nearest to where you're aiming (with hysteresis)
+    float bd = 1e9f; int bi = tg;
+    for (int k = 0; k < nT; k++) { float dx = TX[k] - s_fx, dy = TY[k] - s_fy, d = dx * dx + dy * dy; if (d < bd) { bd = d; bi = k; } }
+    float cdx = TX[tg % nT] - s_fx, cdy = TY[tg % nT] - s_fy;
+    if (bi != tg && bd < 0.36f * (cdx * cdx + cdy * cdy)) tg = bi;
+    tg %= nT;
+  }
+  float tx0 = TX[tg], ty0 = TY[tg];
+  float pull = clampf(dt * (piloting ? 0.35f : 1.8f), 0.f, 1.f);              // autopilot: into the detail
+  s_fx += (tx0 - s_fx) * pull; s_fy += (ty0 - s_fy) * pull;
+  // dive: continuous zoom by |L| per level, turning with it
+  s_du += dt * (0.14f + g_level * 0.3f + aud::bass * 0.15f);
+  s_frot += (g_gz * 0.004f + 0.03f) * dt;
+  if (s_du >= 1.f) {
+    float dxr = s_fx - tx0, dxi = s_fy - ty0, view = S0 * 160.f;
+    if (dxr * dxr + dxi * dxi < view * view) {                                // wrap: same picture, one level shallower
+      s_du -= 1.f; s_colOff += 9; s_wraps++;
+      s_fx = tx0 + (dxr * lr - dxi * li); s_fy = ty0 + (dxr * li + dxi * lr); // offset from the target scales by L
+      if (s_wraps % 10 == 0) { s_preset = (s_preset + 1 + (esp_random() % 3)) % 8; s_crP = s_cr0; s_ciP = s_ci0; s_cTr = 0; }   // now and then, drift to another world
+    }
+  }
+  s_fs = S0 * powf(lAbs, -s_du);
+  float rotNow = s_frot - lArg * s_du;
+  if (s_fs < 3e-6f) {                                                          // steered far off the path: re-enter the dive
+    memcpy(fx::back, fx::buf, fx::LW * fx::LH);
+    s_du = 0; s_fx = tx0; s_fy = ty0; s_reborn = 1.f; hapGesture(HG_REBIRTH);
+    s_fs = S0;
+  }
+  c = cosf(rotNow); s = sinf(rotNow);
+  float sc = s_fs * (1.f - aud::bass * 0.08f);
 
   float ux = c * sc, uy = s * sc, vx = -s * sc, vy = c * sc;
   float ox = s_fx - ux * 80.f - vx * 60.f, oy = s_fy - uy * 80.f - vy * 60.f;
   const int maxIt = s_fIt;
-  int ph = (int)(g_t * 40.f);
-  float detXa[2] = {0, 0}, detYa[2] = {0, 0}; int detNa[2] = {0, 0}, inNa[2] = {0, 0}, loNa[2] = {0, 0};
+  int ph = (int)(g_t * 40.f) + s_colOff;
   auto rows_ = [&](int y0, int y1) {
-    const int hh = y0 != 0;
     for (int y = y0; y < y1; y++) {
     uint8_t *row = fx::buf + y * fx::LW;
     float zr0 = ox + vx * y, zi0 = oy + vy * y;
@@ -1163,43 +1207,13 @@ static void fractalRender() {
         float m = zr * zr + zi * zi;
         int fine = (int)(clampf(1.f - (m - 16.f) / (m + 16.f), 0.f, 1.f) * 12.f);
         v = 24 + ((k * 9 + fine + (int)(sqrtf(trap) * 110.f) + ph) & 127);
-        if (k > maxIt / 3) { detXa[hh] += x; detYa[hh] += y; detNa[hh]++; } else if (k < 3) loNa[hh]++;
-      } else {
-        inNa[hh]++;
-        v = 152 + (((int)(sqrtf(trap2) * 240.f) + (int)(trap * 40.f) - ph * 2) & 103);
-      }
+      } else v = 152 + (((int)(sqrtf(trap2) * 240.f) + (int)(trap * 40.f) - ph * 2) & 103);
       row[x] = (uint8_t)v;
     }
   }
   };
   fx::parallel(rows_);
-  float detX = detXa[0] + detXa[1], detY = detYa[0] + detYa[1];
-  int detN = detNa[0] + detNa[1], inN = inNa[0] + inNa[1], loN = loNa[0] + loNa[1];
-  // how much is actually VISIBLE: count edges on the frame (a flat field can sit at any escape depth)
-  int edgeN = 0; float edgeX = 0, edgeY = 0;
-  for (int y = 1; y < fx::LH - 1; y += 2) {
-    const uint8_t *r = fx::buf + y * fx::LW;
-    for (int x = 1; x < fx::LW - 1; x += 2) {
-      int d = abs((int)r[x] - (int)r[x + 1]) + abs((int)r[x] - (int)r[x + fx::LW]);
-      if (d > 10) { edgeN++; edgeX += x; edgeY += y; }
-    }
-  }
-  s_edgeLast = (float)edgeN;
-  // demo trick: the camera is drawn to where the structure is, so exploring never sinks into a void
-  if (edgeN > 40 && !piloting) {                       // only when you let go of the controls
-    float mx = edgeX / edgeN - 80.f, my = edgeY / edgeN - 60.f;
-    s_fx += (ux * mx + vx * my) * dt * 0.9f; s_fy += (uy * mx + vy * my) * dt * 0.9f;
-  }
-  // too deep for float precision, or lost in a void: the dive loops into a new world
-  s_empty = (edgeN < 260 || inN > 15000) ? s_empty + dt : fmaxf(0.f, s_empty - dt * 0.5f);
-  if (s_fs < 3e-6f || s_empty > 0.6f) {
-    memcpy(fx::back, fx::buf, fx::LW * fx::LH);
-    s_preset = (s_preset + 1 + (esp_random() % 3)) % 8;
-    s_crP = s_cr0 = PRESETS[s_preset][0]; s_ciP = s_ci0 = PRESETS[s_preset][1]; s_cTr = 1.f;
-    s_fs = 3.0f / 160.f; s_fx = 0; s_fy = 0; s_empty = 0; s_reborn = 1.f;
-    hapGesture(HG_REBIRTH);
-  }
-  if (s_reborn > 0) {                                  // dither-dissolve: the old world keeps falling inward
+  if (s_reborn > 0) {                                  // dither-dissolve: the old view keeps falling inward
     s_reborn = fmaxf(0.f, s_reborn - dt * 0.9f);
     float zf = 1.f + (1.f - s_reborn) * 1.5f;
     int thr = (int)(s_reborn * 255.f);
@@ -1800,8 +1814,16 @@ static void drawChrome() {
   canvas.drawFastHLine(0, 13, W, wire::PLUM); canvas.drawFastHLine(0, H - 14, W, wire::PLUM);
   canvas.drawFastHLine(0, 13, (int)(W * clampf(g_level, 0.f, 1.f)), wire::LIME);            // live mic meter
   canvas.setTextSize(1);
-  canvas.setTextColor(wire::LIME); canvas.setCursor(8, 3); canvas.print("synapse");
-  canvas.setTextColor(rgb565(40, 190, 180)); canvas.setCursor(64, 3); canvas.print(g_mode == MODE_ROOMS ? roomsName() : (g_mode == MODE_GARDEN ? gardenName() : names[g_mode]));
+  {  // battery: a small outline cell, fill = charge (lime > 30 %, amber > 15 %, red below), a spark when charging
+    static int lvl = -1; static uint32_t at = 0; static bool chg = false;
+    if (lvl < 0 || millis() - at > 5000) { at = millis(); lvl = M5.Power.getBatteryLevel(); chg = M5.Power.isCharging(); }
+    int L = lvl < 0 ? 0 : (lvl > 100 ? 100 : lvl);
+    canvas.drawRect(8, 3, 22, 8, rgb565(90, 110, 110)); canvas.fillRect(30, 5, 2, 4, rgb565(90, 110, 110));
+    uint16_t bc = L > 30 ? wire::LIME : (L > 15 ? rgb565(255, 190, 40) : rgb565(255, 60, 60));
+    canvas.fillRect(10, 5, (18 * L) / 100, 4, bc);
+    if (chg) { canvas.drawLine(20, 4, 17, 7, rgb565(255, 255, 255)); canvas.drawLine(17, 7, 21, 7, rgb565(255, 255, 255)); canvas.drawLine(21, 7, 18, 10, rgb565(255, 255, 255)); }
+  }
+  canvas.setTextColor(rgb565(40, 190, 180)); canvas.setCursor(40, 3); canvas.print(g_mode == MODE_ROOMS ? roomsName() : (g_mode == MODE_GARDEN ? gardenName() : names[g_mode]));
   int orb = 2 + (int)(g_level * 5.f + g_peak * 3.f);
   if (orb > 6) orb = 6;
   canvas.fillCircle(W - 12, 6, orb + 1, wire::PLUM);
@@ -1878,7 +1900,7 @@ static void splash() {
   c.setTextSize(2); c.setTextColor(hsv565(160, 0.85f, 0.95f));
   c.setCursor((W - 7 * 12) / 2, oy + MANTIS_H + 8); c.print("SYNAPSE");
   c.setTextSize(1); c.setTextColor(rgb565(120, 180, 160));
-  c.setCursor((W - 17 * 6) / 2, oy + MANTIS_H + 30); c.print("a small green god");
+  c.setCursor((W - 17 * 6) / 2, oy + MANTIS_H + 30); c.print("a small green bug");
   c.pushSprite(&M5.Display, 0, 0);
   M5.Speaker.begin();
   M5.Speaker.setVolume(170);
