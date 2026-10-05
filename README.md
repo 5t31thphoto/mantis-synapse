@@ -186,11 +186,6 @@ tools/host/run.sh             # soak: a bot pilot flies 6 seeds x 2 simulated ho
 
 The soak fails on a stuck trip, a theater that never resolves, NaN positions, broken sheet ranges, or non-ASCII text reaching the display font. `docksweep.cpp` tests the docking computer from random approaches. `snap.cpp` + `render.py` render scripted frames of every state to PNG for a look check. `tests.sh` runs the focused tests: job completion, lanes and the atlas, saves across power cycles, and the deep encounters.
 
-### Local build
-
-```text
-pio run -e m5stack-core2
-```
 
 ### Web flasher
 
