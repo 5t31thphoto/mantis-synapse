@@ -1,12 +1,15 @@
 {
-  "name": "SYNAPSE",
-  "version": "1.0.0",
+  "name": "SpaceMantis",
+  "version": "1.3.0",
   "new_install_prompt_erase": true,
   "builds": [
     {
       "chipFamily": "ESP32",
       "parts": [
-        { "path": "firmware-merged.bin", "offset": 0 }
+        {
+          "path": "firmware-merged.bin",
+          "offset": 0
+        }
       ]
     }
   ]
