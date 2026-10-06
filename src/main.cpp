@@ -1,4080 +1,1985 @@
 // ============================================================
-//  SpaceMantis — flight surface over the spreadsheet soul
-//  "Elite Dangerous on a flippin ESP32" — career, not cartography.
-//
-//  Real space is where ordinary business happens: stations, traders, pirates,
-//  rocks, gas giants. Nobody keeps coordinates. Fly into a named gate and you
-//  have chosen where to go: it spawns the next gate, and the third is a portal.
-//  Each portal is one layer down. Dive to the place's depth, the chain turns,
-//  climb, and resurface there — far across a universe with no map.
-//
-//  Exploring real space pays experience. Finding ways through the deep pays
-//  money: the deeper the layer, the more compressed and connected space is,
-//  and a route through it is the most valuable thing a pilot can carry.
+//  SYNAPSE — a small green bug in a glass panel · M5Stack Core2
+//  main.cpp: frame pipeline, input, visual modes.
+//  audio.cpp: always-on listening. calm.cpp: the physics room.
+//  fx.cpp: indexed-colour demo engine. mantis.cpp: the puppet.
 // ============================================================
-#include <M5Unified.h>
-#include <math.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdio.h>
-#include "vec3.h"
-#include "haptics.h"
-#include "mantis_pod_icon.h"
-#include "mantis_body_icon.h"
-#include "pilot_helmet_art.h"
-#include "atlas.h"
-#include "journal.h"
-#include "savefile.h"
+#include "app.h"
+#include "audio.h"
+#include "fx.h"
+#include "wire.h"
+#include "stats.h"
+#ifndef HOST
 #include <Preferences.h>
-#include "ship_art.h"
-#include "logos_art.h"
-#include "trip.h"
-#include "sheet.h"
-#include "universe.h"
-#include "resolve.h"
-#include "contracts.h"
-#include "sim.h"
-#include "content.h"
-#include "lore.h"
+#endif
+#include "mantis_splash.h"
+#include <string.h>
 
-static constexpr int W = 320, H = 240;
-static constexpr float FOCAL = 165.f;
-static constexpr int LAYERS = sm::DEPTH_BAND_COUNT;   // 0 real .. 4 deep cove
+// ---------------- shared state ----------------
+M5Canvas *g_cv = nullptr;
+float g_t = 0, g_dt = 0.033f, g_hue = 160;
+float g_level = 0, g_peak = 0;
+float g_lookX = 0, g_lookY = 0;
+float g_gravX = 0, g_gravY = 0;        // downhill direction in screen space (1 = 1 g)
+float g_gravZ = 1, g_jolt = 0;          // |gravity into the screen| (1 = lying flat), instantaneous jolt (g)
+float g_gyroX = 0, g_gyroY = 0, g_gyroZ = 0;
+int16_t g_mic[MIC_N];
 
-static M5Canvas cv(&M5.Display);
+static float g_ax = 0, g_ay = 0, g_az = 1, g_gx = 0, g_gy = 0, g_gz = 0;
+static float g_shake = 0;
+static uint32_t g_shakeAt = 0;
+bool g_shakeKick = false;                  // one-frame shake event
 
-// ============================================================
-//  small helpers
-// ============================================================
-static float tNow = 0, dt = 0.016f;
-static uint32_t rngState = 0xA341316Cu;
-static uint32_t rnd() { rngState ^= rngState << 13; rngState ^= rngState >> 17; rngState ^= rngState << 5; return rngState; }
-static float rf(float a, float b) { return a + (b - a) * ((rnd() & 0xFFFF) / 65535.f); }
-static int ri(int lo, int hi) { return lo + (int)(rnd() % (uint32_t)(hi - lo + 1)); }
-static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
-static uint16_t rgb(int r, int g, int b) {
-  r = r < 0 ? 0 : (r > 255 ? 255 : r); g = g < 0 ? 0 : (g > 255 ? 255 : g); b = b < 0 ? 0 : (b > 255 ? 255 : b);
-  return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+enum Mode : uint8_t { MODE_SWARM = 0, MODE_EYE, MODE_TUNNEL, MODE_PULSE, MODE_CALM, MODE_MANTIS, MODE_ROOMS, MODE_GARDEN, MODE_MEDITATE, MODE_COUNT };
+enum SwarmVar : uint8_t { SV_FLOCK = 0, SV_ORBIT, SV_CHAOS, SV_COUNT };
+enum TunnelMode : uint8_t { TM_DIVE = 0, TM_RECEDE, TM_FRACTAL, TM_PORTAL, TM_COUNT };
+static const int PP_COUNT = 5;
+static Mode g_mode = MODE_SWARM;
+static SwarmVar g_swarmVar = SV_FLOCK;
+static TunnelMode g_tunnelMode = TM_DIVE;
+static int g_pulsePat = 0;
+static bool g_eyeTrack = true;
+static bool g_mantisSing = false;
+static uint8_t g_mantisMode = 0;              // 0 dance, 1 sing, 2 echo (yakback)
+
+// ---------------- haptics: an expressive little mixer for the vibration motor ----------------
+// The Core2 motor is an ERM whose strength follows setVibration(0..255), so we shape it:
+//   taps      short hits with a decaying tail (hap)
+//   rumble    a continuous layer: amount, pulse rate (Hz) and grit (roughness), refreshed per frame
+//   gestures  keyframed envelopes (hapGesture) for moments that deserve a shape
+//   cut       instant silence (hapCut), e.g. the moment we cross into a new dimension
+// Everything is max-mixed, remapped above the motor's dead zone, and written only when it changes.
+static uint32_t g_hapUntil = 0, g_hapStart = 0, g_kickStart = 0, g_kickEnd = 0, g_quietUntil = 0, g_lastVibWrite = 0;
+static uint8_t g_hapLevel = 0, g_vibNow = 255;
+static float g_rumAmt = 0, g_rumTarget = 0, g_rumRate = 6.f, g_rumGrit = 0, g_rumPh = 0, g_rumJit = 0;
+static uint32_t g_rumStamp = 0, g_rumJitAt = 0, g_hapT = 0;
+struct HapKey { uint8_t level; uint16_t ms; };
+static const HapKey *g_gest = nullptr; static int g_gestN = 0, g_gestI = 0; static uint32_t g_gestT0 = 0; static uint8_t g_gestFrom = 0;
+static const HapKey G_THREAD[]  = {{150, 22}, {40, 45}, {220, 28}, {0, 110}};                                   // ta-DING
+static const HapKey G_CHAIN[]   = {{90, 70}, {170, 60}, {60, 50}, {200, 70}, {90, 50}, {255, 110}, {0, 260}};   // swelling triple
+static const HapKey G_MISS[]    = {{170, 18}, {110, 90}, {50, 110}, {85, 70}, {0, 240}};                        // dull wobble, sinking
+static const HapKey G_THUNDER[] = {{50, 160}, {150, 120}, {80, 170}, {210, 90}, {120, 260}, {70, 320}, {0, 480}};   // rolling, far away
+static const HapKey G_SETTLE[]  = {{120, 40}, {0, 90}, {170, 55}, {0, 160}};                                    // two soft pulses: done
+static const HapKey G_REBIRTH[] = {{30, 250}, {140, 350}, {230, 200}, {0, 30}};                                 // swell, then gone
+static const HapKey G_PAIN[]    = {{255, 30}, {120, 60}, {190, 40}, {60, 140}, {0, 160}};                       // flinch + throb
+static const HapKey G_LUBDUB[]  = {{175, 45}, {30, 90}, {125, 40}, {0, 220}};                                  // lub-dub
+static const HapKey G_THREE[]   = {{140, 350}, {0, 450}, {140, 350}, {0, 450}, {140, 350}, {0, 300}};               // three slow pulses
+static const HapKey G_POP[]     = {{255, 22}, {0, 16}, {190, 12}, {0, 40}};                                        // bubble-wrap pop
+static const HapKey G_CRACK[]   = {{255, 16}, {150, 26}, {235, 20}, {90, 40}, {0, 50}};                         // a close lightning crack
+static const HapKey *const GEST[] = {G_THREAD, G_CHAIN, G_MISS, G_THUNDER, G_SETTLE, G_REBIRTH, G_PAIN, G_CRACK, G_LUBDUB, G_THREE, G_POP};
+static const int GEST_N[] = {4, 7, 5, 7, 4, 4, 5, 5, 4, 6, 4};
+
+static void vib(uint8_t v) {
+  uint32_t now = millis();
+  if (v == g_vibNow) return;
+  if (v != 0 && g_vibNow != 0 && abs((int)v - (int)g_vibNow) < 4) return;       // don't spam I2C with tiny changes
+  if (v != 0 && now - g_lastVibWrite < 4) return;
+  g_vibNow = v; g_lastVibWrite = now; M5.Power.setVibration(v);
 }
-static void unrgb(uint16_t c, int &r, int &g, int &b) { r = (c >> 8) & 0xF8; g = (c >> 3) & 0xFC; b = (c << 3) & 0xF8; }
-static uint16_t shade(uint16_t c, float k) { int r, g, b; unrgb(c, r, g, b); return rgb((int)(r * k), (int)(g * k), (int)(b * k)); }
-static uint16_t mix565(uint16_t a, uint16_t b, float t) {
-  int r1, g1, b1, r2, g2, b2; unrgb(a, r1, g1, b1); unrgb(b, r2, g2, b2);
-  return rgb((int)(r1 + (r2 - r1) * t), (int)(g1 + (g2 - g1) * t), (int)(b1 + (b2 - b1) * t));
+void hap(uint8_t level, uint16_t ms) {
+  if (millis() < g_quietUntil) return;
+  if (level >= g_hapLevel || millis() >= g_hapUntil) { g_hapLevel = level; g_hapStart = millis(); g_hapUntil = millis() + ms; }
 }
-static uint16_t hsv(float h, float s, float v) {
-  h = fmodf(h, 360.f); if (h < 0) h += 360.f;
-  s = clampf(s, 0, 1); v = clampf(v, 0, 1);
-  float c = v * s, x = c * (1.f - fabsf(fmodf(h / 60.f, 2.f) - 1.f)), m = v - c;
-  float R = 0, G = 0, B = 0;
-  if (h < 60) { R = c; G = x; } else if (h < 120) { R = x; G = c; } else if (h < 180) { G = c; B = x; }
-  else if (h < 240) { G = x; B = c; } else if (h < 300) { R = x; B = c; } else { R = c; B = x; }
-  return rgb((int)((R + m) * 255), (int)((G + m) * 255), (int)((B + m) * 255));
+void kickSubHaptic() { g_kickStart = millis(); g_kickEnd = g_kickStart + 150; }
+void hapRumble(float amount, float rateHz, float grit) {
+  g_rumTarget = clampf(amount, 0.f, 1.f); g_rumRate = rateHz; g_rumGrit = clampf(grit, 0.f, 1.f); g_rumStamp = millis();
 }
-
-// fast sine for per-block fields
-static float s_sinTab[1024];
-static void initSin() { for (int i = 0; i < 1024; i++) s_sinTab[i] = sinf(i * 6.2831853f / 1024.f); }
-static inline float fsin(float x) { int i = (int)floorf(x * 162.97466f); return s_sinTab[i & 1023]; }
-static inline float fcos(float x) { return fsin(x + 1.5707963f); }
-
-// The 6x8 font is ASCII only; content text uses em dashes.
-static void asciiCopy(char *dst, size_t cap, const char *src) {
-  size_t o = 0;
-  if (!src) src = "";
-  for (const unsigned char *p = (const unsigned char *)src; *p && o + 1 < cap; ) {
-    if (*p < 0x80) { dst[o++] = (char)*p++; continue; }
-    int n = (*p >= 0xF0) ? 4 : (*p >= 0xE0) ? 3 : (*p >= 0xC0) ? 2 : 1;
-    for (int k = 0; k < n && *p; k++) p++;
-    dst[o++] = '-';
+void hapGesture(uint8_t id) {
+  if (millis() < g_quietUntil || id >= sizeof(GEST_N) / sizeof(GEST_N[0])) return;
+  g_gestFrom = g_vibNow == 255 ? 0 : g_vibNow; g_gest = GEST[id]; g_gestN = GEST_N[id]; g_gestI = 0; g_gestT0 = millis();
+}
+void hapCut(uint16_t quietMs) {
+  g_rumAmt = g_rumTarget = 0; g_gest = nullptr; g_hapLevel = 0; g_hapUntil = 0; g_kickEnd = 0;
+  g_quietUntil = millis() + quietMs;
+  g_vibNow = 0; M5.Power.setVibration(0);
+}
+static void hapService() {
+  uint32_t now = millis();
+  float dt = (now - g_hapT) / 1000.f; if (dt > 0.1f) dt = 0.1f; g_hapT = now;
+  if (now < g_quietUntil) { vib(0); return; }
+  float out = 0;
+  // taps: hit hard, then a soft tail
+  if (g_hapLevel && now < g_hapUntil) {
+    float u = (float)(now - g_hapStart) / (float)(g_hapUntil - g_hapStart + 1);
+    out = fmaxf(out, g_hapLevel / 255.f * (1.f - 0.45f * u * u));
+  } else g_hapLevel = 0;
+  // kick "subwoofer" throb
+  if (g_kickEnd && now < g_kickEnd) {
+    float u = (float)(now - g_kickStart) / (float)(g_kickEnd - g_kickStart), env = (1.f - u) * (1.f - u);
+    out = fmaxf(out, env * (((now / 9) & 1) ? 0.9f : 0.15f));
+  } else g_kickEnd = 0;
+  // rumble: eases toward its target; if nobody refreshes it, it fades away
+  if (now - g_rumStamp > 120) g_rumTarget = 0;
+  g_rumAmt += (g_rumTarget - g_rumAmt) * clampf(dt * (g_rumTarget > g_rumAmt ? 10.f : 6.f), 0.f, 1.f);
+  if (g_rumAmt > 0.01f) {
+    g_rumPh += dt * g_rumRate; if (g_rumPh > 1000.f) g_rumPh -= 1000.f;
+    float w = 0.5f + 0.5f * sinf(g_rumPh * 6.2831853f);
+    w = w * w * (3.f - 2.f * w);                                 // rounder throb
+    if (now - g_rumJitAt > 12) { g_rumJitAt = now; g_rumJit = (esp_random() % 1000) / 1000.f; }
+    float floor_ = 0.45f + 0.5f * g_rumAmt * g_rumAmt;            // strong rumbles fill in: pulses become a roar
+    float v = g_rumAmt * (floor_ + (1.f - floor_) * w) * (1.f - g_rumGrit * 0.35f * g_rumJit);
+    out = fmaxf(out, v);
   }
-  dst[o] = 0;
-}
-static void upcase(char *s) { for (; *s; s++) if (*s >= 'a' && *s <= 'z') *s = (char)(*s - 32); }
-
-// ---- banner: two lines, queued so nothing important is stomped ----
-static char banner[112] = "";
-static uint32_t bannerUntil = 0;
-static char queued[3][112];
-static uint16_t queuedMs[3];
-static uint8_t queuedN = 0;
-static void setBanner(const char *s, uint32_t ms = 2200) { asciiCopy(banner, sizeof(banner), s); bannerUntil = millis() + ms; }
-static void noteBanner(const char *s, uint16_t ms = 2600) {
-  if (bannerUntil <= millis()) { setBanner(s, ms); return; }
-  if (queuedN >= 3) return;
-  asciiCopy(queued[queuedN], sizeof(queued[0]), s);
-  queuedMs[queuedN++] = ms;
-}
-static void serviceBanner() {
-  if (bannerUntil > millis() || !queuedN) return;
-  setBanner(queued[0], queuedMs[0]);
-  for (int i = 1; i < queuedN; i++) { memcpy(queued[i - 1], queued[i], sizeof(queued[0])); queuedMs[i - 1] = queuedMs[i]; }
-  queuedN--;
-}
-
-// ============================================================
-//  ship + camera
-// ============================================================
-static V3 shipPos{0, 0, 0}, prevShipPos{0, 0, 0};
-static Basis shipB;
-static float shipSpeed = 0, rateYaw = 0, ratePitch = 0, rateRoll = 0;
-static float throttleT = 0.5f;           // slider: 0 stop, 0.5 cruise, 1 boost
-static int layer = 0;                    // 0 real .. 4 deep cove
-static float fovPulse = 1.f;
-static float deepFlash = 0.f;            // palette inversion on the deepest heartbeat
-static float crossFlash = 0.f;           // white-out on a portal crossing
-static float hitFlash = 0.f;             // red edge when the hull is struck
-
-// gravitational lens (screen space), set per frame by a collapsed star in view
-static bool lensOn = false;
-static bool alienLensOn = false;            // a visitor bends the deep around itself
-static float alienLX = 0, alienLY = 0, alienLR = 0;
-static float lensX = 0, lensY = 0, lensR = 0;
-
-static inline void applyLens(float &sx, float &sy) {
-  if (!lensOn) return;
-  float dx = sx - lensX, dy = sy - lensY, d2 = dx * dx + dy * dy + 1.f;
-  float push = clampf(lensR * lensR / d2, 0.f, 2.2f);
-  sx += dx * push; sy += dy * push;
-}
-static inline bool project(V3 w, float &sx, float &sy, float &z) {
-  V3 c = shipB.toLocal(w - shipPos);
-  z = c.z;
-  if (z < 0.35f) return false;
-  float k = FOCAL * fovPulse / z;
-  sx = W * 0.5f + c.x * k; sy = H * 0.5f - c.y * k;
-  applyLens(sx, sy);
-  return true;
-}
-static inline bool projectDir(V3 d, float &sx, float &sy) {
-  V3 c = shipB.toLocal(d);
-  if (c.z < 0.05f) return false;
-  float k = FOCAL * fovPulse / c.z;
-  sx = W * 0.5f + c.x * k; sy = H * 0.5f - c.y * k;
-  applyLens(sx, sy);
-  return true;
-}
-static inline bool onScreen(float sx, float sy, float m = 0) { return sx >= -m && sx < W + m && sy >= -m && sy < H + m; }
-
-// ============================================================
-//  meshes: convex hulls of small point sets, flat shaded
-// ============================================================
-struct Mesh {
-  uint8_t nv = 0, nt = 0, ne = 0;
-  V3 v[18];
-  uint8_t t[40][3];
-  V3 n[40];
-  uint8_t e[64][4];   // a, b, face0, face1 (255 = none)
-};
-static bool faceHas(const Mesh &m, int f, uint8_t a, uint8_t b) {
-  bool ha = m.t[f][0] == a || m.t[f][1] == a || m.t[f][2] == a;
-  bool hb = m.t[f][0] == b || m.t[f][1] == b || m.t[f][2] == b;
-  return ha && hb;
-}
-static void buildHull(Mesh &m, const V3 *pts0, int n, bool jitter = false) {
-  // jitter: a hair of noise so big flat faces (hexagons, octagons) triangulate once, not every way
-  V3 pts[18];
-  for (int i = 0; i < n; i++) pts[i] = jitter ? pts0[i] + V3{rf(-1e-3f, 1e-3f), rf(-1e-3f, 1e-3f), rf(-1e-3f, 1e-3f)} : pts0[i];
-  m.nv = (uint8_t)n; m.nt = 0; m.ne = 0;
-  for (int i = 0; i < n; i++) m.v[i] = pts[i];
-  for (int i = 0; i < n; i++)
-    for (int j = i + 1; j < n; j++)
-      for (int k = j + 1; k < n; k++) {
-        V3 nn = cross(pts[j] - pts[i], pts[k] - pts[i]);
-        if (len(nn) < 1e-5f) continue;
-        nn = norm(nn);
-        float d = dot(nn, pts[i]);
-        int pos = 0, neg = 0;
-        for (int l = 0; l < n; l++) {
-          if (l == i || l == j || l == k) continue;
-          float s = dot(nn, pts[l]) - d;
-          if (s > 1e-4f) pos++; else if (s < -1e-4f) neg++;
-        }
-        if ((pos && neg) || (!pos && !neg) || m.nt >= 40) continue;
-        uint8_t a = (uint8_t)i, b = (uint8_t)j, c = (uint8_t)k;
-        if (pos) { uint8_t tmp = b; b = c; c = tmp; nn = -nn; }   // outward
-        m.t[m.nt][0] = a; m.t[m.nt][1] = b; m.t[m.nt][2] = c; m.n[m.nt] = nn; m.nt++;
-      }
-  // feature edges only: where the surface bends
-  for (int f = 0; f < m.nt; f++)
-    for (int s = 0; s < 3; s++) {
-      uint8_t a = m.t[f][s], b = m.t[f][(s + 1) % 3];
-      if (a > b) { uint8_t tmp = a; a = b; b = tmp; }
-      bool have = false;
-      for (int q = 0; q < m.ne; q++) if (m.e[q][0] == a && m.e[q][1] == b) { have = true; break; }
-      if (have) continue;
-      int f1 = 255; bool anyNeighbour = false;
-      for (int g = 0; g < m.nt; g++) {
-        if (g == f || !faceHas(m, g, a, b)) continue;
-        anyNeighbour = true;
-        if (dot(m.n[g], m.n[f]) < 0.995f) f1 = g;
-      }
-      bool feature = f1 != 255 || !anyNeighbour;
-      if (feature && m.ne < 64) { m.e[m.ne][0] = a; m.e[m.ne][1] = b; m.e[m.ne][2] = (uint8_t)f; m.e[m.ne][3] = (uint8_t)f1; m.ne++; }
+  // gesture: linear ramps between keyframes
+  if (g_gest) {
+    uint32_t e = now - g_gestT0;
+    while (g_gest && e >= g_gest[g_gestI].ms) {
+      e -= g_gest[g_gestI].ms; g_gestT0 += g_gest[g_gestI].ms; g_gestFrom = g_gest[g_gestI].level;
+      if (++g_gestI >= g_gestN) g_gest = nullptr;
     }
-}
-
-enum MeshId : uint8_t { M_STATION = 0, M_COBRA, M_VIPER, M_SIDEWINDER, M_SHUTTLE, M_KRAIT, M_POD, M_TETRA, M_GHOST,
-                        M_HEXCORE, M_RINGSEG, M_OCT, M_OCTWIDE, M_MODULE, M_PANEL, M_ROCK0, M_COUNT = M_ROCK0 + 6 };
-static Mesh meshes[M_COUNT];
-
-static void initMeshes() {
-  V3 st[12]; int k = 0;   // cuboctahedron — a nod to the Coriolis
-  for (int a = -1; a <= 1; a += 2) for (int b = -1; b <= 1; b += 2) { st[k++] = {(float)a, (float)b, 0}; st[k++] = {(float)a, 0, (float)b}; st[k++] = {0, (float)a, (float)b}; }
-  buildHull(meshes[M_STATION], st, 12);
-  const V3 cobra[] = {{-0.35f, 0.06f, 1.0f}, {0.35f, 0.06f, 1.0f}, {-1.35f, -0.04f, -0.3f}, {1.35f, -0.04f, -0.3f},
-                      {-0.95f, 0.14f, -0.78f}, {0.95f, 0.14f, -0.78f}, {0, 0.36f, -0.55f}, {0, -0.26f, -0.62f}, {-0.55f, -0.18f, 0.35f}, {0.55f, -0.18f, 0.35f}};
-  buildHull(meshes[M_COBRA], cobra, 10);
-  const V3 viper[] = {{0, 0, 1.35f}, {-0.6f, 0, -0.7f}, {0.6f, 0, -0.7f}, {0, 0.3f, -0.62f}, {0, -0.2f, -0.62f}, {-0.3f, 0.13f, -0.82f}, {0.3f, 0.13f, -0.82f}};
-  buildHull(meshes[M_VIPER], viper, 7);
-  const V3 side[] = {{-1.05f, 0, -0.45f}, {1.05f, 0, -0.45f}, {-0.38f, 0.22f, 0.72f}, {0.38f, 0.22f, 0.72f}, {-0.38f, -0.12f, 0.72f}, {0.38f, -0.12f, 0.72f}, {0, 0.34f, -0.5f}, {0, -0.22f, -0.5f}};
-  buildHull(meshes[M_SIDEWINDER], side, 8);
-  const V3 shut[] = {{-0.42f, -0.35f, -0.8f}, {0.42f, -0.35f, -0.8f}, {-0.42f, 0.35f, -0.8f}, {0.42f, 0.35f, -0.8f},
-                     {-0.45f, -0.3f, 0.45f}, {0.45f, -0.3f, 0.45f}, {-0.35f, 0.3f, 0.45f}, {0.35f, 0.3f, 0.45f}, {0, 0.05f, 1.05f}};
-  buildHull(meshes[M_SHUTTLE], shut, 9);
-  const V3 krait[] = {{0, 0, 1.4f}, {-1.3f, 0.05f, -0.2f}, {1.3f, 0.05f, -0.2f}, {0, 0.45f, -0.35f}, {0, -0.3f, -0.4f}, {-0.45f, 0, -0.95f}, {0.45f, 0, -0.95f}};
-  buildHull(meshes[M_KRAIT], krait, 7);
-  const V3 pod[] = {{0, 0, 0.9f}, {0, 0, -0.9f}, {0.6f, 0, 0}, {-0.6f, 0, 0}, {0, 0.6f, 0}, {0, -0.6f, 0}};
-  buildHull(meshes[M_POD], pod, 6);
-  const V3 tet[] = {{0, 1, 0}, {0.94f, -0.33f, 0}, {-0.47f, -0.33f, 0.82f}, {-0.47f, -0.33f, -0.82f}};
-  buildHull(meshes[M_TETRA], tet, 4);
-  // ghost fleet: long, thin, too quiet
-  const V3 ghost[] = {{0, 0, 2.2f}, {-0.35f, 0, -1.6f}, {0.35f, 0, -1.6f}, {0, 0.22f, -1.2f}, {0, -0.22f, -1.2f}, {-0.9f, 0.02f, -0.4f}, {0.9f, 0.02f, -0.4f}};
-  buildHull(meshes[M_GHOST], ghost, 7);
-  // station parts. Liminar hexcore: a faceted hex body, narrow at both ends
-  {
-    V3 p[18];
-    for (int i = 0; i < 6; i++) {
-      float a = i * 1.0471976f + 0.5235988f;
-      p[i] = {0.52f * cosf(a), 0.52f * sinf(a), 0.86f};
-      p[i + 6] = {0.96f * cosf(a), 0.96f * sinf(a), 0.12f};
-      p[i + 12] = {0.62f * cosf(a), 0.62f * sinf(a), -0.78f};
+    if (g_gest) {
+      float u = (float)e / (float)(g_gest[g_gestI].ms + 1);
+      out = fmaxf(out, (g_gestFrom + (g_gest[g_gestI].level - g_gestFrom) * u) / 255.f);
     }
-    buildHull(meshes[M_HEXCORE], p, 18, true);
   }
-  { // a ring segment: long along its own forward (the ring's tangent)
-    const V3 b[] = {{-0.17f, -0.13f, -0.30f}, {0.17f, -0.13f, -0.30f}, {-0.17f, 0.13f, -0.30f}, {0.17f, 0.13f, -0.30f},
-                    {-0.17f, -0.13f, 0.30f}, {0.17f, -0.13f, 0.30f}, {-0.17f, 0.13f, 0.30f}, {0.17f, 0.13f, 0.30f}, {0.f, 0.19f, 0.f}};
-    buildHull(meshes[M_RINGSEG], b, 9, true);
-  }
-  for (int w = 0; w < 2; w++) {   // octagonal drums for the spindle
-    V3 p[16]; float r = w ? 0.5f : 0.34f, h = w ? 0.16f : 0.22f;
-    for (int i = 0; i < 8; i++) { float a = i * 0.7853982f + 0.3926991f; p[i] = {r * cosf(a), r * sinf(a), h}; p[i + 8] = {r * cosf(a), r * sinf(a), -h}; }
-    buildHull(meshes[w ? M_OCTWIDE : M_OCT], p, 16, true);
-  }
-  { const V3 b[] = {{-0.3f, -0.22f, -0.42f}, {0.3f, -0.22f, -0.42f}, {-0.3f, 0.22f, -0.42f}, {0.3f, 0.22f, -0.42f},
-                    {-0.3f, -0.22f, 0.42f}, {0.3f, -0.22f, 0.42f}, {-0.24f, 0.26f, 0.36f}, {0.24f, 0.26f, 0.36f}};
-    buildHull(meshes[M_MODULE], b, 8, true); }
-  { const V3 b[] = {{-0.6f, -0.02f, -0.22f}, {0.6f, -0.02f, -0.22f}, {-0.6f, 0.02f, -0.22f}, {0.6f, 0.02f, -0.22f},
-                    {-0.6f, -0.02f, 0.22f}, {0.6f, -0.02f, 0.22f}, {-0.6f, 0.02f, 0.22f}, {0.6f, 0.02f, 0.22f}};
-    buildHull(meshes[M_PANEL], b, 8, true); }
-  const float g = 1.618f;
-  V3 ico[12] = {{-1, g, 0}, {1, g, 0}, {-1, -g, 0}, {1, -g, 0}, {0, -1, g}, {0, 1, g}, {0, -1, -g}, {0, 1, -g}, {g, 0, -1}, {g, 0, 1}, {-g, 0, -1}, {-g, 0, 1}};
-  for (int r = 0; r < 6; r++) {
-    V3 p[12];
-    for (int i = 0; i < 12; i++) p[i] = norm(ico[i]) * rf(0.62f, 1.18f);
-    buildHull(meshes[M_ROCK0 + r], p, 12);
-  }
+  // above the dead zone the motor responds; below it, silence
+  vib(out < 0.03f ? 0 : (uint8_t)(55.f + out * 200.f));
 }
 
-// ============================================================
-//  world objects
-// ============================================================
-enum OKind : uint8_t { K_NONE = 0, K_SHIP, K_STATION, K_DOCKGATE, K_ROCK, K_BODY, K_POD, K_WRECK, K_ARTIFACT, K_ANOMALY, K_GATE, K_PORTAL, K_LANDMARK };
-enum GateFlags : uint8_t { GF_DEST = 1, GF_CHAIN = 2, GF_JOB = 4, GF_RUMOR = 8, GF_UNKNOWN = 16, GF_FIXED = 32, GF_KNOWN = 64, GF_LOCALNAME = 128 };
-enum BodyType : uint8_t { BT_GIANT = 0, BT_ROCKY, BT_HOLE, BT_WRONGSTAR, BT_STAR, BT_REDGIANT, BT_WHITEDWARF, BT_NEUTRON };
-static inline bool isStarBody(uint8_t t) { return t == BT_STAR || t == BT_REDGIANT || t == BT_WHITEDWARF || t == BT_NEUTRON; }
+// ---------------- frame pipeline: render core 1, push core 0 ----------------
+static M5Canvas s_fbA(&M5.Display), s_fbB(&M5.Display);
+static M5Canvas *s_fb[2] = {&s_fbA, &s_fbB};
+static int s_cur = 0;
+static bool s_double = false;
+static TaskHandle_t s_dispTask = nullptr;
+static SemaphoreHandle_t s_dispIdle = nullptr;
+static volatile int s_pushIdx = 0;
 
-struct Obj {
-  uint8_t kind, enc, mesh, gflags, depth, bodyType, uses;
-  bool hostile, engaged, done, ghost;
-  V3 p, v;
-  Basis o;
-  float radius, spin, timer, prevSide;
-  uint16_t col;
-  uint32_t seed;
-  int lmId;       // landmark id (0 = none)
-  int link;       // station <-> dock gate
-  char name[24];
-};
-static constexpr int MAX_OBJ = 44;
-static Obj objs[MAX_OBJ];
-
-static Obj *newObj(uint8_t kind) {
-  for (int i = 0; i < MAX_OBJ; i++)
-    if (objs[i].kind == K_NONE) {
-      objs[i] = Obj();
-      objs[i].kind = kind; objs[i].o = Basis(); objs[i].link = -1;
-      objs[i].seed = rnd();
-      return &objs[i];
-    }
-  return nullptr;
-}
-static int idxOf(const Obj *o) { return o ? (int)(o - objs) : -1; }
-static void killObj(int i) { if (i >= 0 && i < MAX_OBJ) objs[i].kind = K_NONE; }
-static void clearWorld() { for (auto &o : objs) o.kind = K_NONE; }
-static int countKind(uint8_t k) { int n = 0; for (auto &o : objs) if (o.kind == k) n++; return n; }
-static float distTo(const Obj &o) { return len(o.p - shipPos); }
-static float surfaceDist(const Obj &o) { return distTo(o) - o.radius; }
-
-// ============================================================
-//  scene state
-// ============================================================
-static V3 sunDir{0.4f, 0.3f, 0.86f};
-static uint16_t sunCol = 0;
-static uint8_t sunType = 2;      // 0 red dwarf, 1 orange, 2 yellow, 3 white, 4 blue giant, 5 red giant, 6 white dwarf
-static V3 layerLight{0.3f, 0.8f, 0.5f};
-static char hereName[24] = "";     // what locals call this place
-static int target = -1;            // targeted object
-static int navObj = -1;            // next gate / portal of the trip
-static int dockTarget = -1;        // autopilot docking to this dock gate
-static uint32_t lastSave = 0;
-static float spawnTimer = 3.f;
-static uint32_t livesSeen = 0;
-
-struct Star { V3 d; uint8_t mag; uint16_t col; };
-static constexpr int NSTARS = 240;
-static Star stars[NSTARS];
-struct Blob { V3 d; float r; uint16_t col; };
-static constexpr int NBLOBS = 44;
-static Blob blobs[NBLOBS];
-static constexpr int NDUST = 34;
-static V3 dust[NDUST];
-struct Streamer { float x, y, z, hue, w; };
-static constexpr int NSTREAM = 22;
-static Streamer streamers[NSTREAM];
-
-// per-block polar coordinates for kaleidoscope fields (screen is fixed)
-static constexpr int BLK = 4, BW = W / BLK, BH = H / BLK;
-// packed 16-bit so the tables stay small in DRAM
-static int16_t blkAngQ[BW * BH], blkRadQ[BW * BH], blkLogQ[BW * BH];
-static inline float blkAng(int i) { return blkAngQ[i] * (3.1415927f / 10000.f); }
-static inline float blkRad(int i) { return blkRadQ[i] * (1.f / 20000.f); }
-static inline float blkLog(int i) { return blkLogQ[i] * (1.f / 8000.f); }
-static void initBlocks() {
-  for (int by = 0; by < BH; by++)
-    for (int bx = 0; bx < BW; bx++) {
-      float x = (bx * BLK + 2 - 160.f) / 160.f, y = (by * BLK + 2 - 120.f) / 160.f;
-      float r = sqrtf(x * x + y * y);
-      blkAngQ[by * BW + bx] = (int16_t)(atan2f(y, x) * (10000.f / 3.1415927f));
-      blkRadQ[by * BW + bx] = (int16_t)(r * 20000.f);
-      blkLogQ[by * BW + bx] = (int16_t)(logf(r + 0.02f) * 8000.f);
-    }
-}
-
-static V3 randDir() {
+static void displayTask(void *) {
   for (;;) {
-    V3 d{rf(-1, 1), rf(-1, 1), rf(-1, 1)};
-    float l = len(d);
-    if (l > 0.1f && l <= 1.f) return d * (1.f / l);
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    s_fb[s_pushIdx]->pushSprite(&M5.Display, 0, 0);
+    xSemaphoreGive(s_dispIdle);
   }
 }
 
-static void buildSky(uint32_t seed) {
-  uint32_t keep = rngState; rngState = seed ? seed : 1;
-  for (int i = 0; i < NSTARS; i++) {
-    stars[i].d = randDir();
-    float m = rf(0, 1);
-    stars[i].mag = (uint8_t)(m < 0.72f ? 0 : m < 0.93f ? 1 : m < 0.985f ? 2 : 3);
-    float t = rf(0, 1);   // stellar colour temperature
-    stars[i].col = t < 0.15f ? rgb(255, 190, 150) : t < 0.35f ? rgb(255, 235, 205) : t < 0.8f ? rgb(235, 240, 255) : rgb(180, 205, 255);
-  }
-  // two or three dusty nebulae — eye candy, not a galaxy
-  int nb = 0, clouds = ri(2, 3);
-  for (int c = 0; c < clouds && nb < NBLOBS; c++) {
-    V3 center = randDir();
-    float hue = rf(0, 1) < 0.5f ? rf(195, 235) : rf(5, 30);
-    if (rf(0, 1) < 0.2f) hue = rf(280, 320);
-    int n = ri(10, 16);
-    for (int k = 0; k < n && nb < NBLOBS; k++)
-      blobs[nb++] = {norm(center + randDir() * rf(0.05f, 0.32f)), rf(0.05f, 0.16f), hsv(hue + rf(-12, 12), rf(0.35f, 0.6f), rf(0.035f, 0.075f))};
-  }
-  for (; nb < NBLOBS; nb++) blobs[nb] = {V3{0, 0, 1}, 0, 0};
-  sunDir = randDir();
-  float st = rf(0, 1);
-  // the local star: mostly ordinary, sometimes not
-  sunType = st < 0.18f ? 0 : st < 0.40f ? 1 : st < 0.62f ? 2 : st < 0.76f ? 3 : st < 0.84f ? 4 : st < 0.93f ? 5 : 6;
-  static const uint16_t starCols[7] = {rgb(255, 120, 70), rgb(255, 172, 100), rgb(255, 232, 175), rgb(248, 248, 255),
-                                       rgb(165, 195, 255), rgb(255, 105, 60), rgb(200, 220, 255)};
-  sunCol = starCols[sunType];
-  rngState = keep;
-}
-
-static void resetDust() {
-  for (auto &d : dust) d = shipPos + randDir() * rf(8, 60);
-  for (auto &s : streamers) { s.x = rf(-30, 30); s.y = rf(-22, 22); s.z = rf(5, 90); s.hue = rf(0, 360); s.w = rf(6, 18); }
-}
-
-// ============================================================
-//  layer look
-// ============================================================
-static const char *layerName(int l) {
-  static const char *n[] = {"REAL SPACE", "THE SHALLOWS", "SMUGGLER ROADS", "BELOW THE ROADS", "DEEP COVE"};
-  return n[l < 0 ? 0 : (l > 4 ? 4 : l)];
-}
-static float layerHue(int l) {
-  static const float h[] = {215, 188, 265, 300, 95};
-  return h[l < 0 ? 0 : (l > 4 ? 4 : l)] + (l >= 3 ? tNow * (l == 4 ? 22.f : 9.f) : 0.f);
-}
-
-// The subspace sky, evaluated per 4x4 block from the view direction so turning
-// the ship turns the world. Deeper layers fold into kaleidoscopes.
-static float fieldGain = 1.f;           // brighter inside portal holes
-static float frameYawA = 0, framePitA = 0;
-static uint16_t fieldColor(int l, int bi, V3 d, float t) {
-  float a = blkAng(bi), r = blkRad(bi);
-  if (l <= 1) {
-    float v = 0.5f + 0.5f * fsin(d.x * 3.1f + t * 0.35f + fsin(d.y * 2.3f - t * 0.27f) * 1.4f);
-    float w = 0.5f + 0.5f * fsin(d.z * 4.2f - d.x * 2.f + t * 0.2f);
-    return hsv(185 + v * 40 + w * 25, 0.55f, (0.035f + v * w * 0.14f) * fieldGain);
-  }
-  if (l == 2) {
-    float v = fsin(d.x * 4.f + t * 0.5f + fsin(d.y * 5.f + t * 0.4f) * 2.f);
-    float w = fsin(d.y * 3.f - d.z * 4.f - t * 0.6f + fsin(d.x * 7.f) * 1.2f);
-    float band = fsin((v + w) * 3.f + r * 4.f - t);
-    float val = 0.06f + (0.5f + 0.5f * band) * (0.5f + 0.25f * (v + w)) * 0.3f;
-    return hsv(250 + v * 40 + band * 30, 0.7f, val * fieldGain);
-  }
-  int k = l == 3 ? 6 : 8;
-  float wedge = 6.2831853f / k;
-  float fa = fmodf(a + 12.566371f + t * (l == 3 ? 0.05f : -0.09f), wedge);
-  if (fa > wedge * 0.5f) fa = wedge - fa;
-  float yawA = frameYawA, pitA = framePitA;
-  float px = fcos(fa) * r, py = fsin(fa) * r;
-  float f1 = fsin(px * 7.f + t * 0.9f + yawA * 3.f);
-  float f2 = fsin(py * 9.f - t * 1.3f + pitA * 4.f + f1 * 1.5f);
-  float f3 = fsin(r * 11.f - t * 2.2f + d.x * 2.f);
-  float v = (f1 + f2 + f3) * 0.33f;
-  float hue = layerHue(l) + v * 90.f + r * 120.f;
-  if (l == 4) {
-    // a tunnel folded into itself: log-polar rings rushing outward
-    float rings = fsin(blkLog(bi) * 9.f - t * 3.6f + fa * 4.f);
-    v = v * 0.6f + rings * 0.6f;
-    hue += rings * 70.f;
-  }
-  float val = 0.10f + (0.5f + 0.5f * v) * (l == 3 ? 0.36f : 0.5f);
-  if (deepFlash > 0.f) { hue += 180.f * deepFlash; val = val * (1.f - deepFlash) + deepFlash * 0.7f; }
-  return hsv(hue, 0.75f, val * (fieldGain > 1.f ? 1.25f : 1.f));
-}
-
-static void drawField(int l, float cx = 160, float cy = 120, float rClip = 1e9f) {
-  float t = tNow;
-  frameYawA = atan2f(shipB.f.x, shipB.f.z); framePitA = shipB.f.y;
-  int tear = (l == 4 && fmodf(tNow, 3.7f) < 0.18f) ? ri(-3, 3) : 0;
-  float r2 = rClip * rClip;
-  bool clip = rClip < 1e8f;
-  for (int by = 0; by < BH; by++) {
-    int y = by * BLK;
-    float yy = (y + 2 - cy); yy *= yy;
-    if (clip && yy > r2) continue;
-    int shift = (tear && (by % 7) < 2) ? tear * BLK : 0;
-    for (int bx = 0; bx < BW; bx++) {
-      int x = bx * BLK;
-      if (clip) { float xx = x + 2 - cx; if (xx * xx + yy > r2) continue; }
-      int bi = by * BW + bx;
-      float u = (x + 2 - 160.f) / FOCAL, v = -(y + 2 - 120.f) / FOCAL;
-      if (alienLensOn && !clip) {
-        float dx = x + 2 - alienLX, dy = y + 2 - alienLY, R = alienLR * 3.5f;
-        float r2 = dx * dx + dy * dy;
-        if (r2 < R * R) {
-          float r = sqrtf(r2), a = 1.f - r / R;
-          a = a * a * (2.2f * fsin(t * 1.7f) + 1.f);
-          float ca = fcos(a), sa = fsin(a);
-          u = (alienLX + dx * ca - dy * sa - 160.f) / FOCAL;
-          v = -(alienLY + dx * sa + dy * ca - 120.f) / FOCAL;
-        }
-      }
-      V3 d = shipB.f + shipB.r * u + shipB.u * v;
-      cv.fillRect(x + shift, y, BLK, BLK, fieldColor(l, bi, d, t));
-    }
-  }
-}
-
-// ============================================================
-//  drawing: sky, bodies, meshes, rings
-// ============================================================
-static void drawStarsReal() {
-  for (int i = 0; i < NSTARS; i++) {
-    float sx, sy;
-    if (!projectDir(stars[i].d, sx, sy) || !onScreen(sx, sy)) continue;
-    const Star &s = stars[i];
-    float tw = 0.75f + 0.25f * fsin(tNow * (1.3f + (i & 7) * 0.31f) + i);
-    int x = (int)sx, y = (int)sy;
-    if (s.mag == 0) cv.drawPixel(x, y, shade(s.col, 0.35f * tw));
-    else if (s.mag == 1) cv.drawPixel(x, y, shade(s.col, 0.75f * tw));
-    else if (s.mag == 2) cv.fillRect(x, y, 2, 2, shade(s.col, 0.85f * tw));
-    else {
-      uint16_t c = shade(s.col, tw);
-      cv.drawPixel(x, y, rgb(255, 255, 255));
-      cv.drawLine(x - 2, y, x + 2, y, shade(c, 0.6f));
-      cv.drawLine(x, y - 2, x, y + 2, shade(c, 0.6f));
-    }
-  }
-}
-
-static void drawNebulae() {
-  for (int i = 0; i < NBLOBS; i++) {
-    if (blobs[i].r <= 0) continue;
-    float sx, sy;
-    if (!projectDir(blobs[i].d, sx, sy)) continue;
-    float rr = blobs[i].r * FOCAL;
-    if (!onScreen(sx, sy, rr)) continue;
-    cv.fillCircle((int)sx, (int)sy, (int)rr, blobs[i].col);
-    cv.fillCircle((int)(sx + rr * 0.2f), (int)(sy - rr * 0.15f), (int)(rr * 0.55f), shade(blobs[i].col, 1.25f));
-  }
-}
-
-// ============================================================
-//  stars: light, not paint. A white-hot core, a halo that falls off like
-//  light does (tinted by temperature), and the camera's diffraction spikes.
-// ============================================================
-static float glowWhite = 1.f;   // how far the light runs to white near the core (cool giants: little)
-static uint16_t glowColor(uint16_t col, float k) {
-  // k: 1 at the core edge -> 0 far out. Far: the star's hue, dim. Near: toward white.
-  int r, g, b; unrgb(col, r, g, b);
-  float w = k * k * k * glowWhite;
-  return rgb((int)(r * k + (255 - r) * w), (int)(g * k + (255 - g) * w), (int)(b * k + (255 - b) * w));
-}
-
-static void drawStarGlow(float x, float y, float core, uint16_t col, float halo, float spike, int nSpikes, float spikeTurn = 0.f) {
-  if (!onScreen(x, y, halo + spike)) return;
-  if (halo > 110.f) halo = 110.f;   // the frame budget: big halos are the costliest thing we draw
-  // halo, outside in: each ring a little brighter, so the light reads as one smooth falloff
-  for (float r = halo; r > core; r -= fmaxf(1.f, r * (r > 50.f ? 0.12f : 0.085f))) {
-    float u = r / halo;
-    float k = powf(core / r, 1.15f) * (1.f - u * u * u);   // light thins to nothing at the rim: no disk edge
-    cv.fillCircle((int)x, (int)y, (int)r, glowColor(col, k * 0.95f));
-  }
-  // diffraction spikes: thin, bright at the root, fading out
-  for (int i = 0; i < nSpikes; i++) {
-    float a = spikeTurn + i * 3.1415927f / (nSpikes / 2 > 0 ? nSpikes / 2 : 1);
-    float ca = cosf(a), sa = sinf(a);
-    for (int seg = 0; seg < 3; seg++) {
-      float r0 = core + spike * seg / 3.f, r1 = core + spike * (seg + 1) / 3.f;
-      uint16_t c = glowColor(col, 0.9f - seg * 0.28f);
-      cv.drawLine((int)(x + ca * r0), (int)(y + sa * r0), (int)(x + ca * r1), (int)(y + sa * r1), c);
-      if (seg == 0) cv.drawLine((int)(x + ca * r0 - sa), (int)(y + sa * r0 + ca), (int)(x + ca * r1 - sa), (int)(y + sa * r1 + ca), glowColor(col, 0.55f));
-    }
-  }
-  cv.fillCircle((int)x, (int)y, (int)fmaxf(1.f, core), rgb(255, 255, 255));
-}
-
-// a star's face, seen up close: limb darkening and slow granulation
-static void drawStarDisk(float sx, float sy, float R, uint16_t col, const Obj *b, bool mottled) {
-  int bs = R < 30 ? 2 : (R < 90 ? 3 : 4);
-  cv.fillCircle((int)sx, (int)sy, (int)R, shade(col, mottled ? 0.55f : 0.9f));   // under the blocks: no gaps at the limb
-  int x0 = (int)clampf(sx - R, 0, W), x1 = (int)clampf(sx + R, 0, W), y0 = (int)clampf(sy - R, 0, H), y1 = (int)clampf(sy + R, 0, H);
-  int r1, g1, b1; unrgb(col, r1, g1, b1);
-  float invR = 1.f / R;
-  for (int y = y0; y < y1; y += bs) {
-    float ny = (y + bs * 0.5f - sy) * invR;
-    for (int x = x0; x < x1; x += bs) {
-      float nx = (x + bs * 0.5f - sx) * invR;
-      float q = 1.f - nx * nx - ny * ny;
-      if (q <= 0) continue;
-      float mu = sqrtf(q);
-      float gran = 1.f;
-      if (b) {
-        V3 nw = shipB.toWorld(V3{nx, -ny, -mu});
-        float lat = dot(nw, b->o.u), lon = dot(nw, b->o.r);
-        gran = mottled ? 0.72f + 0.28f * fsin(lat * 9.f + fsin(lon * 7.f + tNow * 0.2f) * 2.f) * fsin(lon * 11.f - tNow * 0.15f)
-                       : 0.95f + 0.05f * fsin(lat * 23.f + fsin(lon * 17.f + tNow * 0.3f) * 1.6f) * fsin(lon * 19.f - lat * 7.f);   // cells, not rings
-      }
-      float k = mottled ? (0.45f + 0.55f * mu) * gran : (0.78f + 0.22f * mu) * gran;
-      float hot = mottled ? 0.f : 0.35f + mu * mu * 0.5f;   // a hot star's face burns toward white
-      cv.fillRect(x, y, bs, bs, rgb((int)(r1 * k + (255 - r1) * hot), (int)(g1 * k + (255 - g1) * hot), (int)(b1 * k + (255 - b1) * hot)));
-    }
-  }
-}
-
-static bool nearStar = false;   // this system's star is a body you can fly to (drawn with the objects)
-static void drawSun() {
-  if (nearStar) return;
-  float sx, sy;
-  if (!projectDir(sunDir, sx, sy) || !onScreen(sx, sy, 90)) return;
-  //                       red dwarf  orange  yellow  white  blue    red giant  white dwarf
-  static const float core[7]  = {2.5f, 3.f,   3.5f,  3.5f,  4.5f,   0.f,      1.5f};
-  static const float halo[7]  = {20.f, 28.f,  34.f,  36.f,  52.f,   44.f,     15.f};
-  static const float spike[7] = {16.f, 26.f,  34.f,  40.f,  58.f,   10.f,     64.f};
-  float tw = 1.f + 0.03f * fsin(tNow * 7.f);
-  if (sunType == 5) {
-    // a red giant fills a patch of sky: a dim, boiling disk inside a wide red glow
-    glowWhite = 0.15f; drawStarGlow(sx, sy, 16.f, sunCol, halo[5], spike[5], 4); glowWhite = 1.f;
-    drawStarDisk(sx, sy, 17.f, sunCol, nullptr, true);
-  } else {
-    drawStarGlow(sx, sy, core[sunType] * tw, sunCol, halo[sunType] * tw, spike[sunType], 4, 0.785f);
-    if (sunType == 4 || sunType == 6) drawStarGlow(sx, sy, core[sunType], sunCol, core[sunType] + 1.f, spike[sunType] * 0.55f, 4, 0.f);
-  }
-  // lens flare ghosts along the line through the screen centre
-  float fx = 160 - sx, fy = 120 - sy;
-  static const float at[] = {0.45f, 0.9f, 1.3f, 1.75f};
-  static const int rr[] = {5, 11, 7, 17};
-  for (int i = 0; i < 4; i++) {
-    int gx = (int)(sx + fx * at[i]), gy = (int)(sy + fy * at[i]);
-    cv.drawCircle(gx, gy, rr[i], shade(sunCol, 0.22f + 0.06f * i));
-    if (i == 1) cv.drawCircle(gx, gy, rr[i] - 2, shade(sunCol, 0.14f));
-  }
-}
-
-static void drawDustReal() {
-  V3 vel = shipB.f * shipSpeed;
-  for (auto &d : dust) {
-    float x0, y0, z0, x1, y1, z1;
-    if (!project(d, x0, y0, z0)) continue;
-    if (!project(d - vel * 0.05f, x1, y1, z1)) { cv.drawPixel((int)x0, (int)y0, rgb(70, 76, 90)); continue; }
-    cv.drawLine((int)x0, (int)y0, (int)x1, (int)y1, z0 < 15 ? rgb(120, 128, 140) : rgb(62, 68, 80));
-  }
-}
-
-// subspace: stars smear into radial light, streamers flow through
-static void drawStarsDeep() {
-  float stretch = 0.02f + layer * 0.05f + shipSpeed * 0.003f;
-  float hue = layerHue(layer);
-  for (int i = 0; i < NSTARS; i += (layer >= 3 ? 1 : 2)) {
-    float sx, sy;
-    if (!projectDir(stars[i].d, sx, sy) || !onScreen(sx, sy)) continue;
-    float dx = sx - 160, dy = sy - 120;
-    uint16_t c = hsv(hue + (i % 40) * 3, 0.35f + layer * 0.12f, 0.45f + 0.4f * fsin(tNow * 2 + i));
-    cv.drawLine((int)sx, (int)sy, (int)(sx + dx * stretch), (int)(sy + dy * stretch), c);
-  }
-  if (layer == 4) {
-    // the deep cove: constellations wire themselves into a lattice
-    int px = -1, py = -1;
-    for (int i = 0; i < NSTARS; i += 9) {
-      float sx, sy;
-      if (!projectDir(stars[i].d, sx, sy) || !onScreen(sx, sy)) { px = -1; continue; }
-      if (px >= 0 && abs(px - (int)sx) + abs(py - (int)sy) < 110)
-        cv.drawLine(px, py, (int)sx, (int)sy, hsv(hue + 140 + i, 0.8f, 0.35f + 0.25f * fsin(tNow * 3 + i)));
-      px = (int)sx; py = (int)sy;
-    }
-  }
-}
-
-static void drawStreamers() {
-  if (layer < 1) return;
-  int n = layer == 1 ? 6 : (layer == 2 ? 14 : NSTREAM);
-  float spd = 1.f + shipSpeed * 0.9f;
-  for (int i = 0; i < n; i++) {
-    Streamer &s = streamers[i];
-    s.z -= spd * dt;
-    if (s.z < 2.f) { s.z += 90.f; s.x = rf(-30, 30); s.y = rf(-22, 22); s.hue = rf(0, 360); }
-    float wob = fsin(tNow * 1.3f + i) * 3.f;
-    float k0 = FOCAL / s.z, k1 = FOCAL / (s.z + s.w);
-    int x0 = (int)(160 + (s.x + wob) * k0), y0 = (int)(120 - s.y * k0);
-    int x1 = (int)(160 + (s.x + wob * 0.5f) * k1), y1 = (int)(120 - s.y * k1);
-    uint16_t c = hsv(layerHue(layer) + s.hue * (layer >= 3 ? 1.f : 0.15f), 0.8f, clampf(0.25f + 18.f / s.z, 0, 0.95f));
-    cv.drawLine(x0, y0, x1, y1, c);
-    if (s.z < 25) cv.drawLine(x0 + 1, y0, x1 + 1, y1, c);
-  }
-}
-
-// planets and giants, lit from the local star
-static void drawBody(const Obj &b) {
-  float sx, sy, z;
-  if (!project(b.p, sx, sy, z)) return;
-  float R = b.radius * FOCAL * fovPulse / z;
-  if (isStarBody(b.bodyType)) {
-    if (b.bodyType == BT_NEUTRON) {
-      // a dead star's pinprick, and the two beams it sweeps across everything
-      float a = tNow * 5.5f;
-      for (int side = -1; side <= 1; side += 2) {
-        V3 dir = norm(b.o.u * cosf(0.5f) + (b.o.r * cosf(a) + b.o.f * sinf(a)) * sinf(0.5f)) * (float)side;
-        float ex, ey, ez;
-        if (project(b.p + dir * b.radius * 60.f, ex, ey, ez)) {
-          cv.drawLine((int)sx, (int)sy, (int)ex, (int)ey, rgb(200, 170, 255));
-          cv.drawLine((int)sx + 1, (int)sy, (int)ex + 1, (int)ey, rgb(110, 80, 200));
-        }
-      }
-      drawStarGlow(sx, sy, fmaxf(1.5f, R), rgb(210, 190, 255), fmaxf(10.f, R * 4.f), 30.f, 4, tNow * 0.3f);
-      return;
-    }
-    bool giant = b.bodyType == BT_REDGIANT;
-    float halo = clampf(R * (giant ? 1.35f : b.bodyType == BT_WHITEDWARF ? 6.f : 2.1f), R + 4.f, 150.f);
-    float spike = b.bodyType == BT_WHITEDWARF ? 70.f : (giant ? 0.f : clampf(R * 1.3f, 20.f, 90.f));
-    if (R < 5.f) { drawStarGlow(sx, sy, fmaxf(1.5f, R), b.col, halo, spike, 4, 0.785f); return; }
-    glowWhite = giant ? 0.15f : 1.f;
-    if (halo > R + 6.f && R < 100.f) drawStarGlow(sx, sy, R, b.col, halo, 0.f, 0);
-    else {   // too big for a filled halo: a corona of thin rings beyond the limb (cheap, and still light)
-      for (int i = 16; i >= 1; i--) cv.drawCircle((int)sx, (int)sy, (int)(R + i * 1.6f), glowColor(b.col, 0.95f * (1.f - i / 17.f) * (1.f - i / 17.f)));
-    }
-    glowWhite = 1.f;
-    drawStarDisk(sx, sy, R, b.col, &b, giant);
-    if (spike > 0.f && R < 60.f) drawStarGlow(sx, sy, 2.f, b.col, 0.f, spike + R, 4, 0.785f);
+static void pollInput();
+static void present() {
+  if (!s_double) {
+    s_fb[0]->pushSprite(&M5.Display, 0, 0);
+    pollInput();
     return;
   }
-  if (b.bodyType == BT_WRONGSTAR && onScreen(sx, sy, R * 3.f)) {
-    // a star that is wrong: its light runs inward, its colors will not hold still,
-    // and it has an odd number of spikes, which no lens can make
-    float halo = clampf(R * 2.4f, 12.f, 150.f);
-    for (float r = halo; r > R; r -= fmaxf(1.f, r * 0.09f)) {
-      float u = r / halo, k = powf(R / r, 1.3f) * (1.f - u * u * u);
-      cv.fillCircle((int)sx, (int)sy, (int)r, hsv(layerHue(layer) + 150.f + r * 2.5f - tNow * 40.f, 0.7f, k * 0.85f));
-    }
-    for (int i = 0; i < 5; i++) {
-      float a = tNow * 0.4f + i * 1.2566371f;
-      cv.drawLine((int)sx, (int)sy, (int)(sx + cosf(a) * (R + halo)), (int)(sy + sinf(a) * (R + halo)), hsv(layerHue(layer) + i * 50.f, 0.6f, 0.95f));
-    }
-    cv.fillCircle((int)sx, (int)sy, (int)R, rgb(0, 0, 0));
-    cv.drawCircle((int)sx, (int)sy, (int)R, rgb(255, 255, 255));
-    cv.drawCircle((int)sx, (int)sy, (int)R - 1, hsv(tNow * 90.f, 0.5f, 1.f));
-    return;
-  }
-  if (R < 1.5f) { cv.drawPixel((int)sx, (int)sy, shade(b.col, 0.8f)); return; }
-  if (!onScreen(sx, sy, R)) return;
-  if (b.bodyType == BT_HOLE) {
-    float px = 0, py = 0; bool pv = false;
-    for (int s = 0; s <= 40; s++) {
-      float a = s * 0.15708f + tNow * 0.6f;
-      V3 w = b.p + (b.o.r * cosf(a) + b.o.f * sinf(a)) * (b.radius * 2.4f);
-      float x, y, zz;
-      bool ok = project(w, x, y, zz);
-      if (ok && pv) {
-        uint16_t c = hsv(25 + 20 * fsin(a * 3 + tNow * 4), 0.8f, 0.9f);
-        cv.drawLine((int)px, (int)py, (int)x, (int)y, c);
-        cv.drawLine((int)px, (int)py + 1, (int)x, (int)y + 1, shade(c, 0.6f));
-      }
-      px = x; py = y; pv = ok;
-    }
-    cv.fillCircle((int)sx, (int)sy, (int)R, rgb(0, 0, 0));
-    cv.drawCircle((int)sx, (int)sy, (int)(R * 1.08f) + 1, rgb(255, 220, 170));
-    cv.drawCircle((int)sx, (int)sy, (int)(R * 1.18f) + 1, rgb(200, 120, 60));
-    return;
-  }
-  V3 L = shipB.toLocal(b.bodyType == BT_WRONGSTAR ? norm(shipPos - b.p) : (layer == 0 ? sunDir : layerLight));
-  int bs = R < 30 ? 2 : (R < 90 ? 3 : 4);
-  int x0 = (int)clampf(sx - R, 0, W), x1 = (int)clampf(sx + R, 0, W);
-  int y0 = (int)clampf(sy - R, 0, H), y1 = (int)clampf(sy + R, 0, H);
-  float invR = 1.f / R;
-  int h1, s1, v1; unrgb(b.col, h1, s1, v1);
-  for (int y = y0; y < y1; y += bs) {
-    float ny = -(y + bs * 0.5f - sy) * invR;
-    for (int x = x0; x < x1; x += bs) {
-      float nx = (x + bs * 0.5f - sx) * invR;
-      float q = 1.f - nx * nx - ny * ny;
-      if (q <= 0) continue;
-      float nz = -sqrtf(q);
-      float lit = nx * L.x + ny * L.y + nz * L.z;
-      V3 nw = shipB.toWorld(V3{nx, ny, nz});
-      float lat = dot(nw, b.o.u), lon = dot(nw, b.o.r);
-      float pat;
-      if (b.bodyType == BT_GIANT) pat = 0.75f + 0.25f * fsin(lat * 13.f + fsin(lon * 3.f + lat * 5.f) * 0.8f + (float)(b.seed % 7));
-      else if (b.bodyType == BT_WRONGSTAR) pat = 0.8f + 0.2f * fsin(lat * 20.f + tNow * 3.f);
-      else pat = 0.7f + 0.3f * (fsin(lat * 5.f + lon * 3.f + (float)(b.seed & 15)) > 0.2f ? 1.f : 0.5f);
-      float k = b.bodyType == BT_WRONGSTAR ? 0.6f + 0.4f * pat : clampf(lit, 0.f, 1.f) * 0.9f * pat + 0.06f * pat + 0.1f * clampf(-lit, 0.f, 1.f) * (1.f - q);
-      cv.fillRect(x, y, bs, bs, rgb((int)(h1 * k), (int)(s1 * k), (int)(v1 * k)));
-    }
-  }
-  if (b.bodyType != BT_WRONGSTAR && R > 8) {   // thin lit rim on the sun side
-    float ax = L.x, ay = -L.y, al = sqrtf(ax * ax + ay * ay) + 1e-4f;
-    float base = atan2f(ay / al, ax / al);
-    for (int s = -10; s <= 10; s++) {
-      float a = base + s * 0.12f;
-      cv.drawPixel((int)(sx + cosf(a) * (R + 1)), (int)(sy + sinf(a) * (R + 1)), shade(b.col, 1.3f - fabsf((float)s) * 0.07f));
-    }
-  }
+  // wait for the LCD to finish the previous frame — and keep reading input meanwhile
+  while (xSemaphoreTake(s_dispIdle, 0) != pdTRUE) { pollInput(); vTaskDelay(1); }
+  s_pushIdx = s_cur;
+  xTaskNotifyGive(s_dispTask);
+  s_cur ^= 1;
+  g_cv = s_fb[s_cur];
 }
 
-// Livery for the next drawMesh call: side faces take the accent, the forward-top faces the canopy.
-static uint16_t meshAccent = 0, meshCanopy = 0;
-static float meshAmbient = 0.16f;   // floor light: stations are floodlit, ships readable, rocks honest
-// Surface detail without geometry: 1 = panel seams + greebles (ships), 2 = also lit windows + an emblem (stations)
-static void drawDecal(int logo, V3 up);
-static uint8_t meshDetail = 0, meshEmblem = 0;
-static uint16_t meshWindow = 0;
-// 7x7 maker's marks. Liminar: an open ring. Portex: a doorway. MaltaPlex: a cross. Freehold: a stake.
-// Deseret: a beehive.
-static const uint8_t EMBLEMS[6][7] = {
-  {0x1C, 0x22, 0x41, 0x41, 0x41, 0x22, 0x14}, {0x7F, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41},
-  {0x08, 0x08, 0x08, 0x7F, 0x08, 0x08, 0x08}, {0x7E, 0x40, 0x40, 0x7C, 0x40, 0x40, 0x40},
-  {0x1C, 0x3E, 0x00, 0x7F, 0x00, 0x7F, 0x36}, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}};
-static void drawEmblem(int cx, int cy, int which, int sc, uint16_t col) {
-  if (which < 1 || which > 5) return;
-  const uint8_t *e = EMBLEMS[which - 1];
-  for (int r = 0; r < 7; r++) for (int c = 0; c < 7; c++)
-    if (e[r] & (0x40 >> c)) cv.fillRect(cx + (c - 3) * sc + 1, cy + (r - 3) * sc + 1, sc, sc, rgb(12, 10, 16));   // a shadow: reads on any hull
-  for (int r = 0; r < 7; r++) for (int c = 0; c < 7; c++)
-    if (e[r] & (0x40 >> c)) cv.fillRect(cx + (c - 3) * sc, cy + (r - 3) * sc, sc, sc, col);
-}
-static float emblemArea = 0.f, emblemX = 0.f, emblemY = 0.f;
-static V3 decalA, decalB, decalC, decalN;   // the chosen face, in world space
-static float decalK = 1.f;                  // and how it is lit
-static V3 decalCenter; static float decalSize = 0.f;   // the whole flat panel the face belongs to
-static int decalFace = -1;
-static bool drawMesh(const Obj &ob, const Mesh &m, float scale, uint16_t base, uint16_t edgeCol, bool solid, float &outR) {
-  float sx[18], sy[18], cx, cy, zc;
-  V3 wv[18];
-  outR = 0;
-  if (!project(ob.p, cx, cy, zc)) return false;
-  outR = scale * FOCAL / zc;
-  if (outR < 1.6f) { cv.drawPixel((int)cx, (int)cy, base ? base : edgeCol); return true; }
-  if (!onScreen(cx, cy, outR * 1.5f)) return true;
-  for (int i = 0; i < m.nv; i++) {
-    wv[i] = ob.p + ob.o.toWorld(m.v[i] * scale);
-    float z;
-    if (!project(wv[i], sx[i], sy[i], z)) return false;
-  }
-  bool vis[40];
-  V3 light = layer == 0 ? sunDir : layerLight;
-  for (int f = 0; f < m.nt; f++) {
-    V3 nw = ob.o.toWorld(m.n[f]);
-    vis[f] = dot(nw, shipPos - wv[m.t[f][0]]) > 0;
-    if (!vis[f] || !solid) continue;
-    float k = meshAmbient + (1.f - meshAmbient) * clampf(dot(nw, light), 0.f, 1.f);
-    if (layer > 0) k = 0.3f + 0.7f * k;
-    uint16_t fc = base;
-    const V3 &mn = m.n[f];
-    if (meshCanopy && mn.z > 0.3f && mn.y > 0.35f) { fc = meshCanopy; k = 0.55f + 0.45f * k; }   // canopies glow a little
-    else if (meshAccent && fabsf(mn.x) > 0.72f) fc = meshAccent;
-    cv.fillTriangle((int)sx[m.t[f][0]], (int)sy[m.t[f][0]], (int)sx[m.t[f][1]], (int)sy[m.t[f][1]],
-                    (int)sx[m.t[f][2]], (int)sy[m.t[f][2]], shade(fc, k));
-    if (meshDetail) {
-      int a0 = m.t[f][0], a1 = m.t[f][1], a2 = m.t[f][2];
-      float ux = sx[a1] - sx[a0], uy = sy[a1] - sy[a0], vx = sx[a2] - sx[a0], vy = sy[a2] - sy[a0];
-      float area = fabsf(ux * vy - uy * vx) * 0.5f;
-      if (area > 40.f) {
-        uint16_t dk = shade(fc, k * 0.62f), lt = shade(fc, fminf(1.2f, k * 1.3f));
-        auto at = [&](float b1, float b2, float &x, float &y) { x = sx[a0] + ux * b1 + vx * b2; y = sy[a0] + uy * b1 + vy * b2; };
-        float px, py, qx, qy;
-        at(0.f, 0.4f, px, py); at(0.6f, 0.4f, qx, qy);                       // a panel seam across the face
-        cv.drawLine((int)px, (int)py, (int)qx, (int)qy, dk);
-        if (area > 160.f) {
-          at(0.f, 0.72f, px, py); at(0.28f, 0.72f, qx, qy); cv.drawLine((int)px, (int)py, (int)qx, (int)qy, dk);
-          at(0.22f, 0.18f, px, py); cv.fillRect((int)px, (int)py, 2, 1, lt);  // greebles
-          at(0.5f, 0.12f, px, py); cv.drawPixel((int)px, (int)py, lt);
-        }
-        if (meshDetail == 2 && meshWindow && area > 200.f && (f % 3) == 0) {   // a row of lit windows
-          for (float b = 0.1f; b < 0.62f; b += 0.08f) {
-            at(b, 0.55f, px, py);
-            uint32_t hsh = (uint32_t)(f * 31 + (int)(b * 100)) * 2654435761u;
-            if ((hsh >> 27) & 3) cv.drawPixel((int)px, (int)py, ((hsh >> 25) & 1) ? meshWindow : shade(meshWindow, 0.5f));
-          }
-        }
-        // emblems go on a side face: the front carries the dock
-        if (meshEmblem && m.n[f].z < 0.8f && area > emblemArea) {
-          emblemArea = area; emblemX = sx[a0] + ux * 0.33f + vx * 0.33f; emblemY = sy[a0] + uy * 0.33f + vy * 0.33f;
-          decalA = wv[a0]; decalB = wv[a1]; decalC = wv[a2]; decalN = ob.o.toWorld(m.n[f]); decalK = k; decalFace = f;
-        }
-      }
-    }
-  }
-  if (meshEmblem && decalFace >= 0 && decalFace < m.nt) {
-    // a flat panel is stored as several triangles: size the decal to the whole panel
-    V3 acc{0, 0, 0}; float tot = 0.f;
-    for (int f = 0; f < m.nt; f++) {
-      if (!vis[f] || dot(m.n[f], m.n[decalFace]) < 0.995f) continue;
-      V3 A = wv[m.t[f][0]], B = wv[m.t[f][1]], C = wv[m.t[f][2]];
-      float ar = len(cross(B - A, C - A)) * 0.5f;
-      acc += (A + B + C) * (ar / 3.f); tot += ar;
-    }
-    if (tot > 0.f) { decalCenter = acc * (1.f / tot); decalSize = sqrtf(tot) * 0.62f; }
-    decalFace = -1;
-  }
-  for (int e = 0; e < m.ne; e++) {
-    bool v0 = vis[m.e[e][2]], v1 = m.e[e][3] != 255 && vis[m.e[e][3]];
-    if (solid && !v0 && !v1) continue;
-    cv.drawLine((int)sx[m.e[e][0]], (int)sy[m.e[e][0]], (int)sx[m.e[e][1]], (int)sy[m.e[e][1]], (v0 || v1) ? edgeCol : shade(edgeCol, 0.35f));
-  }
+// ---------------- input ----------------
+static bool g_tapLatch = false;
+static int g_tapX = 0, g_tapY = 0;
+static bool takeTap(int &x, int &y) {
+  if (!g_tapLatch) return false;
+  g_tapLatch = false; x = g_tapX; y = g_tapY;
   return true;
 }
+static void nextMode(int dir);
+enum CalState : uint8_t { CAL_IDLE = 0, CAL_RING, CAL_RUN, CAL_DONE };
+static uint8_t s_cal = CAL_IDLE;
+static uint32_t s_calT = 0;
+static int s_calX = 0, s_calY = 0;
+static float s_calS[3]; static int s_calN = 0;
+static void btnBShort();
+static void eyePoke(int x, int y);
+static uint32_t s_bDown = 0;
+static bool s_bLong = false;
+static uint8_t s_eyeStyle = 0;                 // 0 basic, 1 cat, 2 dragon (long-press B in EYE)
+static uint32_t s_touchDown = 0;
+static int s_touchX0 = 0, s_touchY0 = 0;
+static bool s_longFired = false;
+static bool s_centreTouch = false;
 
-// ============================================================
-//  stations: built from parts, dressed in the colours of whoever built them
-// ============================================================
-enum StationStyle : uint8_t { SS_HEXCORE = 0, SS_RING, SS_SPINDLE, SS_OUTPOST, SS_CORIOLIS };
-enum Brand : uint8_t { BR_LIMINAR = 0, BR_PORTEX, BR_MALTAPLEX, BR_DESERET, BR_FREEHOLD };
-struct BrandLook { const char *name; uint16_t base, accent, light; };
-static const BrandLook &brandLook(uint8_t b) {
-  // colours taken from the corporate logo sheet
-  static const BrandLook looks[5] = {
-    {"LIMINAR", rgb(200, 206, 210), rgb(36, 168, 186), rgb(140, 240, 255)},
-    {"PORTEX", rgb(150, 162, 180), rgb(46, 74, 132), rgb(200, 230, 255)},
-    {"MALTAPLEX", rgb(178, 180, 184), rgb(232, 158, 40), rgb(255, 214, 120)},
-    {"DESERET", rgb(214, 206, 180), rgb(122, 138, 78), rgb(255, 236, 170)},
-    {"FREEHOLD", rgb(120, 124, 118), rgb(178, 98, 62), rgb(255, 170, 90)}};
-  return looks[b < 5 ? b : 4];
-}
-
-struct StationPart { uint8_t mesh; V3 off; float yaw, roll, scale; bool accent; };
-
-static int stationParts(uint8_t style, StationPart *out) {
-  int n = 0;
-  auto add = [&](uint8_t m, V3 o, float yaw, float roll, float sc, bool acc) { out[n++] = {m, o, yaw, roll, sc, acc}; };
-  switch (style) {
-    case SS_HEXCORE:
-      add(M_HEXCORE, V3{0, 0, 0}, 0, 0, 1.f, false);
-      for (int i = 0; i < 6; i++) { float a = i * 1.0471976f + 0.5235988f; add(M_MODULE, V3{cosf(a) * 0.98f, sinf(a) * 0.98f, 0.1f}, 0, a, 0.2f, true); }
-      add(M_PANEL, V3{-1.75f, 0, -0.35f}, 0, 0, 0.95f, false);
-      add(M_PANEL, V3{1.75f, 0, -0.35f}, 0, 0, 0.95f, false);
-      break;
-    case SS_RING:
-      for (int i = 0; i < 14; i++) {
-        float a = i * 0.4487989f;
-        add(M_RINGSEG, V3{cosf(a), sinf(a), 0}, 0, a, 1.f, (i % 7) == 0);
-      }
-      for (int i = 0; i < 4; i++) { float a = i * 1.5707963f + 0.785f; add(M_MODULE, V3{cosf(a) * 1.22f, sinf(a) * 1.22f, 0}, 0, a, 0.24f, true); }
-      break;
-    case SS_SPINDLE:
-      for (int i = 0; i < 5; i++) add((i & 1) ? M_OCT : M_OCTWIDE, V3{0, 0, -1.55f + i * 0.46f}, 0, i * 0.2f, 1.f, (i & 1) == 0);
-      add(M_OCT, V3{0, 0, 0.62f}, 0, 0, 0.75f, true);
-      add(M_PANEL, V3{0, 0.95f, -0.85f}, 0, 1.5707963f, 0.8f, false);
-      add(M_PANEL, V3{0, -0.95f, -0.85f}, 0, 1.5707963f, 0.8f, false);
-      break;
-    case SS_OUTPOST:
-      add(M_MODULE, V3{0, 0, 0}, 0, 0, 1.f, false);
-      add(M_MODULE, V3{0, -0.42f, -0.55f}, 1.5707963f, 0, 0.75f, true);
-      add(M_PANEL, V3{-1.1f, 0.15f, -0.2f}, 0, 0.25f, 0.8f, false);
-      add(M_PANEL, V3{1.1f, 0.15f, -0.2f}, 0, -0.25f, 0.8f, false);
-      break;
-    default:
-      add(M_STATION, V3{0, 0, 0}, 0, 0, 1.f, false);
-      break;
-  }
-  return n;
-}
-
-// where the dock gate sits in front of a station, in units of its radius
-static float stationDockFront(uint8_t style) {
-  switch (style) { case SS_RING: return 0.f; case SS_SPINDLE: return 1.35f; case SS_OUTPOST: return 1.9f; case SS_HEXCORE: return 1.75f; default: return 1.73f; }
-}
-
-// each class wears a two-tone hull and a lit canopy, like ours, in its own colours
-static bool liveryOn = true;
-// returns the hull colour (0 = keep the ship's own)
-static uint16_t shipLivery(const Obj &o) {
-  meshAccent = meshCanopy = 0;
-  if (!liveryOn) return 0;
-  if (o.ghost) { meshAccent = rgb(26, 30, 36); meshCanopy = rgb(190, 235, 225); return rgb(92, 100, 110); }
-  switch (o.enc) {
-    case sm::ENC_TRAVELER:  meshAccent = rgb(0, 115, 115);  meshCanopy = rgb(150, 225, 30);  return rgb(214, 204, 178);
-    case sm::ENC_MERCHANT:  meshAccent = rgb(214, 132, 38); meshCanopy = rgb(255, 214, 120); return rgb(226, 218, 196);
-    case sm::ENC_SECURITY:  meshAccent = rgb(40, 70, 150);  meshCanopy = rgb(140, 220, 255); return rgb(222, 228, 236);
-    case sm::ENC_PIRATE:    meshAccent = rgb(34, 28, 28);   meshCanopy = rgb(255, 70, 50);   return rgb(178, 92, 64);
-    case sm::ENC_SUBPIRATE: meshAccent = rgb(93, 0, 93);    meshCanopy = rgb(255, 120, 255); return rgb(132, 116, 150);
-    default: return 0;
-  }
-}
-
-static void drawStationObj(const Obj &st) {
-  uint8_t style = st.bodyType;
-  const BrandLook &bl = brandLook(st.uses);
-  StationPart parts[24];
-  int n = stationParts(style, parts);
-  // world placement for each part, then far to near
-  Obj tmp[24]; float pz[24]; int ord[24];
-  for (int i = 0; i < n; i++) {
-    const StationPart &pp = parts[i];
-    tmp[i] = st;
-    tmp[i].p = st.p + st.o.toWorld(pp.off * st.radius);
-    Basis b = st.o;
-    if (pp.roll != 0.f) b.roll(pp.roll);
-    if (pp.yaw != 0.f) b.yaw(pp.yaw);
-    if (pp.mesh == M_RINGSEG) {   // segments run along the ring's tangent, their top facing outward
-      V3 radial = norm(tmp[i].p - st.p);
-      b = Basis::facing(norm(cross(st.o.f, radial)), radial);
-    }
-    b.fix();
-    tmp[i].o = b;
-    V3 c = shipB.toLocal(tmp[i].p - shipPos);
-    pz[i] = c.z; ord[i] = i;
-  }
-  for (int i = 1; i < n; i++) { int k = ord[i]; int j = i - 1; while (j >= 0 && pz[ord[j]] < pz[k]) { ord[j + 1] = ord[j]; j--; } ord[j + 1] = k; }
-  float outR;
-  for (int q = 0; q < n; q++) {
-    int i = ord[q];
-    const StationPart &pp = parts[i];
-    meshAccent = (pp.accent || style == SS_RING) ? 0 : bl.accent;
-    meshAmbient = 0.45f;
-    meshDetail = pp.mesh == M_PANEL ? 1 : 2; meshWindow = bl.light;
-    bool core = pp.mesh == M_HEXCORE || (style == SS_SPINDLE && pp.mesh == M_OCTWIDE && i == 2) || (style == SS_OUTPOST && i == 0) || (style == SS_RING && pp.accent && pp.mesh == M_RINGSEG);
-    meshEmblem = core ? (uint8_t)(st.uses + 1) : 0;
-    if (core) { emblemArea = 0.f; decalSize = 0.f; }
-    uint16_t base = pp.accent ? bl.accent : (pp.mesh == M_PANEL ? rgb(40, 52, 84) : bl.base);
-    uint16_t edge = pp.mesh == M_PANEL ? rgb(90, 120, 170) : shade(base, 1.25f);
-    drawMesh(tmp[i], meshes[pp.mesh], st.radius * pp.scale, base, edge, true, outR);
-    if (meshEmblem && emblemArea > 110.f) {
-      static const int8_t brandLogo[5] = {LOGO_LIMINAR, -1, LOGO_MALTAPLEX, LOGO_DESERET, LOGO_FREEHOLD};
-      int lg = st.uses < 5 ? brandLogo[st.uses] : -1;
-      if (lg >= 0) drawDecal(lg, st.o.u);
-      else drawEmblem((int)emblemX, (int)emblemY, meshEmblem, emblemArea > 700.f ? 2 : 1, bl.light);
-    }
-    meshAccent = 0; meshAmbient = 0.16f; meshDetail = 0; meshEmblem = 0; meshWindow = 0;
-  }
-  float sx, sy, z;
-  if (!project(st.p, sx, sy, z)) return;
-  float R = st.radius * FOCAL / z;
-  bool blink = ((int)(tNow * 2.f) & 1) != 0;
-  // the dock: a lit slot, collar, or the ring's own heart
-  if (style == SS_HEXCORE || style == SS_CORIOLIS) {
-    float fx, fy, fz;
-    if (project(st.p + st.o.f * st.radius * (style == SS_HEXCORE ? 0.87f : 0.98f), fx, fy, fz) && dot(st.o.f, shipPos - st.p) > 0) {
-      int w = (int)clampf(st.radius * 0.5f * FOCAL / fz, 2, 80), h = w / 3 + 1;
-      cv.fillRect((int)fx - w / 2, (int)fy - h / 2, w, h, rgb(4, 6, 10));
-      cv.drawRect((int)fx - w / 2, (int)fy - h / 2, w, h, blink ? bl.light : shade(bl.light, 0.45f));
-    }
-  } else if (style == SS_SPINDLE) {
-    float fx, fy, fz;
-    if (project(st.p + st.o.f * st.radius * 0.8f, fx, fy, fz)) cv.drawCircle((int)fx, (int)fy, (int)clampf(st.radius * 0.22f * FOCAL / fz, 2, 40), blink ? bl.light : shade(bl.light, 0.5f));
-  } else if (style == SS_OUTPOST) {
-    float fx, fy, fz;
-    if (project(st.p + st.o.f * st.radius * 0.45f, fx, fy, fz)) cv.fillCircle((int)fx, (int)fy, blink ? 2 : 1, bl.light);
-  }
-  // running lights at the extremities
-  if (R > 6) {
-    for (int i = 0; i < 4; i++) {
-      float a = i * 1.5707963f + (style == SS_RING ? 0.f : 0.785f);
-      float rr = style == SS_RING ? 1.12f : (style == SS_OUTPOST ? 1.6f : 1.05f);
-      float lx, ly, lz;
-      if (project(st.p + (st.o.r * cosf(a) + st.o.u * sinf(a)) * (st.radius * rr), lx, ly, lz) && ((i + (int)(tNow * 3.f)) & 1))
-        cv.drawPixel((int)lx, (int)ly, i < 2 ? rgb(255, 60, 50) : rgb(80, 255, 120));
+static void pollInput() {
+  if (g_mode == MODE_MEDITATE) {                          // ~250 Hz motion sampling for breath + heart
+    static uint32_t lastUs = 0;
+    uint32_t us = micros();
+    if (us - lastUs >= 4000 && M5.Imu.update()) {
+      auto d = M5.Imu.getImuData();
+      float dts = lastUs ? (us - lastUs) / 1e6f : 0.004f; if (dts > 0.05f) dts = 0.05f;
+      lastUs = us;
+      medSample(d.accel.x, d.accel.y, d.accel.z, dts);
     }
   }
-  // the maker's mark
-  if (R > 14 && R < 400) {
-    cv.setTextColor(bl.accent == rgb(46, 74, 132) ? rgb(150, 180, 230) : bl.light);
-    int tw = (int)strlen(bl.name) * 6;
-    cv.setCursor((int)sx - tw / 2, (int)clampf(sy + R * 1.15f + 4, 0, 200)); cv.print(bl.name);
-  }
-}
-
-// ============================================================
-//  decals: a logo baked onto a face in perspective. Each texel is placed on the
-//  face's own plane, oriented to the station's up, and lit with the face.
-// ============================================================
-// a logo straight onto the screen (board headers)
-static void drawLogoFlat(int x, int y, int logo) {
-  if (logo < 0 || logo >= LOGO_COUNT) return;
-  for (int j = 0; j < LOGO_SIZE; j++) for (int i = 0; i < LOGO_SIZE; i++) { uint16_t c = LOGOS[logo][j * LOGO_SIZE + i]; if (c) cv.drawPixel(x + i, y + j, c); }
-}
-
-static void drawDecal(int logo, V3 up) {
-  if (logo < 0 || logo >= LOGO_COUNT) return;
-  V3 n = norm(decalN);
-  V3 c = decalCenter;
-  float size = decalSize;
-  if (size <= 0.f) {   // fallback: the triangle alone
-    c = (decalA + decalB + decalC) * (1.f / 3.f);
-    float la = len(decalB - decalC), lb = len(decalC - decalA), lc = len(decalA - decalB);
-    float area3 = len(cross(decalB - decalA, decalC - decalA)) * 0.5f;
-    size = 2.f * area3 / (la + lb + lc + 1e-4f) * 1.35f;
-  }
-  V3 e2 = up - n * dot(up, n);
-  if (len(e2) < 1e-3f) e2 = decalB - decalA - n * dot(decalB - decalA, n);
-  e2 = norm(e2);
-  V3 e1 = cross(n, e2);
-  float cx, cy, cz;
-  if (!project(c, cx, cy, cz)) return;
-  float px = size * FOCAL / cz / LOGO_SIZE;   // screen size of one texel
-  int ts = (int)ceilf(px);
-  if (px < 0.45f) return;                       // too far: nothing would read
-  if (ts < 1) ts = 1;
-  float k = clampf(0.55f + 0.5f * decalK, 0.55f, 1.05f);
-  const uint16_t *img = LOGOS[logo];
-  for (int y = 0; y < LOGO_SIZE; y++) {
-    float v = 0.5f - (y + 0.5f) / LOGO_SIZE;
-    for (int x = 0; x < LOGO_SIZE; x++) {
-      uint16_t col = img[y * LOGO_SIZE + x];
-      if (!col) continue;
-      float u = (x + 0.5f) / LOGO_SIZE - 0.5f;
-      float sx, sy, sz;
-      if (!project(c + e1 * (u * size) + e2 * (v * size) + n * 0.05f, sx, sy, sz)) continue;
-      cv.fillRect((int)(sx - px * 0.5f), (int)(sy - px * 0.5f), ts, ts, k < 0.99f ? shade(col, k) : col);
-    }
-  }
-}
-
-// A ring in 3D: gates and portals are real hoops, seen at an angle.
-static void drawRing(const Obj &g, float R, uint16_t col, int segs, float jitter, float phase, int thick) {
-  float px = 0, py = 0; bool pv = false;
-  for (int s = 0; s <= segs; s++) {
-    float a = s * 6.2831853f / segs;
-    float rr = R * (1.f + jitter * fsin(a * 5.f + phase) + jitter * 0.6f * fsin(a * 11.f - phase * 1.7f));
-    V3 w = g.p + (g.o.r * fcos(a) + g.o.u * fsin(a)) * rr;
-    float x, y, z;
-    bool ok = project(w, x, y, z);
-    if (ok && pv) {
-      cv.drawLine((int)px, (int)py, (int)x, (int)y, col);
-      if (thick > 1) cv.drawLine((int)px + 1, (int)py, (int)x + 1, (int)y, col);
-      if (thick > 2) cv.drawLine((int)px, (int)py + 1, (int)x, (int)y + 1, shade(col, 0.7f));
-    }
-    px = x; py = y; pv = ok;
-  }
-}
-
-// ============================================================
-//  fx
-// ============================================================
-struct Boom { V3 p; float t, size; uint16_t col; bool alive; };
-static Boom booms[6];
-static void addBoom(V3 p, float size, uint16_t col) {
-  for (auto &b : booms) if (!b.alive) { b = {p, 0, size, col, true}; return; }
-  booms[0] = {p, 0, size, col, true};
-}
-struct Bolt { float x0, y0, x1, y1; uint8_t life; uint16_t col; };
-static Bolt bolts[10];
-static uint8_t boltN = 0;
-static void addBolt(float x0, float y0, float x1, float y1, uint16_t col) {
-  if (boltN < 10) bolts[boltN++] = {x0, y0, x1, y1, 7, col};
-}
-
-// ============================================================
-//  the long arc and the money
-// ============================================================
-// Where you are, so a power cycle picks up right here.
-struct Session {
-  uint32_t magic;
-  uint8_t layer, station, docked, pad;
-  sm::Trip trip;
-  char here[24], origin[24];
-  float throttle;
-};
-static const uint32_t SESSION_MAGIC = 0x53455331u;   // "SES1"
-static bool sdDirty = false;
-static uint32_t sdLastWrite = 0;
-static uint8_t journalSeen = 0, journalHeadSeen = 0;
-static void captureSession(Session &ss);
-static void saveSessionNVS() {
-  Session ss; captureSession(ss);
-  Preferences prefs;
-  if (prefs.begin("sm_sess", false)) { prefs.putBytes("s", &ss, sizeof(ss)); prefs.end(); }
-}
-static void saveAll() {
-  sm::sheetSave(); sm::contractsSave(); sm::atlasSave(); sm::journalSave();
-  saveSessionNVS();
-  sdDirty = true;   // the card catches up within a moment (see serviceSD)
-  lastSave = millis();
-}
-static void serviceSD(bool force) {
-  if (!sm::sdReady() || !sdDirty) return;
-  if (!force && millis() - sdLastWrite < 1500) return;
-  Session ss; captureSession(ss);
-  if (sm::sdSaveGame(&ss, sizeof(ss))) {
-    sdDirty = false; sdLastWrite = millis();
-    if (sm::journal().count != journalSeen || sm::journal().head != journalHeadSeen) {
-      sm::sdWriteJournalText(); journalSeen = sm::journal().count; journalHeadSeen = sm::journal().head;
-    }
-  }
-}
-
-static void onDestroyedFlow();
-static bool checkDestroy() {
-  bool died = sm::sheet().lives > livesSeen;
-  if (died) onDestroyedFlow();
-  livesSeen = sm::sheet().lives;
-  return died;
-}
-static bool damage(int amount) {
-  if (amount > 0) {
-    sm::damageHull((uint16_t)amount);
-    hx::thud(clampf(amount / 25.f, 0.35f, 1.f));
-    hitFlash = 0.35f;
-  }
-  return checkDestroy();
-}
-
-// A way through the deep is worth real money; a shallow hop is infrastructure.
-static int routeValue(uint8_t depth, bool unknown) {
-  static const int base[] = {0, 0, 90, 280, 700};
-  int v = base[depth > 4 ? 4 : depth];
-  if (unknown) v = v * 3 / 2;
-  return v;
-}
-// Charting a deep landmark first time is the big score of the explorer's trade.
-static int chartValue(uint8_t band) { return 70 * band * band; }
-
-static bool endingOpen = false;
-static bool lostOpen = false;
-static bool bootOpen = true;  // title card until first tap
-static bool statusOpen = false;  // long-press C: pilot license + ship diagnostic (visual reference only)
-static uint8_t statusPage = 0;   // 0 license + diagnostic, 1 journal + active lead (hold C)
-static float newGameHold = 0, newGameDone = 0;   // splash: hold A + C
-// Something in the deep, below the roads. Rare; no damage; you never see it clearly.
-struct AlienEncounter { bool active; uint8_t cls, outcome; float t, beatA, beatB, beatC; V3 p; bool applied; };
-static AlienEncounter alien{};
-static float alienPending = -1.f;       // seconds until it arrives (scheduled on entering a layer)
-static float alienCooldown = 0.f;       // game seconds before another can come
-static inline bool alienHolds() { return alien.active && alien.t >= 4.f && alien.t < 28.f; }   // power is out
-static bool mapOpen = false;     // long-press A: the atlas (visual reference only)
-static uint8_t mapPage = 0;      // 0 subspace memory, 1 this system (hold A again)
-static int mapTrace = -1;        // atlas place traced from here
-static char tripOrigin[24] = ""; // where the current trip began
-static char endingName[24] = "";
-static void showRecognition(const sm::Landmark *lm) {
-  asciiCopy(endingName, sizeof(endingName), lm->name); upcase(endingName);
-  if (!sm::flagHas("deep_small")) {
-    sm::flagSet("deep_small", 1, true);
-    endingOpen = true;
-    hx::cut(0.4f);
-  } else {
-    char b[112]; snprintf(b, sizeof(b), "%s. YOU KNOW THIS PLACE FROM ANOTHER SKY.", endingName);
-    setBanner(b, 3200);
-  }
-}
-
-// ============================================================
-//  gates, portals, trips
-// ============================================================
-static bool dueHereNow() { return layer == 0 && sm::contractDueHere(hereName); }   // deliveries are paid at surface docks
-
-static uint16_t gateColor(const Obj &g) {
-  if (g.kind == K_DOCKGATE) return dueHereNow() ? rgb(240, 200, 90) : rgb(70, 150, 255);
-  if (g.gflags & GF_JOB) return rgb(240, 200, 90);
-  if (g.gflags & GF_FIXED) return rgb(185, 160, 255);        // charted deep landmark: lilac, never job-gold
-  if (g.gflags & GF_LOCALNAME) return rgb(230, 175, 80);
-  if (g.gflags & GF_CHAIN) return layer == 0 ? rgb(110, 240, 200) : hsv(layerHue(layer) + 60, 0.55f, 0.95f);
-  if (g.gflags & GF_RUMOR) return rgb(80, 225, 215);
-  if (g.gflags & GF_KNOWN) return rgb(110, 230, 150);
-  return rgb(150, 150, 170);
-}
-
-
-// Gates only live in empty space: push a candidate point clear of fat world objects.
-static bool gateBlocked(V3 p, float gateR, int ignoreIdx = -1) {
-  float need = gateR + 12.f;
-  for (int i = 0; i < MAX_OBJ; i++) {
-    if (i == ignoreIdx) continue;
-    const Obj &o = objs[i];
-    if (o.kind == K_NONE) continue;
-    // thin contacts / debris can share sky; fat volumes cannot swallow a ring
-    if (o.kind != K_BODY && o.kind != K_LANDMARK && o.kind != K_STATION && o.kind != K_ROCK
-        && o.kind != K_GATE && o.kind != K_PORTAL && o.kind != K_DOCKGATE) continue;
-    float minD = o.radius + need;
-    // giants: stay outside atmosphere-ish volume (scoop band is ~0.45R; use 0.55R margin)
-    if (o.kind == K_BODY) minD = o.radius * 0.55f + need;
-    if (o.kind == K_LANDMARK) minD = o.radius * 1.15f + need;
-    if (o.kind == K_STATION) minD = o.radius * 1.5f + need;
-    if (len(p - o.p) < minD) return true;
-  }
-  return false;
-}
-
-static V3 emptyGatePoint(V3 p, float gateR) {
-  if (!gateBlocked(p, gateR)) return p;
-  // nudge along / across the approach until the ring sits in clear sky
-  V3 f = shipB.f, r = shipB.r, u = shipB.u;
-  const float steps[] = { 20.f, 40.f, 60.f, 90.f, 120.f, 160.f };
-  const float lats[] = { 0.f, 35.f, -35.f, 70.f, -70.f, 100.f, -100.f };
-  const float verts[] = { 0.f, 25.f, -25.f, 50.f, -50.f };
-  for (float d : steps)
-    for (float lat : lats)
-      for (float vert : verts) {
-        V3 q = p + f * d + r * lat + u * vert;
-        if (!gateBlocked(q, gateR)) return q;
-        q = p - f * (d * 0.35f) + r * lat + u * vert;
-        if (!gateBlocked(q, gateR)) return q;
-      }
-  // last resort: far off the right wing, past typical giant radii
-  return p + r * 220.f + f * 40.f + u * 30.f;
-}
-
-static Obj *spawnGate(V3 p, V3 facing, const char *name, uint8_t depth, uint8_t flags, float R) {
-  Obj *g = newObj(K_GATE);
-  if (!g) return nullptr;
-  p = emptyGatePoint(p, R);
-  g->p = p; g->o = Basis::facing(facing, V3{0, 1, 0}); g->radius = R;
-  g->gflags = flags; g->depth = depth;
-  asciiCopy(g->name, sizeof(g->name), name); upcase(g->name);
-  g->prevSide = dot(shipPos - g->p, g->o.f);
-  return g;
-}
-
-// the deep is smaller: gates come closer together the further down you are
-static float legSpacing() { return layer == 0 ? 95.f : clampf(125.f - layer * 18.f, 55.f, 125.f); }
-
-static V3 aheadPoint(float dist, float lat, float vert) {
-  return shipPos + shipB.f * dist + shipB.r * lat + shipB.u * vert;
-}
-
-static void spawnNextOnPath() {
-  sm::Trip &tr = sm::trip();
-  if (!tr.active) return;
-  float d = legSpacing();
-  V3 p = aheadPoint(d, rf(-0.36f, 0.36f) * d, rf(-0.22f, 0.22f) * d);
-  Obj *o;
-  if (sm::tripPortalReady()) {
-    o = newObj(K_PORTAL);
-    if (!o) return;
-    o->p = emptyGatePoint(p + shipB.f * 25.f, 13.f);
-    o->o = Basis::facing(norm(o->p - shipPos), shipB.u);
-    o->radius = 13.f;
-    o->prevSide = dot(shipPos - o->p, o->o.f);
-    snprintf(o->name, sizeof(o->name), "%s", sm::tripPortalGoesUp() ? "PORTAL UP" : "PORTAL DOWN");
-    setBanner(sm::tripPortalGoesUp() ? "A PORTAL TEARS OPEN - THE WAY UP" : "A PORTAL TEARS OPEN AHEAD", 1800);
-    hx::swell(0.35f, 0.5f, 0.6f);
-  } else {
-    char label[24];
-    uint8_t flags = GF_CHAIN;
-    if (layer == 4) {
-      // the deep cove keeps its own local names, the same in every universe
-      uint32_t key = 0xD33Fu + tr.legs * 7u + tr.step * 3u + (tr.ascending ? 101u : 0u);
-      asciiCopy(label, sizeof(label), sm::deepName(key));
-      flags |= GF_LOCALNAME;
-    } else snprintf(label, sizeof(label), "%s", tr.dest);
-    o = spawnGate(p, norm(p - shipPos), label, tr.destDepth, flags, 8.5f);
-  }
-  navObj = idxOf(o);
-}
-
-// ---- scenes ----
-// A stable number for a place name in this universe: its sky, its star, its dock.
-static uint32_t placeHash(const char *name) {
-  // sheet().universeSeed is fixed for a universe (universeSeed() is the running RNG state)
-  uint32_t h = 2166136261u ^ sm::sheet().universeSeed;
-  for (const char *c = name; c && *c; c++) { h ^= (uint8_t)(*c >= 'a' && *c <= 'z' ? *c - 32 : *c); h *= 16777619u; }
-  h ^= h >> 15; h *= 0x2C1B3C6Du; h ^= h >> 12;
-  return h;
-}
-
-static uint8_t makeLook(uint8_t style, uint8_t brand) { return (uint8_t)(0x80 | (style & 7) | ((brand & 7) << 3)); }
-
-// Who built the dock here: decided once per place and remembered until the wipe.
-// Far places (deep-rated) are more often Freehold outposts.
-static uint8_t stationLookFor(const char *place) {
-  int ai = sm::atlasFind(place);
-  if (ai >= 0 && sm::atlas().place[ai].look) return sm::atlas().place[ai].look;
-  bool far = ai >= 0 && sm::atlas().place[ai].depth >= 2;
-  uint32_t r = placeHash(place) % 100;
-  uint8_t look;
-  if (r < (uint32_t)(far ? 38 : 10)) look = makeLook(SS_OUTPOST, BR_FREEHOLD);
-  else {
-    uint32_t q = (r * 7u) % 100;
-    look = q < 36 ? makeLook(SS_HEXCORE, BR_LIMINAR) : q < 70 ? makeLook(SS_RING, BR_MALTAPLEX) : makeLook(SS_SPINDLE, BR_PORTEX);
-  }
-  if (ai >= 0) sm::atlas().place[ai].look = look;
-  return look;
-}
-
-static void placeStation(V3 p, V3 facing, uint8_t look = 0) {
-  Obj *st = newObj(K_STATION);
-  if (!st) return;
-  if (!look) look = stationLookFor(hereName);
-  uint8_t style = look & 7, brand = (look >> 3) & 7;
-  static const float radius[] = {24.f, 32.f, 26.f, 11.f, 22.f};
-  st->p = p; st->o = Basis::facing(facing, V3{0, 1, 0}); st->radius = radius[style < 5 ? style : 0]; st->mesh = M_STATION;
-  st->spin = style == SS_OUTPOST ? 0.1f : 0.22f; st->col = rgb(150, 160, 175); st->enc = sm::ENC_STATION;
-  st->bodyType = style; st->uses = brand;
-  static const char *kindName[] = {"HEXCORE", "RING", "SPINDLE", "OUTPOST", "STATION"};
-  snprintf(st->name, sizeof(st->name), "%s %s", brandLook(brand).name, kindName[style < 5 ? style : 4]);
-  Obj *dg = newObj(K_DOCKGATE);
-  if (!dg) { st->kind = K_NONE; return; }
-  dg->p = p + st->o.f * (stationDockFront(style) * st->radius); dg->o = st->o;
-  dg->radius = style == SS_RING ? st->radius * 0.55f : (style == SS_OUTPOST ? 5.5f : 7.f);
-  snprintf(dg->name, sizeof(dg->name), "DOCK");
-  dg->prevSide = dot(shipPos - dg->p, dg->o.f);
-  st->link = idxOf(dg); dg->link = idxOf(st);
-}
-
-static bool isRumor(const char *name) {
-  for (uint8_t r = 0; r < sm::rumorCount(); r++) {
-    const sm::NameTag *t = sm::rumorAt(r);
-    if (!t) continue;
-    char up[24]; asciiCopy(up, sizeof(up), t->name); upcase(up);
-    char nm[24]; asciiCopy(nm, sizeof(nm), name); upcase(nm);
-    if (strcmp(up, nm) == 0) return true;
-  }
-  return false;
-}
-
-static const sm::Landmark *landmarkNamed(const char *name);
-
-// Named gates fan out across your view, the way a harbour lays out its lanes.
-static void placeDestGates(int want, V3 avoidDir = V3{0, 0, 0}) {
-  (void)want;   // a place keeps its own lanes until a wipe (see atlas)
-  sm::AtlasLane lanes[8];
-  int n = sm::atlasLanesHere(lanes, 8);
-  sm::Contract &c = sm::contract();
-  const char *names[8]; const char *vias[8] = {nullptr}; uint8_t depths[8], flags[8]; int m = 0;
-  for (int i = 0; i < n && m < 6; i++) {
-    names[m] = lanes[i].name; depths[m] = lanes[i].depth; vias[m] = lanes[i].via[0] ? lanes[i].via : nullptr;
-    flags[m] = GF_DEST | (lanes[i].fixed ? GF_FIXED : 0) |
-               (lanes[i].visited ? GF_KNOWN : (lanes[i].rumor ? GF_RUMOR : GF_UNKNOWN));
-    if (c.live && c.dest[0] && sm::sameName(lanes[i].name, c.dest)) flags[m] |= GF_JOB;   // the lane your job runs down
-    m++;
-  }
-  float span = 2.3f;                       // about 130 degrees of sky
-  for (int k = 0; k < m; k++) {
-    float a = -span * 0.5f + span * (k + 0.5f) / m + rf(-0.08f, 0.08f);
-    float el = ((k & 1) ? 0.16f : -0.12f) + rf(-0.06f, 0.06f);
-    V3 dir = norm(shipB.f * cosf(a) + shipB.r * sinf(a) + shipB.u * el);
-    if (len(avoidDir) > 0.5f && dot(dir, avoidDir) > 0.97f) dir = norm(dir + shipB.u * 0.35f);   // keep clear of the dock
-    V3 p = shipPos + dir * rf(105, 150);
-    Obj *g = spawnGate(p, norm(shipPos - p), names[k], depths[k], flags[k], 9.f);
-    if (g) {
-      const sm::Landmark *hub = (flags[k] & GF_FIXED) ? landmarkNamed(names[k]) : landmarkNamed(vias[k]);
-      if (hub) g->lmId = (int)hub->id;          // the landmark this gate goes to, or runs past
-    }
-  }
-}
-
-static void spawnBody(uint8_t type, float dist, float radius, V3 dir) {
-  Obj *b = newObj(K_BODY);
-  if (!b) return;
-  b->bodyType = type; b->radius = radius;
-  b->p = shipPos + norm(dir) * dist;
-  b->o = Basis::facing(randDir(), randDir());
-  b->enc = sm::ENC_LANDMARK_GIANT;
-  if (type == BT_GIANT) {
-    static const uint16_t pal[] = {rgb(210, 170, 120), rgb(150, 190, 220), rgb(200, 140, 110), rgb(170, 200, 160), rgb(220, 200, 160)};
-    b->col = pal[rnd() % 5];
-    asciiCopy(b->name, sizeof(b->name), sm::encounterFlavor(sm::ENC_LANDMARK_GIANT, (uint8_t)layer).name);
-  } else if (type == BT_ROCKY) {
-    static const uint16_t pal[] = {rgb(170, 140, 110), rgb(120, 140, 170), rgb(190, 110, 80), rgb(150, 150, 140)};
-    b->col = pal[rnd() % 4];
-    snprintf(b->name, sizeof(b->name), "WORLD");
-  } else if (type == BT_HOLE) {
-    b->col = rgb(0, 0, 0);
-    snprintf(b->name, sizeof(b->name), "COLLAPSED STAR");
-  } else {
-    b->col = hsv(layerHue(layer) + 150, 0.6f, 0.9f);
-    snprintf(b->name, sizeof(b->name), "IMPOSSIBLE STAR");
-  }
-}
-
-static void spawnRock(V3 p, float r) {
-  Obj *o = newObj(K_ROCK);
-  if (!o) return;
-  o->p = p; o->radius = r; o->mesh = (uint8_t)(M_ROCK0 + ri(0, 5));
-  o->o = Basis::facing(randDir(), randDir());
-  o->spin = rf(-0.4f, 0.4f); o->col = hsv(rf(20, 40), rf(0.2f, 0.4f), rf(0.45f, 0.65f));
-  o->uses = (uint8_t)ri(1, 3); o->enc = sm::ENC_LANDMARK_ROCK;
-  asciiCopy(o->name, sizeof(o->name), sm::encounterFlavor(sm::ENC_LANDMARK_ROCK, (uint8_t)layer).name);
-}
-
-static void makeRealScene(const char *place, bool station) {
-  clearWorld();
-  target = -1; navObj = -1; dockTarget = -1;
-  asciiCopy(hereName, sizeof(hereName), place && place[0] ? place : sm::placeName(sm::urand(), 0, false));
-  upcase(hereName);
-  buildSky(placeHash(hereName));   // a place keeps its sky (and its star) until the wipe
-  sm::contractSetHere(hereName);
-  sm::contractSetBand(0);
-  { sm::Atlas &at = sm::atlas();
-    if (at.here == 255 || !sm::sameName(at.place[at.here].name, hereName)) sm::atlasVisit(hereName, nullptr, 1, false);
-    if (at.here != 255) {
-      sm::AtlasPlace &ap = at.place[at.here];
-      if (ap.flags & sm::AP_STATION_SET) station = (ap.flags & sm::AP_HAS_STATION) != 0;
-      else ap.flags |= (uint8_t)(sm::AP_STATION_SET | (station ? sm::AP_HAS_STATION : 0));
-    } }
-  shipPos = V3{0, 0, 0}; prevShipPos = shipPos;
-  shipB = Basis::facing(V3{0, 0, 1}, V3{0, 1, 0});
-  layer = 0;
-  resetDust();
-  // sometimes the star is near enough to fly to; a rare cool one can even be scooped (it burns)
-  {
-    uint32_t h = placeHash(hereName) >> 7;
-    nearStar = (h % 100) < 38;
-    if (nearStar) {
-      static const float rad[7] = {90.f, 120.f, 150.f, 170.f, 230.f, 520.f, 14.f};
-      uint8_t bt = sunType == 5 ? BT_REDGIANT : (sunType == 6 ? BT_WHITEDWARF : BT_STAR);
-      spawnBody(bt, rad[sunType] * 9.f + 900.f, rad[sunType], sunDir);
-      for (auto &o : objs) if (o.kind == K_BODY && isStarBody(o.bodyType)) {
-        o.col = sunCol;
-        o.uses = (sunType <= 1 && ((h >> 9) % 100) < 40) ? 1 : 0;   // scoopable: cool and rare
-        static const char *sn[7] = {"RED DWARF", "ORANGE STAR", "YELLOW STAR", "WHITE STAR", "BLUE GIANT", "RED GIANT", "WHITE DWARF"};
-        snprintf(o.name, sizeof(o.name), "%s", sn[sunType]);
-      }
-    }
-  }
-  // a giant to scoop, or a world; with no dock there is always a giant
-  bool giant = !station || rf(0, 1) < 0.6f;
-  V3 side = norm(shipB.f * rf(0.3f, 0.8f) + shipB.r * (rf(0, 1) < 0.5f ? -1.f : 1.f) + shipB.u * rf(-0.4f, 0.4f));
-  if (giant) spawnBody(BT_GIANT, rf(520, 820), rf(170, 290), side);
-  else spawnBody(BT_ROCKY, rf(600, 900), rf(120, 220), side);
-  V3 stationDir{0, 0, 0};
-  if (station) {
-    stationDir = norm(shipB.f + shipB.r * rf(-0.3f, 0.3f) + shipB.u * rf(-0.15f, 0.15f));
-    V3 sp = shipPos + stationDir * 190.f;
-    placeStation(sp, norm(shipPos - sp + shipB.r * 40.f));
-  }
-  placeDestGates(ri(3, 5), stationDir);
-  if (rf(0, 1) < 0.45f) {
-    V3 c = shipPos + randDir() * 60.f + shipB.f * 200.f;
-    int n = ri(5, 8);
-    for (int i = 0; i < n; i++) spawnRock(c + randDir() * rf(8, 45), rf(2.5f, 8.f));
-  }
-  spawnTimer = rf(4, 8);
-}
-
-static const sm::Landmark *landmarkNamed(const char *name) {
-  if (!name || !name[0]) return nullptr;
-  for (int i = 0; i < sm::landmarkCount(); i++) { const sm::Landmark *lm = sm::landmarkAt(i); if (lm && sm::sameName(lm->name, name)) return lm; }
-  return nullptr;
-}
-
-static void spawnLandmarkObj(const sm::Landmark *lm, V3 p) {
-  Obj *o = newObj(K_LANDMARK);
-  if (!o || !lm) return;
-  o->p = p; o->radius = 34.f; o->lmId = (int)lm->id;
-  o->o = Basis::facing(norm(shipPos - p), V3{0, 1, 0});
-  o->col = lm->handmade ? rgb(240, 200, 110) : rgb(170, 200, 255);
-  asciiCopy(o->name, sizeof(o->name), lm->name); upcase(o->name);
-}
-
-static const sm::Landmark *pickLandmark(int band, bool preferUncharted) {
-  const sm::Landmark *fallback = nullptr;
-  int n = sm::landmarkCount(), start = n ? (int)(rnd() % (uint32_t)n) : 0;
-  for (int k = 0; k < n; k++) {
-    const sm::Landmark *lm = sm::landmarkAt((start + k) % n);
-    if (!lm || lm->band > band || lm->band + 1 < band) continue;
-    if (preferUncharted && sm::landmarkDiscovered(lm->id)) { if (!fallback) fallback = lm; continue; }
-    return lm;
-  }
-  return fallback;
-}
-
-static void makeLayerScene() {
-  clearWorld();
-  sm::contractSetBand((uint8_t)layer);
-  target = -1; navObj = -1; dockTarget = -1;
-  sm::Trip &tr = sm::trip();
-  // The deep cove is persistent: same light, same bodies, same places, every life.
-  uint32_t keep = rngState;
-  if (layer == 4) rngState = 0xC0FEu + tr.legs * 977u;
-  layerLight = norm(V3{rf(-1, 1), rf(0.2f, 1), rf(-1, 1)});
-  resetDust();
-  if (layer >= 2 && rf(0, 1) < 0.35f)
-    spawnBody(layer >= 3 && rf(0, 1) < 0.6f ? BT_HOLE : BT_WRONGSTAR, rf(260, 420), layer >= 3 ? rf(10, 16) : rf(40, 70),
-              norm(shipB.f + shipB.r * rf(-0.8f, 0.8f) + shipB.u * rf(-0.4f, 0.4f)));
-  // uncharted landmarks at the edge of the path — deeper means more of them
-  float lmChance = layer == 1 ? 0.12f : layer == 2 ? 0.3f : layer == 3 ? 0.45f : 0.65f;
-  if (rf(0, 1) < lmChance)
-    if (const sm::Landmark *lm = pickLandmark(layer, layer < 4))
-      {
-        spawnLandmarkObj(lm, aheadPoint(rf(160, 230), (rf(0, 1) < 0.5f ? 1.f : -1.f) * rf(70, 120), rf(-40, 40)));
-        sm::Trip &tp = sm::trip();
-        if (tp.active && !tp.fixedPoint && !tp.via[0]) asciiCopy(tp.via, sizeof(tp.via), lm->name);   // you passed it
-      }
-  if (layer == 4) rngState = keep ^ rnd();
-  if (layer == 1 && rf(0, 1) < 0.12f) {   // a Freehold outpost, clinging to the shallows
-    V3 op = aheadPoint(rf(170, 230), (rf(0, 1) < 0.5f ? 1.f : -1.f) * rf(60, 110), rf(-30, 30));
-    placeStation(op, norm(shipPos - op), makeLook(SS_OUTPOST, BR_FREEHOLD));
-    for (auto &o : objs) if (o.kind == K_STATION) snprintf(o.name, sizeof(o.name), "DEEP OUTPOST");
-  }
-  spawnTimer = rf(3, 6);
-  if (layer >= 3 && countKind(K_LANDMARK) == 0 && alienCooldown <= 0.f && !alien.active && rf(0, 1) < 0.07f)
-    alienPending = rf(6.f, 14.f);
-  else alienPending = -1.f;
-}
-
-// ---- contacts ----
-static void spawnContact() {
-  uint8_t w[sm::ENC_COUNT];
-  sm::encounterWeights((uint8_t)layer, w);
-  int sum = 0; for (int i = 0; i < sm::ENC_COUNT; i++) sum += w[i];
-  bool ghost = layer == 4 && rf(0, 1) < 0.4f;
-  if (sum <= 0 && !ghost) return;
-  int kind = sm::ENC_SECURITY;
-  if (!ghost) {
-    int pick = (int)(rnd() % (uint32_t)sum), acc = 0;
-    for (int i = 0; i < sm::ENC_COUNT; i++) { acc += w[i]; if (pick < acc) { kind = i; break; } }
-  }
-  V3 dir = norm(shipB.f * rf(0.4f, 1.f) + shipB.r * rf(-1, 1) + shipB.u * rf(-0.5f, 0.5f));
-  V3 p = shipPos + dir * rf(230, 320);
-  if (kind == sm::ENC_STATION) {
-    if (layer > 0 || countKind(K_STATION) > 0) return;
-    placeStation(p, norm(shipPos - p));
-    setBanner("AN OUTPOST BEACON RESOLVES OUT OF THE DARK", 2400);
-    return;
-  }
-  if (kind == sm::ENC_LANDMARK_ROCK) { spawnRock(p, rf(4, 9)); return; }
-  if (kind == sm::ENC_LANDMARK_GIANT) return;
-  Obj *o = newObj(K_SHIP);
-  if (!o) return;
-  o->enc = (uint8_t)kind; o->p = p; o->radius = 3.2f;
-  const sm::EncounterFlavor &fl = sm::encounterFlavor((sm::EncounterClass)kind, (uint8_t)layer);
-  asciiCopy(o->name, sizeof(o->name), fl.name);
-  V3 across = norm(cross(dir, shipB.u) * (rf(0, 1) < 0.5f ? 1.f : -1.f) - dir * 0.3f);
-  o->v = across * rf(6, 11);
-  switch (kind) {
-    case sm::ENC_TRAVELER: o->mesh = M_SHUTTLE; o->col = rgb(200, 190, 160); break;
-    case sm::ENC_MERCHANT: o->mesh = M_COBRA; o->col = rgb(140, 175, 165); o->radius = 4.2f; break;
-    case sm::ENC_SECURITY: o->mesh = M_VIPER; o->col = rgb(120, 160, 230); break;
-    case sm::ENC_PIRATE: o->mesh = M_SIDEWINDER; o->col = rgb(190, 90, 70); o->hostile = true; break;
-    case sm::ENC_SUBPIRATE: o->mesh = M_KRAIT; o->col = rgb(150, 90, 200); o->hostile = true; break;
-    case sm::ENC_HOSTILE: o->mesh = 255; o->col = rgb(230, 70, 220); o->hostile = true; o->radius = 4.5f; break;
-    case sm::ENC_ANOMALY: o->kind = K_ANOMALY; o->mesh = 255; o->col = hsv(layerHue(layer) + 120, 0.6f, 1.f); o->v = V3{0, 0, 0}; o->radius = 6.f; break;
-    case sm::ENC_ESCAPE_POD: o->kind = K_POD; o->mesh = M_POD; o->col = rgb(220, 210, 130); o->v = o->v * 0.15f; o->radius = 1.4f; break;
-    case sm::ENC_WRECK: o->kind = K_WRECK; o->mesh = M_COBRA; o->col = rgb(90, 90, 100); o->v = o->v * 0.1f; o->radius = 4.2f; o->spin = rf(-0.3f, 0.3f); break;
-    case sm::ENC_ARTIFACT: o->kind = K_ARTIFACT; o->mesh = M_TETRA; o->col = rgb(200, 150, 255); o->v = V3{0, 0, 0}; o->radius = 2.f; o->spin = 0.8f; break;
-    default: break;
-  }
-  if (ghost) {
-    // the ghost fleet: the deep cove's quiet owners
-    o->ghost = true; o->mesh = M_GHOST; o->col = rgb(70, 80, 90); o->radius = 5.f;
-    o->v = o->v * 0.6f;
-    snprintf(o->name, sizeof(o->name), "GHOST FLEET");
-  }
-  if (o->kind == K_SHIP) o->o = Basis::facing(norm(o->v), V3{0, 1, 0});
-  if (o->enc == sm::ENC_SECURITY && !ghost && sm::sheet().heat[sm::HEAT_SECURITY] > 50) o->hostile = true;
-  if (layer == 0 && (kind == sm::ENC_PIRATE || kind == sm::ENC_SECURITY || kind == sm::ENC_MERCHANT)) {
-    char b[112]; snprintf(b, sizeof(b), "CONTACT: %s", o->name); noteBanner(b, 1600);
-  }
-}
-
-// ============================================================
-//  targeting + context verbs
-// ============================================================
-enum VerbId : uint8_t { VB_NONE = 0, VB_HAIL, VB_ATTACK, VB_DOCK, VB_MINE, VB_SCOOP, VB_SALVAGE, VB_RESCUE, VB_READ, VB_SCAN, VB_CHART };
-struct Chip { uint8_t id; const char *label; uint16_t col; bool enabled; char note[16]; int x, y, w, h; };
-static Chip chips[3];
-static int chipN = 0;
-
-// What the target offers, given what it is, what the ship can do, and the moment.
-static int verbsFor(const Obj &o, Chip *out) {
-  int n = 0;
-  float sd = surfaceDist(o);
-  const sm::Pilot &p = sm::sheet();
-  auto add = [&](uint8_t id, const char *label, uint16_t col, float range, const char *blocked) {
-    if (n >= 3) return;
-    Chip &c = out[n++];
-    memset(&c, 0, sizeof(c));
-    c.id = id; c.label = label; c.col = col; c.enabled = true;
-    if (blocked) { c.enabled = false; snprintf(c.note, sizeof(c.note), "%s", blocked); }
-    else if (range > 0 && sd > range) { c.enabled = false; snprintf(c.note, sizeof(c.note), "%dm", (int)(sd * 10)); }
-  };
-  const uint16_t G = rgb(60, 200, 110), R = rgb(230, 70, 70), B = rgb(70, 140, 255), A = rgb(230, 170, 60),
-                 C = rgb(80, 200, 230), V = rgb(180, 120, 255), Y = rgb(240, 205, 90);
-  bool holdFull = p.holdUsed >= p.holdCap;
-  switch (o.kind) {
-    case K_SHIP:
-      add(VB_HAIL, o.enc == sm::ENC_HOSTILE ? "SIGNAL" : "HAIL", G, 160, o.done ? "SILENT" : nullptr);
-      add(VB_ATTACK, "ATTACK", R, 90, nullptr);
-      break;
-    case K_ANOMALY:
-      add(VB_SCAN, "SCAN", V, 140, o.done ? "READ" : nullptr);
-      add(VB_ATTACK, "ATTACK", R, 90, nullptr);
-      break;
-    case K_STATION: add(VB_DOCK, "DOCK", B, 0, nullptr); break;
-    case K_ROCK: add(VB_MINE, "MINE", A, 40, o.uses == 0 ? "SPENT" : (holdFull ? "HOLD FULL" : nullptr)); break;
-    case K_BODY:
-      if (isStarBody(o.bodyType)) {
-        if (o.uses == 1) add(VB_SCOOP, "SCOOP", C, o.radius * 0.5f, p.fuel >= p.fuelCap ? "TANK FULL" : (o.timer > 0 ? "SETTLING" : nullptr));
-        else add(VB_SCOOP, "SCOOP", C, 0, "TOO HOT");
-        break;
-      }
-      if (o.bodyType == BT_GIANT)
-        add(VB_SCOOP, "SCOOP", C, o.radius * 0.45f, p.fuel >= p.fuelCap ? "TANK FULL" : (o.timer > 0 ? "SETTLING" : nullptr));
-      break;
-    case K_POD: add(VB_RESCUE, "RESCUE", G, 40, nullptr); break;
-    case K_WRECK:
-      add(VB_SALVAGE, "SALVAGE", A, 40, o.done ? "STRIPPED" : (holdFull ? "HOLD FULL" : nullptr));
-      add(VB_ATTACK, "ATTACK", R, 90, nullptr);
-      break;
-    case K_ARTIFACT:
-      add(VB_READ, "READ", V, 55, o.done ? "READ" : nullptr);
-      add(VB_ATTACK, "ATTACK", R, 90, nullptr);
-      break;
-    case K_LANDMARK: add(VB_CHART, "CHART", Y, 170, nullptr); break;
-    default: break;
-  }
-  return n;
-}
-
-static bool targetable(const Obj &o) { return o.kind != K_NONE && o.kind != K_DOCKGATE; }
-
-// ============================================================
-//  the short theater: fire, cut, beam, hail — then the sheet resolves
-// ============================================================
-enum Theater : uint8_t { TH_NONE = 0, TH_COMBAT, TH_BEAM, TH_COMM };
-static uint8_t theater = TH_NONE;
-static uint8_t theaterVerb = VB_NONE;
-static int theaterObj = -1;
-static float theaterT = 0, theaterBeat = 0;
-static uint8_t volleys = 0, maxVolleys = 0;
-static bool ambushed = false;
-
-static void ghostFleetHail(Obj &o) {
-  // They trade in routes and fixed points. Surface money means nothing here.
-  int charted = 0;
-  for (int i = 0; i < sm::landmarkCount(); i++) if (sm::landmarkAt(i) && sm::landmarkDiscovered(sm::landmarkAt(i)->id)) charted++;
-  if (sm::rankOf(sm::CR_DEPTHRUNNER) < 3 || charted < 3) {
-    setBanner("GHOST FLEET: they do not answer pilots who still count stars.", 2800);
-    sm::grantXp(sm::CR_DEPTHRUNNER, 4);
-  } else if (!sm::flagHas("ghost_trade")) {
-    int pay = 250 + charted * 80;
-    sm::addCredits(pay);
-    sm::flagSet("ghost_trade", 1, false);
-    char b[112]; snprintf(b, sizeof(b), "GHOST FLEET buys your fixed points. They already knew most of them. | +%dcr", pay);
-    setBanner(b, 3200);
-  } else {
-    setBanner("GHOST FLEET: a cold nod. The cove remembers your hull.", 2400);
-  }
-  o.done = true;
-  saveAll();
-}
-
-static void finishTheater() {
-  int oi = theaterObj;
-  uint8_t verb = theaterVerb;
-  theater = TH_NONE; theaterVerb = VB_NONE; theaterObj = -1;
-  if (oi < 0 || objs[oi].kind == K_NONE) return;
-  Obj &o = objs[oi];
-
-  if (verb == VB_CHART) {
-    const sm::Landmark *lm = nullptr;
-    for (int i = 0; i < sm::landmarkCount(); i++) if (sm::landmarkAt(i) && (int)sm::landmarkAt(i)->id == o.lmId) lm = sm::landmarkAt(i);
-    if (!lm) return;
-    int life = sm::landmarkChartedLife(lm->id);
-    bool first = life == 0;
-    bool otherLife = life != 0 && life != (int)(1 + sm::sheet().lives % 120);
-    sm::discoverLandmark(lm->id);
-    sm::atlasFixedPoint(lm->name, lm->band);
-    if (first) { char jb[72]; snprintf(jb, sizeof(jb), "Charted %s. It was where the stories said.", lm->name); sm::journalAdd(jb); }
-    sm::grantXp(sm::CR_DEPTHRUNNER, first ? (uint16_t)(18 + lm->band * 6) : 4);
-    if (otherLife) { showRecognition(lm); char jb[72]; snprintf(jb, sizeof(jb), "%s again. Another sky, the same place.", lm->name); sm::journalAdd(jb); }
-    else if (first) {
-      int pay = chartValue(lm->band);
-      sm::addCredits(pay);
-      char b[112]; snprintf(b, sizeof(b), "CHARTED: %s | +%dcr. SOMEONE WILL PAY FOR THIS.", o.name, pay);
-      setBanner(b, 3000);
-      noteBanner(sm::landmarkLine(*lm, sm::urand()), 3000);
-    } else setBanner("CHARTED. IT HAS NOT MOVED.", 1800);
-    hx::swell(0.6f, 0.25f, 0.6f);
-    saveAll();
-    return;
-  }
-  if (verb == VB_SCOOP && isStarBody(o.bodyType)) {
-    uint16_t before = sm::sheet().fuel;
-    sm::setFuel((uint16_t)(before + 22 + sm::capTier(sm::CAP_FUELSYS) * 6));
-    sm::grantXp(sm::CR_PROSPECTOR, 6);
-    char b[112]; snprintf(b, sizeof(b), "SKIMMED THE CORONA | +%dfuel", (int)sm::sheet().fuel - (int)before);
-    setBanner(b, 2200);
-    o.timer = 6.f;
-    hx::swell(0.6f, 0.1f, 0.4f);
-    return;
-  }
-  if (verb == VB_SCOOP) {
-    uint16_t before = sm::sheet().fuel;
-    sm::ResolveIn in{sm::VERB_HAIL, sm::ENC_LANDMARK_GIANT, (uint8_t)layer, 1};
-    sm::ResolveOut out = sm::resolve(in);
-    char b[112]; snprintf(b, sizeof(b), "%s | +%dfuel", out.blurb ? out.blurb : "scooped", (int)sm::sheet().fuel - (int)before);
-    setBanner(b, 2200);
-    o.timer = 12.f;
-    hx::swell(0.5f, 0.1f, 0.4f);
-    return;
-  }
-  if (verb == VB_HAIL && o.ghost) { ghostFleetHail(o); return; }
-
-  sm::EncounterClass who = (sm::EncounterClass)o.enc;
-  bool attack = verb == VB_ATTACK;
-  sm::Pilot &p = sm::sheet();
-  int32_t cr0 = p.credits; int hull0 = p.hull, fuel0 = p.fuel; uint16_t hold0 = p.holdUsed;
-  uint8_t threat = o.ghost ? 10 : sm::encounterFlavor(who, (uint8_t)layer).threat;
-  sm::ResolveIn in{attack ? sm::VERB_ATTACK : sm::VERB_HAIL, who, (uint8_t)layer, threat ? threat : (uint8_t)1};
-  sm::ResolveOut out = sm::resolve(in);
-  if (checkDestroy()) return;
-  if (out.rumorName[0]) {
-    bool lmRumor = sm::landmarkFind(out.rumorName) != nullptr;
-    sm::atlasRumor(out.rumorName, out.rumorDepth, lmRumor);
-    if (layer == 0) {   // the lane opens where you are
-      Obj *g = spawnGate(aheadPoint(rf(110, 140), rf(-50, 50), rf(-18, 18)), -shipB.f, out.rumorName, out.rumorDepth,
-                         (uint8_t)(GF_DEST | GF_RUMOR | (lmRumor ? GF_FIXED : 0)), 9.f);
-      if (g) g->o = Basis::facing(norm(shipPos - g->p), V3{0, 1, 0});
-      char nb[112]; snprintf(nb, sizeof(nb), "A NEW GATE: %s", g ? g->name : out.rumorName);
-      noteBanner(nb, 2000);
-    }
-  }
-
-  char tail[48] = ""; size_t k = 0;
-  int dc = (int)(p.credits - cr0), dh = (int)p.hull - hull0, df = (int)p.fuel - fuel0, dhold = (int)p.holdUsed - (int)hold0;
-  if (dc) k += snprintf(tail + k, sizeof(tail) - k, " %+dcr", dc);
-  if (dh && k < sizeof(tail)) k += snprintf(tail + k, sizeof(tail) - k, " %+dhull", dh);
-  if (df && k < sizeof(tail)) k += snprintf(tail + k, sizeof(tail) - k, " %+dfuel", df);
-  if (who == sm::ENC_ANOMALY && !attack && layer > 0 && sm::haulAdd("anomaly scan", 1, true) && k < sizeof(tail))
-    k += snprintf(tail + k, sizeof(tail) - k, " +1 scan");   // deep outposts pay for these
-  if (dhold > 0 && k < sizeof(tail)) snprintf(tail + k, sizeof(tail) - k, " +%dhold", dhold);
-  char b[112]; snprintf(b, sizeof(b), "%s%s%s", out.blurb ? out.blurb : "...", tail[0] ? " |" : "", tail);
-  setBanner(b, 3000);
-
-  if (attack && out.destroyedOther) {
-    addBoom(o.p, o.radius * 3.f, rgb(255, 170, 60));
-    hx::boom(1.f);
-    if (target == oi) target = -1;
-    killObj(oi);
-  } else {
-    o.done = true; o.engaged = false; o.timer = 20.f;
-    // a fight that doesn't end in fire usually ends in someone leaving
-    if (o.kind == K_SHIP && o.hostile && rf(0, 1) < 0.7f) { o.hostile = false; o.v = norm(o.p - shipPos) * 16.f; }
-    if (o.kind == K_POD && !attack) { if (target == oi) target = -1; killObj(oi); }
-    else if (o.kind == K_ROCK && o.uses) o.uses--;
-    else if (o.kind == K_SHIP && !o.hostile) o.v = norm(o.p - shipPos) * 14.f;
-  }
-  saveAll();
-}
-
-static void beginTheater(int oi, uint8_t verb) {
-  if (oi < 0 || theater != TH_NONE) return;
-  theaterObj = oi; theaterVerb = verb; theaterT = 0; theaterBeat = 0; volleys = 0;
-  Obj &o = objs[oi];
-  if (verb == VB_ATTACK && (o.kind == K_SHIP || o.kind == K_ANOMALY)) {
-    theater = TH_COMBAT;
-    maxVolleys = (uint8_t)clampf(3 + sm::capTier(sm::CAP_WEAPONS) / 2, 3, 6);
-    o.engaged = true;
-  } else if (verb == VB_HAIL) {
-    theater = TH_COMM; maxVolleys = 0;
-  } else {
-    theater = TH_BEAM;
-    maxVolleys = (uint8_t)(verb == VB_MINE ? 4 + sm::capTier(sm::CAP_MINING)
-                         : verb == VB_SCOOP ? (5 - sm::capTier(sm::CAP_FUELSYS) / 2 < 2 ? 2 : 5 - sm::capTier(sm::CAP_FUELSYS) / 2) : 5);
-    if (maxVolleys > 9) maxVolleys = 9;
-  }
-}
-
-static void runVerb(uint8_t id) {
-  if (target < 0 || theater != TH_NONE) return;
-  hx::pop(0.3f, 0.02f);
-  if (id == VB_DOCK) {
-    dockTarget = objs[target].link;
-    setBanner("DOCKING COMPUTER ENGAGED", 1400);
-    return;
-  }
-  if (id == VB_HAIL) setBanner("OPENING COMM...", 900);
-  beginTheater(target, id);
-}
-
-static void theaterTick() {
-  if (theater == TH_NONE) return;
-  if (theaterObj < 0 || objs[theaterObj].kind == K_NONE) { theater = TH_NONE; return; }
-  Obj &o = objs[theaterObj];
-  float sx, sy, z;
-  if (!project(o.p, sx, sy, z)) { sx = 160; sy = -20; }
-  theaterT += dt; theaterBeat += dt;
-  if (theater == TH_COMM) { if (theaterT > 0.9f) finishTheater(); return; }
-  if (theater == TH_BEAM) {
-    if (theaterVerb == VB_SCOOP) hx::hum(hx::HUM_BEAM, 0.35f, 3.f, 0.25f);
-    else if (theaterVerb == VB_CHART || theaterVerb == VB_READ || theaterVerb == VB_SCAN) hx::hum(hx::HUM_BEAM, 0.22f, 9.f, 0.1f);
-    else hx::hum(hx::HUM_BEAM, 0.38f, 21.f, 0.6f);
-    if (theaterBeat > 0.24f) {
-      theaterBeat = 0; volleys++;
-      if (theaterVerb == VB_MINE || theaterVerb == VB_SALVAGE) {
-        addBolt(160, H - 6, sx + rf(-4, 4), sy + rf(-4, 4), theaterVerb == VB_MINE ? rgb(170, 255, 110) : rgb(255, 190, 110));
-        hx::pop(0.25f, 0.02f);
-      }
-      if (volleys >= maxVolleys) finishTheater();
-    }
-    return;
-  }
-  if (theaterBeat > 0.3f) {   // combat
-    theaterBeat = 0; volleys++;
-    if (!ambushed || volleys > 1) {
-      addBolt(120, H - 4, sx + rf(-5, 5), sy + rf(-5, 5), rgb(130, 255, 190));
-      addBolt(200, H - 4, sx + rf(-5, 5), sy + rf(-5, 5), rgb(130, 255, 190));
-      hx::pop(0.55f, 0.03f);
-    }
-    if ((rnd() % 100) < (uint32_t)(50 + layer * 6)) {
-      addBolt(sx, sy, 160 + rf(-40, 40), H - 10, rgb(255, 90, 70));
-      hx::thud(0.55f);
-      hitFlash = 0.18f;
-    }
-    if (volleys >= maxVolleys) { ambushed = false; finishTheater(); }
-  }
-}
-
-// ============================================================
-//  station
-// ============================================================
-static constexpr int STATION_ROWS = 6;
-static bool stationOpen = false;
-static int stationChoice = 0;
-static int stationIdx = -1;
-static float dockAnim = 0;      // docking sequence playing
-static float launchAnim = 0;    // being taxied back out
-static char stationMoodText[112] = "";
-static sm::Opportunity stationOpportunity{};
-static bool opportunityTaken = false;
-static int gearCap = 0;
-static char courseName[24] = "";   // a destination committed at the board
-static uint8_t courseDepth = 0, courseFlags = 0;
-
-static int refuelCost() {
-  const sm::Pilot &p = sm::sheet();
-  int fp = sm::fuelPrice() * (layer > 0 ? 3 : 2) / 2;   // fuel hauled down to an outpost costs more
-  return (p.fuelCap - p.fuel) * fp + (p.hullMax - p.hull) * sm::repairPrice();
-}
-static int rumorPrice() { return 12; }
-static int gearPrice() { return 80 + sm::capTier((sm::CapId)gearCap) * 55; }
-static int sellableValue(bool doSell) {
-  sm::Pilot &p = sm::sheet();
-  const char *owned = sm::contract().live ? sm::contractCargo(sm::contract().kind) : nullptr;
-  int pay = 0; char names[sm::MAX_HAUL_LINES][sm::NAME_LEN]; int nn = 0;
-  for (uint8_t i = 0; i < p.haulN; ++i) {
-    if (owned && strncmp(p.haul[i].what, owned, sm::NAME_LEN) == 0) continue;
-    bool scan = strcmp(p.haul[i].what, "anomaly scan") == 0;
-    if (scan && layer == 0) continue;   // nobody up here believes in them, let alone buys them
-    int each = scan ? 60 + 40 * layer : sm::marketPrice(p.haul[i].what, p.haul[i].legal != 0);
-    if (layer > 0 && (strcmp(p.haul[i].what, "rock") == 0 || strcmp(p.haul[i].what, "ore") == 0)) each *= 2;
-    pay += p.haul[i].amount * each;
-    strncpy(names[nn], p.haul[i].what, sm::NAME_LEN); nn++;
-  }
-  if (doSell) for (int i = 0; i < nn; i++) sm::haulRemove(names[i]);
-  return pay;
-}
-
-static void boardLanes() {
-  sm::AtlasLane lanes[8];
-  int n = sm::atlasLanesHere(lanes, 8), m = 0;
-  const char *names[8]; uint8_t depths[8], visited[8];
-  for (int i = 0; i < n; i++) {
-    if (lanes[i].fixed) continue;                       // a landmark is not a delivery address
-    int ai = sm::atlasFind(lanes[i].name);
-    if (ai >= 0) {
-      const sm::AtlasPlace &ap = sm::atlas().place[ai];
-      if ((ap.flags & sm::AP_STATION_SET) && !(ap.flags & sm::AP_HAS_STATION)) continue;   // no dock to deliver to
-    }
-    names[m] = lanes[i].name; depths[m] = lanes[i].depth; visited[m] = lanes[i].visited ? 1 : 0; m++;
-  }
-  sm::contractSetLanes(names, depths, visited, m);
-}
-
-static void openBoard() {
-  stationOpen = true; stationChoice = 0;
-  if (layer > 0) sm::contractOfferDeep();   // deep outposts post deep work
-  else { boardLanes(); sm::contractOffer(); }
-  opportunityTaken = layer > 0 || !sm::makeOpportunity(stationOpportunity, 0);
-  gearCap = (int)(sm::urand() % sm::CAP_COUNT);
-  if (sm::sheet().rank[sm::CR_DEPTHRUNNER] >= 4 && (sm::urand() % 100) < 35) gearCap = sm::CAP_STABILIZER;
-  asciiCopy(stationMoodText, sizeof(stationMoodText), sm::stationMood((uint8_t)(sm::urand() % 5), sm::worldPressure(), sm::urand()));
-  sm::grantXp(sm::CR_TRADER, 1);
-  courseName[0] = 0;
-}
-
-static void dockNow(int stationObj) {
-  stationIdx = stationObj;
-  dockAnim = 1.2f;
-  dockTarget = -1; target = -1; theater = TH_NONE;
-  hx::swell(0.55f, 0.7f, 0.5f);
-}
-
-static void launch() {
-  stationOpen = false;
-  launchAnim = 0.9f;
-  Obj *st = (stationIdx >= 0 && objs[stationIdx].kind == K_STATION) ? &objs[stationIdx] : nullptr;
-  if (st) {
-    V3 gp = (st->link >= 0 && objs[st->link].kind == K_DOCKGATE) ? objs[st->link].p : st->p + st->o.f * 40.f;
-    shipPos = gp + st->o.f * 14.f; prevShipPos = shipPos;
-    shipB = Basis::facing(st->o.f, st->o.u);
-    for (auto &o : objs) if (o.kind == K_GATE || o.kind == K_DOCKGATE || o.kind == K_PORTAL) o.prevSide = dot(shipPos - o.p, o.o.f);
-  }
-  // the course you committed to waits right in front of you
-  if (courseName[0]) {
-    for (int i = 0; i < MAX_OBJ; i++)
-      if (objs[i].kind == K_GATE && (objs[i].gflags & GF_DEST) && strcmp(objs[i].name, courseName) == 0) killObj(i);
-    Obj *g = spawnGate(aheadPoint(60.f, rf(-8, 8), rf(-5, 5)), -shipB.f, courseName, courseDepth, courseFlags, 9.f);
-    target = idxOf(g);
-    char b[112]; snprintf(b, sizeof(b), "COURSE: %s - DEPTH %u. FLY THE GATE.", courseName, courseDepth);
-    noteBanner(b, 2600);
-  }
-  hx::swell(0.7f, 0.15f, 0.5f);
-  throttleT = 0.5f;
-  shipSpeed = 12.f;
-  saveAll();
-}
-
-// After taking a job: its lane in this system turns gold and is targeted. No new gate.
-static void lightJobLane() {
-  const sm::Contract &c = sm::contract();
-  if (!c.live || !c.dest[0]) return;
-  for (int i = 0; i < MAX_OBJ; i++)
-    if (objs[i].kind == K_GATE && (objs[i].gflags & GF_DEST) && sm::sameName(objs[i].name, c.dest)) { objs[i].gflags |= GF_JOB; target = i; }
-}
-
-static void setCourse(const char *name, uint8_t depth, uint8_t flags) {
-  asciiCopy(courseName, sizeof(courseName), name); upcase(courseName);
-  courseDepth = depth < 1 ? 1 : depth;
-  courseFlags = flags;
-}
-
-static void stationCommit() {
-  sm::Contract &off = sm::contractOfferPeek();
-  sm::Pilot &p = sm::sheet();
-  char buf[112];
-  hx::pop(0.3f, 0.02f);
-  switch (stationChoice) {
-    case 0: {   // business: stay docked
-      int fp = sm::fuelPrice(); if (fp < 1) fp = 1;
-      if (p.fuel >= p.fuelCap && p.hull >= p.hullMax) { setBanner("ALREADY TOPPED UP", 1200); break; }
-      if (sm::spendCredits(refuelCost())) { sm::setFuel(p.fuelCap); sm::repairHull(p.hullMax); setBanner("REFUELED / REPAIRED", 1600); }
-      else {
-        int partial = p.credits / fp, need = p.fuelCap - p.fuel;
-        if (partial > need) partial = need;
-        if (partial > 0) { sm::spendCredits(partial * fp); sm::setFuel((uint16_t)(p.fuel + partial)); setBanner("PARTIAL REFUEL - CREDIT THIN", 1700); }
-        else if (p.fuel < 15) { sm::setFuel(15); sm::addHeat(sm::HEAT_HOUSE, 6); setBanner("THE DOCK FRONTS YOU 15 FUEL. THEY WILL REMEMBER.", 2400); }
-        else setBanner("TOO BROKE FOR THE DOCK", 1400);
-      }
-      break;
-    }
-    case 1:   // work: deliver here, drop the lead, or take the board's job
-      if (dueHereNow()) { sm::contractDeliverHere(hereName); hx::swell(0.5f, 0.1f, 0.3f); break; }
-      if (sm::contract().live) { sm::contractAbandon(); setBanner("LEAD DROPPED", 1400); break; }
-      if (sm::contractAccept(off)) {
-        snprintf(buf, sizeof(buf), "ACCEPTED: %s", off.title); setBanner(buf, 2000);
-        if (off.dest[0]) { launch(); lightJobLane(); return; }
-      } else setBanner(off.kind == sm::CK_MARKET ? "CANNOT COVER THE CARGO" : "NO ROOM IN THE HOLD", 1800);
-      break;
-    case 2: {   // a rumor is a place you can now fly to: buying it sets the course
-      if (layer > 0) { setBanner("NOBODY SELLS NAMES DOWN HERE", 1400); break; }
-      if (!sm::spendCredits(rumorPrice())) { setBanner("THE RUMOR SELLER WANTS MONEY", 1500); break; }
-      char name[24]; asciiCopy(name, sizeof(name), sm::placeName(sm::urand(), 0, false));
-      uint8_t d = sm::placeDepth(name);
-      sm::rumorAdd(name, d, 14);
-      sm::atlasRumor(name, d, false);
-      sm::grantXp(sm::CR_TRADER, 4);
-      snprintf(buf, sizeof(buf), "RUMOR: %s. %s", name, sm::marketRumor(sm::worldPressure(), sm::urand()));
-      setBanner(buf, 3000);
-      setCourse(name, d, GF_DEST | GF_RUMOR);
-      launch();
-      return;
-    }
-    case 3: {   // business
-      int pay = sellableValue(false);
-      if (pay > 0) {
-        sellableValue(true); sm::addCredits(pay); sm::grantXp(sm::CR_TRADER, (uint16_t)(6 + pay / 25));
-        snprintf(buf, sizeof(buf), "HAUL SOLD +%dcr", pay); setBanner(buf, 1900);
-      } else {
-        uint8_t t = sm::capTier((sm::CapId)gearCap);
-        if (t >= 10) { setBanner("NOTHING HERE BEATS WHAT YOU FLY", 1500); break; }
-        if (sm::spendCredits(gearPrice())) {
-          sm::earnCap((sm::CapId)gearCap, (uint8_t)(t + 1));
-          snprintf(buf, sizeof(buf), "%s %u - EQUIPPED", sm::capName((sm::CapId)gearCap), t + 1); upcase(buf);
-          setBanner(buf, 1900);
-          gearCap = (int)(sm::urand() % sm::CAP_COUNT);
-        } else setBanner("GEAR IS TOO EXPENSIVE HERE", 1500);
-      }
-      break;
-    }
-    case 4:
-      if (opportunityTaken) { setBanner("THE BOARD IS EMPTY", 1200); break; }
-      if (sm::contract().live) { setBanner("FINISH OR DROP YOUR LEAD FIRST", 1600); break; }
-      if (sm::contractFromOpportunity(stationOpportunity)) {
-        opportunityTaken = true;
-        snprintf(buf, sizeof(buf), "LEAD: %s", stationOpportunity.title); setBanner(buf, 2000);
-        const sm::Contract &c = sm::contract();
-        if (c.dest[0]) { launch(); lightJobLane(); return; }
-      } else setBanner("NO ROOM FOR THAT WORK", 1500);
-      break;
-    case 5: launch(); return;
-  }
-  saveAll();
-}
-
-// ============================================================
-//  trips: threading, crossing, arrival
-// ============================================================
-static void arriveReal(bool turnedBack) {
-  sm::Trip tr = sm::trip();
-  sm::tripEnd();
-  char place[24];
-  bool station;
-  if (turnedBack) { asciiCopy(place, sizeof(place), sm::placeName(sm::urand(), 0, false)); station = rf(0, 1) < 0.6f; }
-  else if (tr.fixedPoint) {
-    // a fixed point is in the deep; the climb out surfaces somewhere new, in any sky
-    asciiCopy(place, sizeof(place), sm::placeName(sm::urand(), 0, false)); station = rf(0, 1) < 0.65f;
-  }
-  else { asciiCopy(place, sizeof(place), tr.dest); station = tr.unknown ? rf(0, 1) < 0.7f : rf(0, 1) < 0.85f; }
-  upcase(place);
-  sm::atlasVisit(place, tripOrigin, tr.destDepth, true, tr.fixedPoint ? tr.dest : (tr.via[0] ? tr.via : nullptr));
-  if (!turnedBack && sm::contract().live && sm::sameName(place, sm::contract().dest)) station = true;
-  { // a place you have been keeps its dock, or its lack of one
-    int ai = sm::atlasFind(place);
-    if (ai >= 0) {
-      sm::AtlasPlace &ap = sm::atlas().place[ai];
-      if (ap.flags & sm::AP_STATION_SET) station = (ap.flags & sm::AP_HAS_STATION) != 0;
-      else ap.flags |= (uint8_t)(sm::AP_STATION_SET | (station ? sm::AP_HAS_STATION : 0));
-    }
-  }
-  makeRealScene(place, station);
-  sm::onResurface();
-  char b[112];
-  if (!turnedBack) {
-    if (!tr.fixedPoint) sm::knownGateAdd(tr.dest, tr.destDepth);
-    sm::contractOnGate(tr.dest, 0, tr.unknown != 0);
-    // real-space exploring is experience; a deep way through is money
-    if (tr.unknown) sm::grantXp(sm::CR_WANDERER, (uint16_t)(10 + tr.destDepth * 4));
-    sm::grantXp(sm::CR_DEPTHRUNNER, (uint16_t)(2 + tr.destDepth * 3));
-    int pay = routeValue(tr.destDepth, tr.unknown != 0);
-    if (pay > 0) {
-      sm::addCredits(pay);
-      snprintf(b, sizeof(b), "RESURFACED: %s. A WAY THROUGH DEPTH %u IS WORTH MONEY | +%dcr", hereName, tr.destDepth, pay);
-    } else snprintf(b, sizeof(b), "RESURFACED: %s - FAR ACROSS THE UNIVERSE", hereName);
-  } else snprintf(b, sizeof(b), "YOU SURFACE SOMEWHERE ELSE: %s", hereName);
-  setBanner(b, 3400);
-  hx::swell(0.5f, 0.3f, 0.8f);
-  saveAll();
-}
-
-static void crossPortal(Obj &portal) {
-  sm::Crossing c = sm::tripCross();
-  if (c.refused) {
-    setBanner("THE PORTAL WON'T TAKE A DRY SHIP - THE CHAIN TURNS BACK", 2800);
-    hx::stutter(0.6f, 4, 0.09f);
-    killObj(idxOf(&portal));
-    navObj = -1;
-    if (layer == 0) sm::tripEnd(); else spawnNextOnPath();
-    return;
-  }
-  // the crossing: the hum peaks, then total silence
-  hx::cut(0.7f);
-  crossFlash = 1.f;
-  layer = c.to;
-  if (c.damage > 0) {
-    if (damage(c.damage)) return;
-    setBanner(c.dry ? "DRY CLIMB - THE HULL PAYS FOR IT" : "GLITCH - REALITY SLIPS", 2200);
-    hx::stutter(0.85f, 7, 0.07f);
-  }
-  if (c.arrived) { arriveReal(sm::trip().turnedBack != 0); return; }
-  makeLayerScene();
-  sm::Trip &tr = sm::trip();
-  char b[112];
-  if (c.turnPoint) {
-    if (tr.fixedPoint) {
-      const sm::Landmark *lm = nullptr;
-      for (int i = 0; i < sm::landmarkCount(); i++) {
-        const sm::Landmark *q = sm::landmarkAt(i);
-        char up[24]; asciiCopy(up, sizeof(up), q->name); upcase(up);
-        if (strcmp(up, tr.dest) == 0) lm = q;
-      }
-      if (lm) spawnLandmarkObj(lm, aheadPoint(140.f, 0, 10.f));
-      // the hub's gates: every known place that has routed through it
-      sm::AtlasLane hub[6];
-      int nh = sm::atlasHubLanes(lm ? lm->name : tr.dest, hub, 6);
-      for (int k = 0; k < nh; k++) {
-        float a = -1.0f + 2.0f * (k + 0.5f) / nh;
-        V3 p = aheadPoint(95.f, sinf(a) * 70.f, cosf(a * 2.f) * 18.f - 9.f);
-        Obj *hg = spawnGate(p, norm(shipPos - p), hub[k].name, hub[k].depth, GF_DEST | GF_KNOWN, 9.f);
-        if (hg) { hg->uses = 1; if (lm) hg->lmId = (int)lm->id; }
-      }
-      if (nh) snprintf(b, sizeof(b), "%s. %d KNOWN WAY%s RUN THROUGH HERE.", tr.dest, nh, nh == 1 ? "" : "S");
-      else snprintf(b, sizeof(b), "%s. THE FIXED POINT IS HERE.", tr.dest);
-    } else if (tr.via[0]) {
-      // passing a hub: it hangs beside the way, and the chain stays on your destination
-      const sm::Landmark *lm = landmarkNamed(tr.via);
-      if (lm && countKind(K_LANDMARK) == 0) spawnLandmarkObj(lm, aheadPoint(170.f, (rnd() & 1u) ? 55.f : -55.f, 12.f));
-      snprintf(b, sizeof(b), "PASSING %s. THE CHAIN TURNS UP.", tr.via); upcase(b);
-    } else snprintf(b, sizeof(b), "%s - DEPTH REACHED. THE CHAIN TURNS UP.", layerName(layer));
-    setBanner(b, 2600);
-  } else {
-    setBanner(layerName(layer), 1600);
-    if (layer >= 2 && (rnd() & 1u)) noteBanner(sm::deepWhisper((uint8_t)layer, sm::urand()), 3000);
-  }
-  if (layer >= 3) sm::grantXp(sm::CR_DEPTHRUNNER, (uint16_t)(4 + layer * 2));
-  spawnNextOnPath();
-  saveAll();
-}
-
-static void threadGate(Obj &g) {
-  int gi = idxOf(&g);
-  if (g.kind == K_DOCKGATE) {
-    if (g.link >= 0 && objs[g.link].kind == K_STATION) dockNow(g.link);
-    return;
-  }
-  if (g.kind == K_PORTAL) { crossPortal(g); return; }
-  hx::swell(0.45f, 0.04f, 0.14f);
-  if ((g.gflags & GF_DEST) && g.uses == 1 && sm::trip().active && layer > 0) {
-    // a hub gate at a landmark: the climb now goes to a place you know, past this hub
-    sm::Trip &tr = sm::trip();
-    const sm::Landmark *hub = landmarkNamed(tr.dest);
-    if (hub) asciiCopy(tr.via, sizeof(tr.via), hub->name);
-    asciiCopy(tr.dest, sizeof(tr.dest), g.name);
-    tr.fixedPoint = 0; tr.unknown = 0; tr.ascending = 1; tr.step = 1;
-    for (int i = 0; i < MAX_OBJ; i++) if (objs[i].kind == K_GATE && objs[i].uses == 1) killObj(i);
-    if (navObj >= 0) { killObj(navObj); navObj = -1; }
-    if (target == gi) target = -1;
-    char b[112]; snprintf(b, sizeof(b), "COURSE: %s - THROUGH %s", tr.dest, hub ? hub->name : "THE HUB");
-    setBanner(b, 2400);
-    spawnNextOnPath();
-    return;
-  }
-  if (g.gflags & GF_DEST) {
-    // the choice: this is where we are going
-    dockTarget = -1;
-    asciiCopy(tripOrigin, sizeof(tripOrigin), hereName);
-    sm::tripBegin(g.name, g.depth, (g.gflags & GF_UNKNOWN) != 0, (g.gflags & GF_FIXED) != 0);
-    if (g.lmId && !(g.gflags & GF_FIXED))   // a lane that runs past a landmark hub
-      for (int i = 0; i < sm::landmarkCount(); i++) if (sm::landmarkAt(i) && (int)sm::landmarkAt(i)->id == g.lmId) asciiCopy(sm::trip().via, sizeof(sm::trip().via), sm::landmarkAt(i)->name);
-    char b[112]; snprintf(b, sizeof(b), "COURSE: %s - DEPTH %u", g.name, g.depth);
-    setBanner(b, 2200);
-    if (target == gi) target = -1;
-    killObj(gi);
-    spawnNextOnPath();
-    return;
-  }
-  if (g.gflags & GF_CHAIN) {
-    sm::tripGate();
-    if (sm::contract().live) sm::contractOnGate("", (uint8_t)layer, false);
-    if (target == gi) target = -1;
-    killObj(gi);
-    spawnNextOnPath();
-    char b[32]; snprintf(b, sizeof(b), "GATE %u/3", sm::trip().step);
-    setBanner(b, 900);
-  }
-}
-
-// ============================================================
-//  destruction
-// ============================================================
-static void onDestroyedFlow() {
-  livesSeen = sm::sheet().lives;
-  rngState = sm::universeSeed() ^ 0x9E3779B9u;
-  sm::contractAbandon();
-  sm::tripEnd();
-  sm::atlasWipe();
-  { char jb[72]; snprintf(jb, sizeof(jb), "Pod launched. Life %lu ends. No names out here.", (unsigned long)sm::sheet().lives); sm::journalAdd(jb); }
-  theater = TH_NONE; stationOpen = false; mapOpen = false; statusOpen = false; endingOpen = false; dockAnim = 0; launchAnim = 0;
-  queuedN = 0;
-  hx::boom(1.f);
-  crossFlash = 1.f;
-  makeRealScene(nullptr, rf(0, 1) < 0.65f);
-  // Beat between skies: pod recovered, still lost — no meta about reseeding.
-  lostOpen = true;
-  saveAll();
-}
-
-// ============================================================
-//  input
-// ============================================================
-static float neutralAx = 0, neutralAy = 0;
-static bool neutralValid = false;
-static float tiltX = 0, tiltY = 0, tiltRoll = 0;
-static bool touchDown = false, dragging = false, sliding = false;
-static int touchX0 = 0, touchY0 = 0, touchLX = 0, touchLY = 0;
-static uint32_t touchT0 = 0;
-
-static constexpr int ROW_Y0 = 46, ROW_PITCH = 23, ROW_H = 20;
-static constexpr int SLIDER_X = W - 22, SLIDER_Y0 = 44, SLIDER_Y1 = 196;
-
-static void captureNeutral() {
-  if (M5.Imu.update()) {
-    auto d = M5.Imu.getImuData();
-    neutralAx = d.accel.x; neutralAy = d.accel.y; neutralValid = true;
-  }
-}
-
-static void cycleTarget() {
-  float bestScore = 1e9f; int best = -1;
-  for (int i = 0; i < MAX_OBJ; i++) {
-    if (!targetable(objs[i]) || i == target) continue;
-    float sx, sy, z;
-    if (!project(objs[i].p, sx, sy, z) || !onScreen(sx, sy)) continue;
-    float score = fabsf(sx - 160) + fabsf(sy - 120) + z * 0.2f;
-    if (objs[i].kind == K_GATE || objs[i].kind == K_PORTAL) score += 60;
-    if (score < bestScore) { bestScore = score; best = i; }
-  }
-  target = best;
-  if (best >= 0) hx::pop(0.22f, 0.015f);
-}
-
-static void mapTap(int x, int y);
-static void startNewGame();
-static void alienTick();
-static void handleTap(int x, int y) {
-  if (mapOpen) { mapTap(x, y); return; }
-  if (statusOpen) { statusOpen = false; hx::pop(0.15f, 0.01f); return; }
-  if (bootOpen) {
-    bootOpen = false;
-    setBanner("FIND A GATE", 2000);
-    return;
-  }
-  if (lostOpen) {
-    lostOpen = false;
-    setBanner(sm::lossLine(sm::sheet().lives, sm::urand()), 3200);
-    return;
-  }
-  if (endingOpen) { endingOpen = false; setBanner("KEEP FLYING. THE NAMES WILL BE THERE.", 3000); return; }
-  if (stationOpen) {
-    if (y >= ROW_Y0 && y < ROW_Y0 + STATION_ROWS * ROW_PITCH) {
-      int row = (y - ROW_Y0) / ROW_PITCH;
-      if (row == stationChoice) stationCommit(); else { stationChoice = row; hx::pop(0.15f, 0.01f); }
-    }
-    return;
-  }
-  for (int i = 0; i < chipN; i++) {
-    const Chip &c = chips[i];
-    if (x >= c.x && x < c.x + c.w && y >= c.y && y < c.y + c.h) {
-      if (c.enabled) runVerb(c.id);
-      else {
-        hx::pop(0.12f, 0.01f);
-        size_t n = strlen(c.note);
-        setBanner(n && c.note[n - 1] == 'm' ? "OUT OF RANGE - FLY CLOSER" : c.note, 1000);
-      }
-      return;
-    }
-  }
-  float best = 1e9f; int pick = -1;
-  for (int i = 0; i < MAX_OBJ; i++) {
-    if (!targetable(objs[i])) continue;
-    float sx, sy, z;
-    if (!project(objs[i].p, sx, sy, z)) continue;
-    float rr = objs[i].radius * FOCAL / z;
-    if (objs[i].kind == K_BODY) rr = clampf(rr, 6, 400);
-    float dd = sqrtf((sx - x) * (sx - x) + (sy - y) * (sy - y));
-    float slack = 16.f + clampf(rr, 0, 60);
-    if (dd < slack && dd - rr * 0.5f < best) { best = dd - rr * 0.5f; pick = i; }
-  }
-  if (pick >= 0 && pick != target) { target = pick; hx::pop(0.25f, 0.015f); }
-  else if (pick < 0) target = -1;
-}
-
-static void setThrottleFromY(int y) {
-  float t = 1.f - (float)(y - SLIDER_Y0) / (SLIDER_Y1 - SLIDER_Y0);
-  t = clampf(t, 0, 1);
-  if (fabsf(t - 0.5f) < 0.04f) t = 0.5f;   // a soft detent at cruise
-  if ((throttleT < 0.5f) != (t < 0.5f) || (throttleT == 0.5f) != (t == 0.5f)) hx::pop(0.15f, 0.01f);
-  throttleT = t;
-}
-
-static void updateInput() {
   M5.update();
+  hapService();
+  uint32_t now = millis();
+  if (M5.BtnA.wasPressed()) nextMode(-1);
+  if (M5.BtnC.wasPressed()) nextMode(1);
+  if (M5.BtnB.wasPressed()) { s_bDown = now; s_bLong = false; }
+  if (M5.BtnB.isPressed() && s_bDown && !s_bLong && g_mode == MODE_EYE && now - s_bDown > 650) {
+    s_bLong = true; s_eyeStyle = (uint8_t)((s_eyeStyle + 1) % 3); hapGesture(HG_SETTLE);
+  }
+  if (M5.BtnB.isPressed() && s_bDown && !s_bLong && g_mode == MODE_CALM && calmIsWaves() && now - s_bDown > 650) {
+    s_bLong = true; calmBoatNext(); hapGesture(HG_THREAD);                   // hold B in the wave tank: another boat
+  }
+  if (M5.BtnB.isPressed() && s_bDown && !s_bLong && g_mode == MODE_MANTIS && g_mantisMode == 2 && now - s_bDown > 650) {
+    s_bLong = true; g_mantisMode = 0; g_mantisSing = false; aud::cave(false); hapGesture(HG_SETTLE);   // hold B: leave the cave
+  }
+  if (M5.BtnB.wasReleased() && s_bDown) { if (!s_bLong) btnBShort(); s_bDown = 0; }
+
   auto td = M5.Touch.getDetail();
-  bool flying = !stationOpen && !endingOpen && !lostOpen && !bootOpen && !statusOpen && !mapOpen && dockAnim <= 0 && !alienHolds();
+  bool inStage = td.y >= 14 && td.y < H - 14;
   if (td.wasPressed()) {
-    touchDown = true; dragging = false; sliding = false;
-    touchX0 = touchLX = td.x; touchY0 = touchLY = td.y; touchT0 = millis();
-    if (flying && td.x >= SLIDER_X - 6 && td.y >= SLIDER_Y0 - 12 && td.y <= SLIDER_Y1 + 12) { sliding = true; setThrottleFromY(td.y); }
-  }
-  if (touchDown && td.isPressed()) {
-    int dx = td.x - touchLX, dy = td.y - touchLY;
-    if (sliding) setThrottleFromY(td.y);
+    if (td.y >= H - 14 && td.y < H) { if (td.x < 90) nextMode(-1); else if (td.x > 230) nextMode(1); }
+    else if (inStage) {
+      g_tapLatch = true; g_tapX = td.x; g_tapY = td.y;
+      s_touchDown = now; s_touchX0 = td.x; s_touchY0 = td.y; s_longFired = false;
+      s_centreTouch = g_mode == MODE_TUNNEL && (td.x - W / 2) * (td.x - W / 2) + (td.y - H / 2) * (td.y - H / 2) < 52 * 52;   // re-centre: flying modes only
+      if (g_mode == MODE_EYE) eyePoke(td.x, td.y);
+      else if (g_mode == MODE_MANTIS) mantisTap(td.x, td.y);
+      else if (g_mode == MODE_CALM) calmTouch(td.x, td.y, true);
+      else if (g_mode == MODE_ROOMS) roomsTouch(td.x, td.y);
+      else if (g_mode == MODE_GARDEN) gardenTouch(td.x, td.y);
+      else if (g_mode == MODE_MEDITATE) medTouch(td.x, td.y);
+    }
+  } else if (td.isPressed() && inStage && s_touchDown) {
+    if (abs(td.x - s_touchX0) + abs(td.y - s_touchY0) > 14) { s_touchDown = 0; if (s_cal == CAL_RING) s_cal = CAL_IDLE; }   // a drag
     else {
-      if (!dragging && (abs(td.x - touchX0) + abs(td.y - touchY0)) > 7 && flying) dragging = true;
-      if (dragging && flying && launchAnim <= 0) {
-        // slide = look around: direct yaw + pitch (not roll)
-        shipB.yaw(dx * 0.0095f);
-        shipB.pitch(-dy * 0.011f);
-        shipB.fix();
-        if (dockTarget >= 0 && (abs(dx) + abs(dy)) > 3) { dockTarget = -1; setBanner("DOCKING COMPUTER OFF", 900); }
+      uint32_t held = now - s_touchDown;
+      if (!s_longFired && !s_centreTouch && held > 600) {
+        s_longFired = true;
+        if (g_mode == MODE_CALM) { calmLongPress(); hap(60, 60); }
       }
+      // hold still near the centre: after 2 s a ring closes in on the finger, then we calibrate
+      if (s_centreTouch && s_cal == CAL_IDLE && held > 2000) { s_cal = CAL_RING; s_calT = now; s_calX = td.x; s_calY = td.y; }
+      if (s_cal == CAL_RING && now - s_calT > 1200) { s_cal = CAL_RUN; s_calT = now; s_calN = 0; s_calS[0] = s_calS[1] = s_calS[2] = 0; hapCut(1150); }   // motor off: it would shake the gyro
     }
-    touchLX = td.x; touchLY = td.y;
   }
-  if (td.wasReleased()) {
-    if (touchDown && !dragging && !sliding && millis() - touchT0 < 450) handleTap(touchX0, touchY0);
-    touchDown = false; dragging = false; sliding = false;
+  if (td.wasReleased() && s_touchDown && s_centreTouch && s_cal == CAL_IDLE && g_mode == MODE_CALM) {
+    uint32_t held = now - s_touchDown;
+    if (held > 600 && held < 2000) { calmLongPress(); hap(60, 60); }
   }
+  if (!td.isPressed()) { s_touchDown = 0; if (s_cal == CAL_RING) s_cal = CAL_IDLE; }
+}
 
-  if (mapOpen) {
-    if (M5.BtnA.wasHold()) { mapPage ^= 1; mapTrace = -1; hx::pop(0.2f, 0.02f); }
-    else if (M5.BtnA.wasClicked() || M5.BtnB.wasPressed() || M5.BtnC.wasPressed()) { mapOpen = false; hx::pop(0.15f, 0.01f); }
-    return;
+// ---------------- sensors ----------------
+// g_lookX/Y and g_gravX/Y: exactly V12 (gaze, parallax, swarm chaos, calm gravity were right).
+// g_flyX/Y: steering for flight modes, measured from the neutral pose captured during calibration,
+// with a deadzone, so holding the Core2 at your natural angle no longer keeps pushing one way.
+float g_flyX = 0, g_flyY = 0;
+// Flight steering = how far you've ROTATED the Core2 away from the pose you hold it in.
+// Reference pose = the gravity direction while you hold it naturally (captured by the centre-hold gesture,
+// and automatically each time you enter a flight mode once you're still). The steering vector is the true
+// rotation from that pose: axis = ref x now, angle = atan2(|ref x now|, ref . now). It grows the more you
+// tip - past 90 degrees too - and stays put while you hold the tilt. Near a flat pose it is exactly the
+// flat-pose mapping (ref=(0,0,1): steer = (-gx, gy)), the same axes as gravity and gaze.
+static float s_ref[3] = {0.f, 0.f, 1.f};
+static float s_gN[3] = {0.f, 0.f, 1.f};
+static bool s_autoCap = false;
+static float s_stillT = 0;
+static uint32_t s_centeredAt = 0;
+static void loadCal() {
+#ifndef HOST
+  Preferences p;
+  if (p.begin("synapse", true)) { s_ref[0] = p.getFloat("rx", 0.f); s_ref[1] = p.getFloat("ry", 0.f); s_ref[2] = p.getFloat("rz", 1.f); p.end(); }
+#endif
+}
+static void saveCal() {
+#ifndef HOST
+  Preferences p;
+  if (p.begin("synapse", false)) { p.putFloat("rx", s_ref[0]); p.putFloat("ry", s_ref[1]); p.putFloat("rz", s_ref[2]); p.end(); }
+#endif
+}
+static void capturePose() { s_ref[0] = s_gN[0]; s_ref[1] = s_gN[1]; s_ref[2] = s_gN[2]; s_centeredAt = millis(); }
+void flightPoseSoon() { s_autoCap = true; s_stillT = 0; }        // called when a flight mode starts
+static inline float shapeSteer(float v) {                    // 3 deg deadzone, 1.0 at ~34 deg, growing faster beyond
+  float a = fabsf(v) - 0.05f;
+  if (a <= 0) return 0;
+  float s = a / 0.55f;
+  float o = s * (0.55f + 0.45f * fminf(s, 2.5f));
+  return copysignf(fminf(o, 3.f), v);
+}
+static inline float softDz(float v, float dz) { return v > dz ? v - dz : (v < -dz ? v + dz : 0.f); }
+static void sampleImu() {
+  if (!M5.Imu.update()) return;
+  auto d = M5.Imu.getImuData();
+  float ax = d.accel.x, ay = d.accel.y, az = d.accel.z;
+  g_ax = g_ax * 0.7f + ax * 0.3f; g_ay = g_ay * 0.7f + ay * 0.3f; g_az = g_az * 0.7f + az * 0.3f;
+  g_gx = d.gyro.x; g_gy = d.gyro.y; g_gz = d.gyro.z;
+  // accelerometer -> screen, consistent with the gyro half below (IMU X = screen right, Y = screen up):
+  g_gravX = -g_ax; g_gravY = g_ay; g_gravZ = fabsf(g_az);
+  g_gyroX = g_gx; g_gyroY = g_gy; g_gyroZ = g_gz;
+  float tx = -g_ax, ty = g_ay;
+  if (s_cal == CAL_RUN) s_calN++;
+  if (fabsf(tx) < 0.08f) tx = 0;
+  if (fabsf(ty) < 0.08f) ty = 0;
+  if (fabsf(g_gx) + fabsf(g_gy) > 8.f) { g_lookX += g_gy * 0.0025f; g_lookY += g_gx * 0.0025f; }
+  float k = (fabsf(tx) + fabsf(ty) < 0.15f) ? 0.22f : 0.12f;
+  g_lookX += (tx - g_lookX) * k; g_lookY += (ty - g_lookY) * k;
+  g_lookX = clampf(g_lookX, -1.1f, 1.1f); g_lookY = clampf(g_lookY, -1.1f, 1.1f);
+  float mag = sqrtf(ax * ax + ay * ay + az * az);
+  g_jolt = fabsf(mag - 1.f);
+  if (mag > 0.3f && fabsf(mag - 1.f) < 0.45f) {                // unit gravity, shakes rejected
+    for (int i = 0; i < 3; i++) s_gN[i] += ((i == 0 ? ax : (i == 1 ? ay : az)) / mag - s_gN[i]) * 0.35f;
+    float n = sqrtf(s_gN[0] * s_gN[0] + s_gN[1] * s_gN[1] + s_gN[2] * s_gN[2]) + 1e-6f;
+    s_gN[0] /= n; s_gN[1] /= n; s_gN[2] /= n;
   }
-  if (statusOpen) {
-    if (M5.BtnC.wasHold()) { statusPage ^= 1; hx::pop(0.2f, 0.02f); }
-    else if (M5.BtnC.wasClicked() || M5.BtnA.wasPressed() || M5.BtnB.wasPressed()) { statusOpen = false; hx::pop(0.15f, 0.01f); }
-    return;
+  if (s_cal == CAL_RUN) { s_calS[0] += s_gN[0]; s_calS[1] += s_gN[1]; s_calS[2] += s_gN[2]; }
+  if (s_autoCap) {                                               // entering a flight mode: centre on how you're holding it
+    float gyr = fabsf(g_gx) + fabsf(g_gy) + fabsf(g_gz);
+    s_stillT = gyr < 30.f ? s_stillT + g_dt : 0.f;
+    if (s_stillT > 0.35f) { capturePose(); s_autoCap = false; }
   }
-  if (bootOpen) {
-    if (newGameDone > 0) { newGameDone -= dt; return; }
-    if (M5.BtnA.isPressed() && M5.BtnC.isPressed()) {
-      // both held: the bar fills; it turns red before the save is cleared
-      float before = newGameHold;
-      newGameHold += dt;
-      if (before < 1.5f && newGameHold >= 1.5f) hx::pop(0.35f, 0.03f);
-      if (newGameHold >= 2.0f) { startNewGame(); newGameHold = 0; newGameDone = 1.6f; hx::boom(0.7f); }
-      return;
+  {
+    float cx = s_ref[1] * s_gN[2] - s_ref[2] * s_gN[1], cy = s_ref[2] * s_gN[0] - s_ref[0] * s_gN[2], cz = s_ref[0] * s_gN[1] - s_ref[1] * s_gN[0];
+    float sn = sqrtf(cx * cx + cy * cy + cz * cz), cs = s_ref[0] * s_gN[0] + s_ref[1] * s_gN[1] + s_ref[2] * s_gN[2];
+    float ang = atan2f(sn, cs), k = sn > 1e-5f ? ang / sn : 1.f;
+    float rx = cx * k, ry = cy * k, rz = cz * k;                    // rotation vector (device frame)
+    // Split it the way a person means it, whatever the grip: "right edge dropped" = rotation about the
+    // horizontal forward axis F; "top tipped away" = rotation about the horizontal right axis Xh.
+    // Flat grip: F = screen-up. Held upright in front of you: F = screen normal (a steering-wheel turn).
+    float hx = 1.f - s_ref[0] * s_ref[0], hy = -s_ref[0] * s_ref[1], hz = -s_ref[0] * s_ref[2];
+    float hn = sqrtf(hx * hx + hy * hy + hz * hz) + 1e-6f; hx /= hn; hy /= hn; hz /= hn;
+    float fx_ = s_ref[1] * hz - s_ref[2] * hy, fy_ = s_ref[2] * hx - s_ref[0] * hz, fz_ = s_ref[0] * hy - s_ref[1] * hx;
+    g_flyX = shapeSteer(-(rx * fx_ + ry * fy_ + rz * fz_));
+    g_flyY = shapeSteer(-(rx * hx + ry * hy + rz * hz));
+  }
+  g_shake = g_shake * 0.8f + fabsf(mag - 1.f) * 0.2f;
+  if (g_shake > 0.5f && millis() - g_shakeAt > 350) {
+    g_shakeAt = millis(); g_shakeKick = true;
+    g_hue = fmodf(g_hue + 40.f + (esp_random() % 120), 360.f);
+    hap(150, 40);
+  }
+}
+static void calService() {
+  uint32_t now = millis();
+  if (s_cal == CAL_RING) {                                  // a heartbeat that quickens as the ring closes
+    float u = clampf((now - s_calT) / 1200.f, 0.f, 1.f);
+    hapRumble(0.25f + u * 0.35f, 1.3f + u * 5.5f, 0.f);
+  }
+  // M5Unified's own gyro offset calibration runs while the device is held still (its documented method),
+  // then the offsets are saved to NVS. The neutral pose for flying is averaged over the same second.
+  static bool calOn = false;
+  if (s_cal == CAL_RUN && !calOn) { calOn = true; M5.Imu.setCalibration(0, 200, 0); }
+  if (s_cal == CAL_RUN && now - s_calT > 1200) {
+    M5.Imu.setCalibration(0, 0, 0); calOn = false;
+    M5.Imu.saveOffsetToNVS();
+    if (s_calN >= 8) {
+      float x = s_calS[0], y = s_calS[1], z = s_calS[2], n = sqrtf(x * x + y * y + z * z) + 1e-6f;
+      s_ref[0] = x / n; s_ref[1] = y / n; s_ref[2] = z / n; s_centeredAt = millis(); saveCal();
     }
-    newGameHold = 0;
-    if (M5.BtnA.wasClicked() || M5.BtnB.wasClicked() || M5.BtnC.wasClicked()) handleTap(0, 0);
-    return;
+    g_lookX = -g_ax; g_lookY = g_ay;
+    s_cal = CAL_DONE; s_calT = now; hapGesture(HG_SETTLE);
+  } else if (s_cal == CAL_DONE && now - s_calT > 900) s_cal = CAL_IDLE;
+}
+static void drawCal() {
+  uint32_t now = millis();
+  if (g_mode == MODE_TUNNEL && s_centeredAt && now - s_centeredAt < 900 && s_cal == CAL_IDLE) {
+    float u = (now - s_centeredAt) / 900.f;
+    canvas.drawCircle(160, 120, 14 + (int)(u * 30.f), wire::LIME);
+    canvas.setTextColor(wire::LIME); canvas.setCursor(160 - 24, 146); canvas.print("centered");
   }
-  if (lostOpen || endingOpen) { if (M5.BtnA.wasPressed() || M5.BtnB.wasPressed() || M5.BtnC.wasPressed()) handleTap(0, 0); return; }
-  if (stationOpen) {
-    if (M5.BtnA.wasPressed()) launch();
-    else if (M5.BtnB.wasPressed()) stationCommit();
-    else if (M5.BtnC.wasPressed()) { stationChoice = (stationChoice + 1) % STATION_ROWS; hx::pop(0.12f, 0.01f); }
-    return;
-  }
-  if (M5.BtnA.wasHold()) { mapOpen = true; mapPage = 0; mapTrace = -1; hx::pop(0.25f, 0.02f); return; }
-  if (M5.BtnA.wasClicked()) cycleTarget();   // release edge: a hold never cycles
-  if (M5.BtnC.wasHold()) { statusOpen = true; statusPage = 0; hx::pop(0.25f, 0.02f); return; }
-  if (M5.BtnB.wasClicked()) { captureNeutral(); tiltX = tiltY = tiltRoll = 0; rateYaw = ratePitch = rateRoll = 0; setBanner("ATTITUDE CENTERED", 900); hx::pop(0.2f, 0.02f); }
-  if (M5.BtnC.wasClicked()) { throttleT = 0.5f; setBanner("CRUISE", 700); hx::pop(0.2f, 0.02f); }   // release edge: a hold opens status
-
-  if (!neutralValid) captureNeutral();
-  if (M5.Imu.update()) {
-    auto d = M5.Imu.getImuData();
-    float ax = d.accel.x - neutralAx, ay = d.accel.y - neutralAy;
-    // soft deadzone + expo so a resting hand holds course
-    auto shape = [](float v) {
-      float a = fabsf(v);
-      if (a < 0.05f) return 0.f;
-      a = clampf((a - 0.05f) / 0.45f, 0, 1.4f);
-      return (v < 0 ? -1.f : 1.f) * (a * 0.45f + a * a * 0.55f);
-    };
-    // Device tip: X → pitch stick, Y → yaw stick (flip signs on device if mirrored)
-    tiltY = tiltY * 0.8f + shape(ay) * 0.2f;   // pitch
-    tiltX = tiltX * 0.8f + shape(ax) * 0.2f;   // yaw
-    // Steering-wheel roll: gyro about Z, intentional deadzone + ease-in
-    float gz = d.gyro.z;   // if no roll on device, try d.gyro.x or d.gyro.y
-    float ga = fabsf(gz);
-    float twist = 0.f;
-    const float dead = 0.45f;
-    if (ga > dead) {
-      float u = clampf((ga - dead) / 0.8f, 0.f, 1.f);
-      u = u * u;
-      twist = (gz < 0.f ? -1.f : 1.f) * u;
+  if (s_cal == CAL_RING) {
+    float u = clampf((now - s_calT) / 1200.f, 0.f, 1.f), r = 64.f * (1.f - u) * (1.f - u * 0.3f);
+    canvas.drawCircle(s_calX, s_calY, (int)r + 2, wire::PLUM);
+    canvas.drawCircle(s_calX, s_calY, (int)r + 1, wire::TEAL);
+    canvas.drawCircle(s_calX, s_calY, (int)r, wire::LIME);
+    for (int k = 0; k < 6; k++) {                              // six sigils converge with the ring
+      float a = k * 1.0471976f + u * 3.f;
+      canvas.fillCircle(s_calX + (int)(cosf(a) * r), s_calY + (int)(sinf(a) * r), 2, wire::LIME);
     }
-    tiltRoll = tiltRoll * 0.85f + twist * 0.15f;
+    canvas.fillCircle(s_calX, s_calY, 1 + (int)(u * 3.f), wire::LIME);
+  } else if (s_cal == CAL_RUN || s_cal == CAL_DONE) {
+    bool run = s_cal == CAL_RUN;
+    canvas.fillRoundRect(60, 96, 200, 48, 10, rgb565(4, 18, 20));
+    canvas.drawRoundRect(60, 96, 200, 48, 10, wire::TEAL);
+    canvas.drawRoundRect(61, 97, 198, 46, 9, wire::PLUM);
+    canvas.setTextSize(1); canvas.setTextColor(wire::LIME);
+    const char *t = run ? "hold it how you like - calibrating" : "centered on your grip";
+    canvas.setCursor(160 - (int)strlen(t) * 3, 108); canvas.print(t);
+    float u = run ? clampf((now - s_calT) / 1200.f, 0.f, 1.f) : 1.f;
+    canvas.fillRect(80, 126, (int)(160 * u), 4, wire::TEAL);
+    canvas.drawRect(80, 126, 160, 4, wire::PLUM);
   }
 }
 
 // ============================================================
-//  world update
+//  SWARM
 // ============================================================
-static float cruiseSpeed() { return layer == 0 ? 13.f : 15.f + layer * 2.5f; }
-static float speedWanted() {
-  // 0 .. 0.5 ramps stop..cruise, 0.5 .. 1 ramps cruise..boost (2x)
-  float c = cruiseSpeed();
-  return throttleT <= 0.5f ? c * (throttleT / 0.5f) : c * (1.f + (throttleT - 0.5f) * 2.f);
-}
+static const int N_PART = 72, N_TRAIL = 96;
+struct Particle { float x, y, vx, vy, hue; };
+struct Trail { int16_t x, y; uint16_t c; uint8_t life; };
+static Particle g_p[N_PART];
+static Trail g_tr[N_TRAIL];
+static int g_trI = 0;
 
-static void autopilot() {
-  if (dockTarget < 0 || objs[dockTarget].kind != K_DOCKGATE || objs[dockTarget].link < 0) { dockTarget = -1; return; }
-  Obj &g = objs[dockTarget];
-  Obj &st = objs[g.link];
-  // waypoints around the station, never through it: out to the side, round to
-  // the front, onto the slot's axis, then straight through the blue gate
-  V3 f = st.o.f;
-  V3 rel = shipPos - st.p;
-  float ax = dot(rel, f);
-  V3 latv = rel - f * ax;
-  float latd = len(latv);
-  V3 out = latd > 1.f ? latv * (1.f / latd) : st.o.r;
-  V3 aim;
-  float front = stationDockFront(st.bodyType) * st.radius;   // the gate, along the station's axis
-  float side;
-  if (st.bodyType == SS_RING) {
-    // the ring is open both ways: come in along the axis from whichever side you are on
-    float sg = ax >= 0.f ? 1.f : -1.f, d = fabsf(ax);
-    side = d;
-    if (d < 30.f && latd > st.radius * 0.45f) aim = st.p + f * (sg * 70.f) + out * (latd * 0.5f);     // stand off the plane
-    else if (latd > d * 0.3f + 2.f) aim = st.p + f * (sg * clampf(d * 0.5f, 12.f, 80.f));             // onto the axis
-    else aim = st.p - f * (sg * 6.f);                                                                   // through the middle
-  } else {
-    float clear = st.radius * (st.bodyType == SS_OUTPOST ? 4.f : 3.4f);
-    float hullFront = front - 6.f;
-    side = ax - front;                         // distance in front of the dock gate
-    if (ax < hullFront && latd < clear * 0.72f) aim = st.p + out * clear + f * clampf(ax, -2.f * st.radius, 60.f);   // clear the hull
-    else if (ax < hullFront) aim = st.p + f * (front + 57.f) + out * 25.f;                                          // round to the front
-    else if (latd > side * 0.3f + 2.f) aim = st.p + f * (front + clampf(side * 0.5f, 12.f, 80.f));                 // onto the axis
-    else aim = g.p - f * 6.f;                                                                                       // through the slot
+static void seedParticles() {
+  for (int i = 0; i < N_PART; i++) {
+    g_p[i].x = (float)(esp_random() % W); g_p[i].y = (float)(14 + esp_random() % (H - 30));
+    g_p[i].vx = ((int)(esp_random() % 100) - 50) * 0.03f; g_p[i].vy = ((int)(esp_random() % 100) - 50) * 0.03f;
+    g_p[i].hue = g_hue + (esp_random() % 60) - 30;
   }
-  V3 loc = shipB.toLocal(norm(aim - shipPos));
-  shipB.yaw(clampf(atan2f(loc.x, loc.z), -1.2f * dt, 1.2f * dt));
-  shipB.pitch(clampf(-atan2f(loc.y, loc.z), -1.2f * dt, 1.2f * dt));
-  shipB.roll(clampf(dot(shipB.r, st.o.u), -0.8f * dt, 0.8f * dt));   // level to the station
-  shipB.fix();
-  throttleT = (side > -2.f && side < 45.f) ? 0.3f : 0.5f;
-  hx::hum(hx::HUM_ENGINE, 0.12f, 35.f, 0.1f);
 }
-
-static void updateContacts() {
-  for (int i = 0; i < MAX_OBJ; i++) {
-    Obj &o = objs[i];
-    if (o.kind == K_NONE) continue;
-    if (o.timer > 0) o.timer -= dt;
-    if (o.spin != 0 && o.kind != K_SHIP && o.kind != K_STATION) { o.o.roll(o.spin * dt); o.o.yaw(o.spin * 0.37f * dt); o.o.fix(); }
-    if (o.kind == K_STATION) { o.o.roll(o.spin * dt); o.o.fix(); }
-    if (o.kind == K_SHIP) {
-      V3 toMe = shipPos - o.p;
-      float d = len(toMe);
-      if (o.hostile && !o.engaged && o.timer <= 0 && theater == TH_NONE) {
-        // hunters bend toward you
-        o.v = o.v + (norm(toMe) * 12.f - o.v) * clampf(dt * 0.9f, 0, 1);
-        if (d < 42.f) {
-          float slip = sm::capTier(sm::CAP_CLOAK) * 0.12f + sm::rankOf(sm::CR_GHOST) * 0.02f;
-          o.engaged = true;
-          if (rf(0, 1) < slip) {
-            setBanner("THEY LOSE YOU IN THE DARK", 1600); sm::grantXp(sm::CR_GHOST, 5);
-            o.hostile = false; o.v = norm(o.p - shipPos) * 12.f;
-          } else {
-            char b[112]; snprintf(b, sizeof(b), "%s: %s", o.name, sm::encounterFlavor((sm::EncounterClass)o.enc, (uint8_t)layer).attack);
-            setBanner(b, 1800);
-            target = i; ambushed = true;
-            beginTheater(i, VB_ATTACK);
-            hx::thud(0.8f);
-          }
+static void addTrail(int x, int y, uint16_t c) {
+  g_tr[g_trI] = {(int16_t)x, (int16_t)y, c, 40};
+  g_trI = (g_trI + 1) % N_TRAIL;
+}
+static void drawPsyBg() {
+  float pulse = 0.08f + g_level * 0.18f + g_peak * 0.12f;
+  // mantis aura: teal / plum breathing with the room's sound
+  for (int y = 14; y < H - 14; y += 4) {
+    float u = (float)(y - 14) / (H - 28), s = 0.5f + 0.5f * sinf(u * 6.f + g_t * 0.7f);
+    float k = 0.10f + g_level * 0.25f;
+    canvas.fillRect(0, y, W, 4, rgb565((uint8_t)(93 * s * k), (uint8_t)(115 * (1.f - s) * k), (uint8_t)((115 * (1.f - s) + 93 * s) * k)));
+  }
+  for (int i = 0; i < 12; i++) {
+    float yy = 16.f + fmodf(i * 19.f + g_t * (12.f + g_level * 40.f) + g_lookY * 30.f + 400.f, (float)(H - 30));
+    canvas.drawFastHLine(0, (int)yy, W, hsv565(g_hue + i * 18.f + g_t * 15.f, 0.7f, pulse * (0.5f + 0.5f * sinf(i + g_t * 2.f))));
+  }
+  for (int i = 0; i < 10; i++) {
+    float xx = fmodf(i * 37.f + g_t * (8.f + g_peak * 25.f) + g_lookX * 40.f + 400.f, (float)W);
+    canvas.drawFastVLine((int)xx, 14, H - 28, hsv565(g_hue + 80.f + i * 12.f, 0.6f, 0.06f + g_peak * 0.15f * (0.5f + 0.5f * sinf(i * 1.7f + g_t))));
+  }
+}
+static void drawTinyMantis(int cx, int cy) {
+  const int sc = 5;
+  int dw = MANTIS_W / sc, dh = MANTIS_H / sc, ox = cx - dw / 2, oy = cy - dh / 2;
+  for (int y = 0; y < dh; y++)
+    for (int x = 0; x < dw; x++) {
+      uint16_t c = mantis_splash[(y * sc) * MANTIS_W + x * sc];
+      if (c) canvas.drawPixel(ox + x, oy + y, c);
+    }
+}
+// ---- CHAOS: jelly globs under real gravity. They merge (weakly) into bigger globs, burst into
+//      droplets when you shake, flow around, avoid your finger, and never settle into a dead heap. ----
+struct Jelly { float x, y, vx, vy, m, hue, wob; bool live; };
+static const int NJ = 70;
+static Jelly s_j[NJ];
+static bool s_jInit = false;
+static inline float jR(float m) { return 4.f + sqrtf(m) * 3.2f; }
+static int jSpawn(float x, float y, float vx, float vy, float m, float hue) {
+  for (int i = 0; i < NJ; i++) if (!s_j[i].live) { s_j[i] = {x, y, vx, vy, m, hue, (esp_random() % 628) / 100.f, true}; return i; }
+  return -1;
+}
+static void chaosJelly() {
+  float dt = fminf(g_dt, 0.05f);
+  if (!s_jInit) {
+    s_jInit = true;
+    for (int i = 0; i < 26; i++) jSpawn(30.f + (esp_random() % 260), 30.f + (esp_random() % 170), 0, 0, 1.f + (esp_random() % 30) / 10.f, (float)(esp_random() % 360));
+  }
+  float soundHue = g_hue + g_level * 100.f + aud::centroid * 90.f;
+  // shake: globs burst into droplets of random sizes, flung apart
+  if (g_shakeKick) {
+    for (int i = 0; i < NJ; i++) {
+      Jelly &b = s_j[i];
+      if (!b.live) continue;
+      float a0 = (esp_random() % 628) / 100.f, sp = 160.f + (esp_random() % 220);
+      if (b.m > 1.6f) {
+        int pieces = 2 + (int)(esp_random() % 4);
+        float left = b.m;
+        for (int k = 0; k < pieces && left > 0.4f; k++) {
+          float share = k == pieces - 1 ? left : left * (0.2f + (esp_random() % 50) / 100.f);
+          float a = a0 + k * 6.2831853f / pieces + ((int)(esp_random() % 60) - 30) / 100.f;
+          if (k == 0) { b.m = share; b.vx += cosf(a) * sp; b.vy += sinf(a) * sp; }
+          else jSpawn(b.x + cosf(a) * 4.f, b.y + sinf(a) * 4.f, b.vx + cosf(a) * sp, b.vy + sinf(a) * sp, share, b.hue + k * 25.f);
+          left -= share;
         }
-      }
-      if (theater != TH_NONE && theaterObj == i) {
-        if (d > 25.f) o.v = o.v + (norm(toMe) * 6.f - o.v) * clampf(dt, 0, 1);
-        else if (d < 20.f) o.v = o.v + (norm(-toMe) * 6.f - o.v) * clampf(dt, 0, 1);
-      }
-      if (len(o.v) > 0.5f) o.o = Basis::facing(norm(o.v), V3{0, 1, 0});
-    }
-    if (o.kind == K_SHIP || o.kind == K_POD || o.kind == K_WRECK) o.p += o.v * dt;
-    bool transient = o.kind == K_SHIP || o.kind == K_POD || o.kind == K_WRECK || o.kind == K_ARTIFACT || o.kind == K_ANOMALY || o.kind == K_ROCK;
-    float far = o.kind == K_SHIP ? 520.f : 700.f;
-    if (transient && i != theaterObj && distTo(o) > far) { if (target == i) target = -1; killObj(i); }
-  }
-}
-
-// The nearest point of a station's hull to p, and how thick the hull is there.
-static void stationHull(const Obj &st, V3 p, V3 &c, float &cr) {
-  V3 rel = p - st.p, f = st.o.f;
-  float ax = dot(rel, f);
-  switch (st.bodyType) {
-    case SS_RING: {   // a torus: the middle is open (that is the dock)
-      V3 radial = rel - f * ax;
-      float rl = len(radial);
-      c = st.p + (rl > 1e-3f ? radial * (1.f / rl) : st.o.r) * st.radius;
-      cr = st.radius * 0.3f;
-      return;
-    }
-    case SS_SPINDLE: {   // a capsule along its axis
-      float t = clampf(ax, -1.75f * st.radius, 0.45f * st.radius);   // stops short of the dock gate at the tip
-      c = st.p + f * t; cr = st.radius * 0.58f;
-      return;
-    }
-    case SS_OUTPOST: c = st.p; cr = st.radius * 1.35f; return;
-    default: c = st.p; cr = st.radius * 1.15f; return;
-  }
-}
-
-static void collide() {
-  for (int i = 0; i < MAX_OBJ; i++) {
-    Obj &o = objs[i];
-    if (!(o.kind == K_STATION || o.kind == K_ROCK || o.kind == K_BODY || o.kind == K_LANDMARK || o.kind == K_SHIP)) continue;
-    float r = o.radius * 1.05f;
-    V3 centre = o.p;
-    if (o.kind == K_STATION) stationHull(o, shipPos, centre, r);
-    V3 d = shipPos - centre;
-    float l = len(d);
-    if (l >= r || l < 1e-3f) continue;
-    V3 nrm = d * (1.f / l);
-    shipPos = centre + nrm * (r + 0.2f);
-    // glance off: turn the nose along the surface and lose speed
-    float into = -dot(shipB.f, nrm);
-    if (into > 0.f) { shipB.f = norm(shipB.f + nrm * (into * 1.3f)); shipB.fix(); }
-    float impact = shipSpeed * clampf(into, 0.2f, 1.f);
-    shipSpeed *= 0.35f;
-    if (o.kind == K_BODY && o.bodyType == BT_HOLE) {
-      setBanner("THE COLLAPSED STAR TAKES A BITE OF THE HULL", 2000);
-      if (damage(18)) return;
-    } else if (o.timer <= 0) {
-      o.timer = 1.2f;
-      int dmg = (int)clampf(impact * 0.35f, 1.f, o.kind == K_BODY ? 8.f : 6.f);
-      setBanner(o.kind == K_BODY ? (isStarBody(o.bodyType) ? "CORONA BURN - PULL AWAY" : "ATMOSPHERE SKIP - SHIELDS SCREAM") : "SCRAPED THE HULL", 1200);
-      if (damage(dmg)) return;
+      } else { b.vx += cosf(a0) * sp; b.vy += sinf(a0) * sp; }
     }
   }
-}
-
-static void gateCrossings() {
-  for (int i = 0; i < MAX_OBJ; i++) {
-    Obj &g = objs[i];
-    if (g.kind != K_GATE && g.kind != K_PORTAL && g.kind != K_DOCKGATE) continue;
-    float side = dot(shipPos - g.p, g.o.f);
-    float prev = g.prevSide;
-    g.prevSide = side;
-    bool crossed = (prev > 0 && side <= 0) || (prev < 0 && side >= 0);
-    if (!crossed || fabsf(prev - side) < 1e-5f) continue;
-    if (dockTarget >= 0 && i != dockTarget) continue;   // the docking computer only threads the dock
-    V3 x = lerp3(prevShipPos, shipPos, prev / (prev - side));
-    if (len(x - g.p) < g.radius) { threadGate(g); return; }   // world may have changed
-    if (g.kind == K_PORTAL && len(x - g.p) < g.radius * 2.2f) {
-      setBanner("THE PORTAL REJECTS A CROOKED APPROACH - COME ROUND", 1800);
-      hx::stutter(0.4f, 3, 0.08f);
-    }
-  }
-}
-
-static float starHeat = 0.f;
-static void heatWorld() {
-  for (auto &o : objs) {
-    if (o.kind != K_BODY || !isStarBody(o.bodyType)) continue;
-    float sd = surfaceDist(o), heatR = o.radius * 0.6f;
-    if (sd > heatR) continue;
-    float close = 1.f - clampf(sd / heatR, 0.f, 1.f);
-    hx::hum(hx::HUM_BODY, 0.3f + 0.5f * close, 9.f + 14.f * close, 0.7f);   // a rasping heat
-    starHeat += dt * (1.f + close * 2.5f);
-    if (starHeat >= 0.9f) {
-      starHeat = 0.f;
-      char b[48]; snprintf(b, sizeof(b), "HULL HEATING - %d%%", (int)(40 + close * 60));
-      setBanner(b, 900);
-      if (damage(1 + (int)(close * 3.f))) return;
-    }
-  }
-}
-
-static void hapticWorld() {
-  // heavy bodies: a slow tidal throb that grows as you close in
-  for (auto &o : objs) {
-    if (o.kind != K_BODY) continue;
-    float sd = surfaceDist(o), range = o.bodyType == BT_HOLE ? o.radius * 14.f : o.radius * 1.6f;
-    if (sd > range) continue;
-    float k = 1.f - sd / range; k = k * k;
-    if (o.bodyType == BT_HOLE) hx::hum(hx::HUM_BODY, 0.2f + 0.7f * k, 0.6f + 2.4f * k, 0.3f);
-    else hx::hum(hx::HUM_BODY, 0.45f * k, 0.55f + 0.5f * k, 0.12f);
-  }
-  // portals: spacetime tearing, building to the crossing
-  for (auto &o : objs) {
-    if (o.kind != K_PORTAL) continue;
-    float d = distTo(o);
-    if (d > 260) continue;
-    float k = clampf(1.f - d / 260.f, 0, 1);
-    hx::hum(hx::HUM_PORTAL, 0.08f + 0.9f * powf(k, 1.7f), 1.5f + 16.f * k, 0.15f + 0.35f * k);
-  }
-  // subspace pressure and the heartbeat of the deep
-  if (layer > 0) {
-    hx::hum(hx::HUM_DEEP, 0.04f + layer * 0.035f, 0.25f + layer * 0.12f, 0.05f * layer);
-    static float beatT = 0;
-    beatT -= dt;
-    if (layer >= 3 && beatT <= 0) {
-      hx::heartbeat(0.35f + (layer - 3) * 0.3f);
-      if (layer == 4) deepFlash = 1.f;
-      beatT = layer == 4 ? rf(0.9f, 1.7f) : 1.35f;
-    }
-  }
-  if (throttleT > 0.75f && shipSpeed > 5) hx::hum(hx::HUM_ENGINE, 0.08f + (throttleT - 0.75f) * 0.3f, 42.f, 0.2f);
-}
-
-static void updateWorld() {
-  sm::simTick(millis());
-  sm::contractTick();
-  serviceBanner();
-  sm::Contract done;
-  if (sm::contractTakeCompleted(done)) {
-    char b[112]; snprintf(b, sizeof(b), "JOB DONE: %s +%dcr", done.title, done.pay);
-    { char jb[72]; snprintf(jb, sizeof(jb), "Finished %s%s%s. Paid %d.", done.title, done.dest[0] ? " to " : "", done.dest, done.pay); sm::journalAdd(jb); }
-    noteBanner(b, 2800); hx::swell(0.5f, 0.1f, 0.3f);
-  }
-  if (crossFlash > 0) crossFlash -= dt * 2.2f;
-  if (deepFlash > 0) deepFlash -= dt * 3.5f;
-  if (hitFlash > 0) hitFlash -= dt;
-  fovPulse = layer >= 3 ? 1.f + 0.035f * (layer - 2) * sinf(tNow * 1.7f) + (layer == 4 ? deepFlash * 0.06f : 0.f) : 1.f;
-
-  if (dockAnim > 0) { dockAnim -= dt; if (dockAnim <= 0) openBoard(); return; }
-  if (stationOpen || endingOpen || lostOpen || bootOpen || statusOpen || mapOpen) return;
-  alienTick();
-  if (alienHolds() || (alien.active && alien.t >= 22.f)) {
-    // dead stick: the ship coasts to a halt, nothing else moves
-    shipSpeed *= expf(-dt * 1.4f); rateYaw = ratePitch = 0;
-    prevShipPos = shipPos; shipPos += shipB.f * (shipSpeed * dt);
-    for (auto &o : objs) if (o.kind != K_NONE) o.prevSide = dot(shipPos - o.p, o.o.f);
-    return;
-  }
-  if (launchAnim > 0) launchAnim -= dt;
-
-  // attitude: tilt aims, with a little mass
-  if (dockTarget >= 0) autopilot();
-  else {
-    float k = 1.f - expf(-dt / 0.12f);
-    rateYaw += (-tiltX * 1.15f - rateYaw) * k;
-    ratePitch += (-tiltY * 1.0f - ratePitch) * k;
-    rateRoll += (tiltRoll * 1.2f - rateRoll) * k;
-    shipB.yaw(rateYaw * dt);
-    shipB.pitch(ratePitch * dt);
-    shipB.roll(rateRoll * dt);
-    // light assistance only when nearly threaded: a nudge toward the ring's heart
-    for (auto &g : objs) {
-      if (g.kind != K_GATE && g.kind != K_PORTAL && g.kind != K_DOCKGATE) continue;
-      V3 c = shipB.toLocal(g.p - shipPos);
-      if (c.z < 4.f || c.z > 50.f) continue;
-      float off = sqrtf(c.x * c.x + c.y * c.y) / c.z;
-      if (off > 0.45f) continue;
-      float k = (1.f - off / 0.45f) * 0.55f * dt;
-      shipB.yaw(clampf(atan2f(c.x, c.z), -k, k));
-      shipB.pitch(clampf(-atan2f(c.y, c.z), -k, k));
-      break;
-    }
-    shipB.fix();
-  }
-  float want = speedWanted();
-  if (theater == TH_COMBAT || theater == TH_BEAM) want = fminf(want, cruiseSpeed() * 0.4f);
-  if (sm::sheet().fuel == 0 && layer == 0) want *= 0.6f;
-  shipSpeed += (want - shipSpeed) * (1.f - expf(-dt / 0.6f));
-  prevShipPos = shipPos;
-  shipPos += shipB.f * (shipSpeed * dt);
-
-  for (auto &d : dust) {   // dust wraps around the ship
-    V3 rel = d - shipPos;
-    if (len(rel) > 60.f || dot(rel, shipB.f) < -20.f) d = shipPos + norm(shipB.f * rf(0.6f, 1.f) + randDir() * 0.7f) * rf(25, 60);
-  }
-
-  int layerBefore = layer;
-  uint32_t livesBefore = sm::sheet().lives;
-  gateCrossings();
-  if (layer != layerBefore || sm::sheet().lives != livesBefore || stationOpen || dockAnim > 0) return;
-  collide();
-  updateContacts();
-  theaterTick();
-  heatWorld();
-  hapticWorld();
-
-  spawnTimer -= dt;
-  if (spawnTimer <= 0) {
-    spawnTimer = layer == 0 ? rf(6, 12) : rf(5, 10);
-    int contacts = countKind(K_SHIP) + countKind(K_POD) + countKind(K_WRECK) + countKind(K_ARTIFACT) + countKind(K_ANOMALY);
-    if (contacts < 4 && rf(0, 1) < 0.7f) spawnContact();
-  }
-
-  // the trip path never vanishes: if the next gate is lost, lay another ahead
-  sm::Trip &tr = sm::trip();
-  if (tr.active && navObj >= 0 && (objs[navObj].kind == K_NONE || distTo(objs[navObj]) > 900.f)) { killObj(navObj); navObj = -1; }
-  if (tr.active && navObj < 0) spawnNextOnPath();
-
-  // real space: slow idle burn; subspace costs are paid at the portals
-  static float burn = 0;
-  if (layer == 0) { burn += dt * (throttleT > 0.75f ? 3.f : 1.f); if (burn > 12.f) { burn = 0; if (sm::sheet().fuel > 0) sm::burnFuel(1); } }
-
-  // wandered off in real space with nothing named nearby: new gates drift into view
-  if (layer == 0 && !tr.active) {
-    int dests = 0;
-    for (int i = 0; i < MAX_OBJ; i++) {
-      if (objs[i].kind != K_GATE || !(objs[i].gflags & GF_DEST)) continue;
-      if (distTo(objs[i]) > 900) { if (target == i) target = -1; killObj(i); } else dests++;
-    }
-    if (dests == 0) placeDestGates(ri(3, 4));
-  }
-
-  for (int i = 0; i < boltN; ) { if (--bolts[i].life == 0) bolts[i] = bolts[--boltN]; else i++; }
-  for (auto &b : booms) if (b.alive) { b.t += dt; if (b.t > 1.3f) b.alive = false; }
-  if (millis() > lastSave + 30000) saveAll();
-  serviceSD(false);
-}
-
-// ============================================================
-//  draw
-// ============================================================
-static int order[MAX_OBJ];
-static float orderZ[MAX_OBJ];
-
-static void drawGateLike(Obj &o, float sx, float sy, float z) {
-  float r = o.radius * FOCAL / z;
-  if (o.kind == K_PORTAL) {
-    int next = sm::tripPortalGoesUp() ? layer - 1 : layer + 1;
-    if (r > 3 && onScreen(sx, sy, r)) {
-      // the next layer is already visible through the hole
-      if (next <= 0) {
-        cv.fillCircle((int)sx, (int)sy, (int)(r * 0.92f), rgb(2, 3, 8));
-        if (r > 10) for (int s = 0; s < NSTARS; s += 3) {
-          float px, py;
-          if (!projectDir(stars[s].d, px, py)) continue;
-          if ((px - sx) * (px - sx) + (py - sy) * (py - sy) < r * r * 0.8f) cv.drawPixel((int)px, (int)py, stars[s].col);
+  // pairs: squishy contact (no stacking), weak cohesion nearby, gentle merging when they meet slowly
+  for (int i = 0; i < NJ; i++) {
+    Jelly &a = s_j[i];
+    if (!a.live) continue;
+    float ra = jR(a.m);
+    for (int k = i + 1; k < NJ; k++) {
+      Jelly &b = s_j[k];
+      if (!b.live) continue;
+      float dx = b.x - a.x, dy = b.y - a.y, d2 = dx * dx + dy * dy, rr = ra + jR(b.m);
+      if (d2 > (rr + 16.f) * (rr + 16.f) || d2 < 0.01f) continue;
+      float d = sqrtf(d2), nx = dx / d, ny = dy / d;
+      if (d < rr) {
+        float rv = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
+        if (fabsf(rv) < 45.f && a.m + b.m < 14.f && (esp_random() % 1000) < 6) {       // merge (weak tendency)
+          float M = a.m + b.m;
+          a.x = (a.x * a.m + b.x * b.m) / M; a.y = (a.y * a.m + b.y * b.m) / M;
+          a.vx = (a.vx * a.m + b.vx * b.m) / M; a.vy = (a.vy * a.m + b.vy * b.m) / M;
+          a.m = M; a.wob += 1.5f; b.live = false; ra = jR(a.m);
+          continue;
         }
-      } else { fieldGain = 1.9f; drawField(next, sx, sy, r * 0.92f); fieldGain = 1.f; }
-      for (int k = 1; k <= 3; k++)
-        cv.drawCircle((int)sx, (int)sy, (int)(r * (0.25f + 0.2f * k + 0.05f * fsin(tNow * 3 - k))), hsv(layerHue(next < 0 ? 0 : next) + k * 25, 0.7f, 0.55f));
-    }
-    drawRing(o, o.radius, rgb(200, 80, 220), 32, 0.05f, tNow * 7.f, 3);
-    drawRing(o, o.radius * 1.07f, rgb(160, 255, 120), 24, 0.08f, -tNow * 5.f, 1);
-    if (layer >= 3) drawRing(o, o.radius * 1.15f, hsv(layerHue(layer), 0.8f, 0.7f), 20, 0.12f, tNow * 3.f, 1);
-    return;
-  }
-  uint16_t col = gateColor(o);
-  V3 c = shipB.toLocal(o.p - shipPos);
-  bool aligned = c.z > 0 && c.z < 80 && sqrtf(c.x * c.x + c.y * c.y) < o.radius * 0.8f;
-  if (layer >= 3) {   // chromatic ghosts in the deep
-    Obj gh = o; gh.p = o.p + shipB.r * 0.6f;
-    drawRing(gh, o.radius, hsv(layerHue(layer) + 120, 0.9f, 0.6f), 18, 0.02f, tNow, 1);
-  }
-  drawRing(o, o.radius, col, 22, 0.f, 0, aligned ? 3 : 2);
-  drawRing(o, o.radius * 0.9f, shade(col, 0.5f), 18, 0.f, 0, 1);
-  if (o.gflags & GF_CHAIN) {   // chevrons turning inward
-    for (int s = 0; s < 4; s++) {
-      float a = s * 1.5708f + tNow * 0.8f;
-      V3 dir = o.o.r * cosf(a) + o.o.u * sinf(a);
-      float bx, by, bz, tx, ty, tz;
-      if (project(o.p + dir * (o.radius * 1.14f), bx, by, bz) && project(o.p + dir * (o.radius * 0.98f), tx, ty, tz))
-        cv.drawLine((int)bx, (int)by, (int)tx, (int)ty, col);
-    }
-  }
-  if (aligned) cv.drawCircle((int)sx, (int)sy, (int)(r * 1.25f) + 2, rgb(240, 240, 210));
-  if (o.kind == K_DOCKGATE && r > 3) {
-    bool due = dueHereNow();
-    cv.setTextColor(col); cv.setCursor((int)sx - (due ? 24 : 12), (int)(sy - r - 11)); cv.print(due ? "DOCK - JOB" : "DOCK");
-  } else if (r > 2.5f && (o.gflags & GF_DEST) && z < 700) {
-    cv.setTextColor(col);
-    cv.setCursor((int)sx - (int)strlen(o.name) * 3, (int)(sy - r - 20)); cv.print(o.name);
-    sm::DepthAbility da = sm::depthQuery(o.depth);
-    bool risky = o.depth > da.maxBand;
-    char dl[28];
-    bool viaHub = o.lmId && !(o.gflags & GF_FIXED);
-    snprintf(dl, sizeof(dl), "DEPTH %u%s%s", o.depth, risky ? " !" : "", (o.gflags & GF_JOB) ? "  JOB" : (o.gflags & GF_FIXED) ? "  FIXED" : viaHub ? "  VIA" : (o.gflags & GF_UNKNOWN) ? "  ?" : "");
-    cv.setTextColor(risky ? rgb(255, 110, 90) : shade(col, 0.8f));
-    cv.setCursor((int)sx - (int)strlen(dl) * 3, (int)(sy - r - 10)); cv.print(dl);
-  } else if (r > 3 && (o.gflags & GF_LOCALNAME)) {
-    cv.setTextColor(col); cv.setCursor((int)sx - (int)strlen(o.name) * 3, (int)(sy - r - 11)); cv.print(o.name);
-  }
-}
-
-static void drawObjects() {
-  int n = 0;
-  for (int i = 0; i < MAX_OBJ; i++) {
-    if (objs[i].kind == K_NONE) continue;
-    V3 c = shipB.toLocal(objs[i].p - shipPos);
-    if (c.z < -objs[i].radius) continue;
-    order[n] = i; orderZ[n] = c.z; n++;
-  }
-  for (int i = 1; i < n; i++) {   // far to near
-    int oi = order[i]; float z = orderZ[i]; int j = i - 1;
-    while (j >= 0 && orderZ[j] < z) { order[j + 1] = order[j]; orderZ[j + 1] = orderZ[j]; j--; }
-    order[j + 1] = oi; orderZ[j + 1] = z;
-  }
-  lensOn = alienLensOn;
-  if (alienLensOn) { lensX = alienLX; lensY = alienLY; lensR = alienLR; }
-  for (int k = 0; k < n; k++) {
-    Obj &o = objs[order[k]];
-    float sx, sy, z, outR;
-    switch (o.kind) {
-      case K_BODY: drawBody(o); break;
-      case K_STATION:
-        if (o.bodyType != SS_CORIOLIS) { drawStationObj(o); break; }
-        drawMesh(o, meshes[M_STATION], o.radius, o.col, rgb(200, 215, 230), true, outR);
-        if (project(o.p + o.o.f * o.radius * 0.98f, sx, sy, z) && dot(o.o.f, shipPos - o.p) > 0) {
-          int w = (int)clampf(o.radius * 0.55f * FOCAL / z, 2, 80), h = w / 3 + 1;
-          cv.fillRect((int)sx - w / 2, (int)sy - h / 2, w, h, rgb(4, 6, 10));
-          cv.drawRect((int)sx - w / 2, (int)sy - h / 2, w, h, ((int)(tNow * 3) & 1) ? rgb(90, 170, 255) : rgb(40, 80, 140));
-        }
-        break;
-      case K_SHIP:
-        if (o.mesh == 255) {   // the hostile: a thing of spines
-          if (project(o.p, sx, sy, z)) {
-            float r = o.radius * FOCAL / z;
-            for (int s = 0; s < 7; s++) {
-              float a = tNow * 1.3f + s * 0.8976f, rr = r * (1.f + 0.35f * fsin(tNow * 5.f + s));
-              cv.drawLine((int)sx, (int)sy, (int)(sx + fcos(a) * rr), (int)(sy + fsin(a) * rr), o.col);
-            }
-            cv.fillCircle((int)sx, (int)sy, (int)clampf(r * 0.25f, 1, 12), rgb(255, 150, 255));
-          }
-        } else {
-          if (layer >= 3) {   // the deep leaves afterimages
-            Obj echo = o; echo.p = o.p - o.v * 0.25f;
-            drawMesh(echo, meshes[o.mesh], o.radius, 0, hsv(layerHue(layer) + 180, 0.8f, 0.5f), false, outR);
-          }
-          uint16_t hull = shipLivery(o);
-          if (!hull) hull = o.col;
-          meshAmbient = 0.3f; meshDetail = 1;
-          if (o.ghost) { meshEmblem = 1; emblemArea = 0.f; decalSize = 0.f; }
-          drawMesh(o, meshes[o.mesh], o.radius, hull, o.ghost ? rgb(170, 190, 200) : shade(hull, 1.3f), true, outR);
-          if (o.ghost && emblemArea > 90.f) drawDecal(LOGO_GHOSTFLEET, o.o.u);
-          meshAccent = meshCanopy = 0; meshAmbient = 0.16f; meshDetail = 0; meshEmblem = 0;
-          if (outR > 2 && project(o.p - o.o.f * o.radius, sx, sy, z))   // engine glow
-            cv.fillCircle((int)sx, (int)sy, (int)clampf(outR * 0.12f, 1, 4), o.ghost ? rgb(200, 255, 230) : o.hostile ? rgb(255, 120, 80) : rgb(140, 200, 255));
-        }
-        break;
-      case K_ROCK: drawMesh(o, meshes[o.mesh], o.radius, o.uses ? o.col : shade(o.col, 0.5f), shade(o.col, 1.25f), true, outR); break;
-      case K_POD:
-        drawMesh(o, meshes[M_POD], o.radius, o.col, rgb(255, 255, 200), true, outR);
-        if (project(o.p, sx, sy, z) && ((int)(tNow * 3) & 1)) cv.fillCircle((int)sx, (int)sy, 2, rgb(80, 255, 120));
-        break;
-      case K_WRECK: drawMesh(o, meshes[M_COBRA], o.radius, rgb(40, 40, 46), rgb(120, 110, 100), true, outR); break;
-      case K_ARTIFACT:
-        drawMesh(o, meshes[M_TETRA], o.radius, 0, hsv(270 + 30 * fsin(tNow * 2), 0.6f, 1.f), false, outR);
-        if (project(o.p, sx, sy, z)) cv.fillCircle((int)sx, (int)sy, (int)clampf(outR * 0.25f, 1, 6), rgb(230, 200, 255));
-        break;
-      case K_ANOMALY:
-        if (project(o.p, sx, sy, z)) {
-          float r = o.radius * FOCAL / z;
-          for (int s = 0; s < 3; s++) cv.drawCircle((int)sx, (int)sy, (int)(r * (0.4f + 0.3f * s + 0.1f * fsin(tNow * 3 + s))), hsv(layerHue(layer) + 120 + s * 30, 0.6f, 0.9f));
-          for (int s = 0; s < 8; s++) { float a = tNow * 2 + s * 0.785f; cv.drawPixel((int)(sx + fcos(a) * r), (int)(sy + fsin(a) * r * 0.6f), rgb(255, 230, 255)); }
-        }
-        break;
-      case K_LANDMARK:
-        if (project(o.p, sx, sy, z)) {
-          float r = o.radius * FOCAL / z;
-          // a monument: a slow ring of stones around a steady light
-          for (int s = 0; s < 12; s++) {
-            float a = tNow * 0.15f + s * 0.5236f;
-            float x, y, zz;
-            if (project(o.p + (o.o.r * cosf(a) + o.o.u * sinf(a)) * o.radius, x, y, zz)) cv.fillRect((int)x - 1, (int)y - 1, 3, (int)clampf(6.f * FOCAL / zz, 2, 18), o.col);
-          }
-          cv.fillCircle((int)sx, (int)sy, (int)clampf(r * 0.18f, 2, 24), shade(o.col, 0.9f + 0.1f * fsin(tNow * 2)));
-          cv.drawCircle((int)sx, (int)sy, (int)clampf(r * 0.3f, 3, 40), shade(o.col, 0.5f));
-          if (r > 4) { cv.setTextColor(o.col); cv.setCursor((int)sx - (int)strlen(o.name) * 3, (int)(sy - r - 12)); cv.print(o.name); }
-        }
-        break;
-      case K_DOCKGATE: case K_GATE: case K_PORTAL:
-        if (project(o.p, sx, sy, z)) drawGateLike(o, sx, sy, z);
-        break;
-      default: break;
-    }
-    // a collapsed star bends light around itself for everything drawn after it
-    if (o.kind == K_BODY && o.bodyType == BT_HOLE && project(o.p, sx, sy, z)) {
-      float r = o.radius * FOCAL / z;
-      if (r > 2 && onScreen(sx, sy, r * 6)) { lensOn = true; lensX = sx; lensY = sy; lensR = r * 1.6f; }
-    }
-  }
-}
-
-static void drawBoomsAndBolts() {
-  for (auto &b : booms) {
-    if (!b.alive) continue;
-    float sx, sy, z;
-    if (!project(b.p, sx, sy, z)) continue;
-    float r = b.size * FOCAL / z * (0.3f + b.t * 1.4f);
-    cv.drawCircle((int)sx, (int)sy, (int)r, mix565(rgb(255, 255, 220), b.col, clampf(b.t * 2, 0, 1)));
-    cv.drawCircle((int)sx, (int)sy, (int)(r * 0.6f), shade(b.col, 1.f - b.t * 0.6f));
-    for (int k = 0; k < 10; k++) {
-      float a = k * 0.628f + b.p.x;
-      cv.drawPixel((int)(sx + cosf(a) * r * 1.3f), (int)(sy + sinf(a) * r * 1.3f), rgb(255, 200, 120));
-    }
-  }
-  for (int i = 0; i < boltN; i++) {
-    const Bolt &b = bolts[i];
-    cv.drawLine((int)b.x0, (int)b.y0, (int)b.x1, (int)b.y1, b.col);
-    if (b.life > 4) cv.drawLine((int)b.x0 + 1, (int)b.y0, (int)b.x1 + 1, (int)b.y1, rgb(255, 255, 220));
-  }
-  if (theaterObj >= 0 && objs[theaterObj].kind != K_NONE) {
-    float sx, sy, z;
-    if (!project(objs[theaterObj].p, sx, sy, z)) return;
-    if (theater == TH_BEAM) {
-      uint16_t c = theaterVerb == VB_SCOOP ? rgb(120, 210, 255) : theaterVerb == VB_CHART ? rgb(255, 215, 120)
-                 : (theaterVerb == VB_READ || theaterVerb == VB_SCAN) ? rgb(200, 150, 255) : rgb(170, 255, 110);
-      if (theaterVerb == VB_SCOOP) {
-        for (int k = 0; k < 8; k++) {
-          float u = fmodf(tNow * 1.4f + k * 0.125f, 1.f);
-          cv.fillCircle((int)(160 + (sx - 160) * (1 - u)), (int)(H - 8 + (sy - H + 8) * (1 - u)), 1, c);
-        }
+        float push = (rr - d) * 9.f;                                          // jelly pressure
+        a.vx -= nx * push * dt * 60.f * b.m / (a.m + b.m); a.vy -= ny * push * dt * 60.f * b.m / (a.m + b.m);
+        b.vx += nx * push * dt * 60.f * a.m / (a.m + b.m); b.vy += ny * push * dt * 60.f * a.m / (a.m + b.m);
       } else {
-        cv.drawLine(160, H - 6, (int)sx, (int)sy, c);
-        cv.drawLine(159, H - 6, (int)sx - 1, (int)sy, shade(c, 0.5f));
+        float pull = 26.f * dt;                                                // weak cohesion
+        a.vx += nx * pull; a.vy += ny * pull; b.vx -= nx * pull; b.vy -= ny * pull;
       }
-    } else if (theater == TH_COMM) {
-      for (int k = 0; k < 4; k++) {
-        float u = fmodf(theaterT * 1.8f + k * 0.25f, 1.f);
-        cv.drawCircle((int)(160 + (sx - 160) * u), (int)(H - 12 + (sy - H + 12) * u), 3 + k, rgb(90, 230, 140));
+    }
+  }
+  // forces, motion, walls
+  auto td = M5.Touch.getDetail();
+  bool touching = td.isPressed() && td.y > 16 && td.y < H - 18;
+  float G = 330.f;
+  for (int i = 0; i < NJ; i++) {
+    Jelly &b = s_j[i];
+    if (!b.live) continue;
+    b.vx += g_gravX * G * dt; b.vy += g_gravY * G * dt;
+    float st = 34.f + g_level * 110.f + aud::onset * 140.f;                     // the room's sound keeps them stirring
+    if (aud::onset > 0.35f && (esp_random() % 3) == 0) { b.vx += ((int)(esp_random() % 200) - 100) * aud::onset; b.vy -= (60 + esp_random() % 120) * aud::onset; }   // hops on the beat
+    if (b.m > 6.f && (esp_random() % 1000) < (int)(dt * 150.f)) {            // big globs sometimes pinch off a droplet
+      float part = b.m * (0.25f + (esp_random() % 30) / 100.f), a = (esp_random() % 628) / 100.f;
+      if (jSpawn(b.x + cosf(a) * jR(b.m), b.y + sinf(a) * jR(b.m), b.vx + cosf(a) * 90.f, b.vy + sinf(a) * 90.f, part, b.hue + 30.f) >= 0) b.m -= part;
+    }
+    b.vx += sinf(g_t * 1.3f + b.y * 0.03f + i) * st * dt; b.vy += cosf(g_t * 1.1f + b.x * 0.03f) * st * dt;
+    if (touching) {
+      float dx = b.x - td.x, dy = b.y - td.y, d2 = dx * dx + dy * dy + 1.f;
+      if (d2 < 60.f * 60.f) { float d = sqrtf(d2); b.vx += dx / d * 900.f * dt; b.vy += dy / d * 900.f * dt; }
+    }
+    float drag = 1.f - 1.4f * dt; b.vx *= drag; b.vy *= drag;
+    b.x += b.vx * dt; b.y += b.vy * dt;
+    float r = jR(b.m);
+    if (b.x < r) { b.x = r; b.vx = fabsf(b.vx) * 0.45f; }
+    if (b.x > W - r) { b.x = W - r; b.vx = -fabsf(b.vx) * 0.45f; }
+    if (b.y < 15 + r) { b.y = 15 + r; b.vy = fabsf(b.vy) * 0.45f; }
+    if (b.y > H - 15 - r) { b.y = H - 15 - r; b.vy = -fabsf(b.vy) * 0.45f; }
+    b.wob = fmaxf(0.f, b.wob - dt * 2.f);
+  }
+  // draw: liquid bridges first (metaball look), then glossy jelly bodies
+  for (int i = 0; i < NJ; i++) {
+    if (!s_j[i].live) continue;
+    for (int k = i + 1; k < NJ; k++) {
+      if (!s_j[k].live) continue;
+      float dx = s_j[k].x - s_j[i].x, dy = s_j[k].y - s_j[i].y, d = sqrtf(dx * dx + dy * dy);
+      float ri = jR(s_j[i].m), rk = jR(s_j[k].m);
+      if (d < (ri + rk) * 1.15f) {
+        float br = fminf(ri, rk) * (1.15f - d / (ri + rk)) * 1.6f;
+        if (br > 1.5f) canvas.fillCircle((int)((s_j[i].x * rk + s_j[k].x * ri) / (ri + rk)), (int)((s_j[i].y * rk + s_j[k].y * ri) / (ri + rk)), (int)br,
+                                         hsv565(soundHue + s_j[i].hue * 0.3f, 0.75f, 0.55f + g_level * 0.3f));
       }
+    }
+  }
+  for (int i = 0; i < NJ; i++) {
+    Jelly &b = s_j[i];
+    if (!b.live) continue;
+    float r = jR(b.m) * (1.f + aud::bass * 0.12f + 0.08f * b.wob * sinf(g_t * 20.f));
+    float h = soundHue + b.hue * 0.3f;
+    canvas.fillCircle((int)b.x, (int)b.y, (int)r + 1, hsv565(h + 20.f, 0.9f, 0.3f));
+    canvas.fillCircle((int)b.x, (int)b.y, (int)r, hsv565(h, 0.75f, 0.55f + g_level * 0.3f));
+    canvas.fillCircle((int)(b.x - r * 0.2f), (int)(b.y - r * 0.2f), (int)(r * 0.62f), hsv565(h - 10.f, 0.55f, 0.8f + g_level * 0.2f));
+    canvas.fillCircle((int)(b.x - r * 0.4f), (int)(b.y - r * 0.45f), (int)fmaxf(1.f, r * 0.18f), rgb565(255, 255, 255));
+  }
+  if (touching) drawTinyMantis(td.x, td.y);
+}
+
+static void modeSwarm() {
+  canvas.fillSprite(rgb565(8, 4, 16));
+  drawPsyBg();
+  for (int i = 0; i < N_TRAIL; i++) {
+    Trail &t = g_tr[i];
+    if (t.life < 2) continue;
+    int r = 1 + (t.life >> 4);
+    canvas.fillCircle(t.x, t.y, r, t.c);
+    t.life = (uint8_t)(t.life * 0.88f);
+  }
+  float gx = 0, gy = 0;
+  if (g_swarmVar == SV_CHAOS) { chaosJelly(); return; }
+  if (g_shakeKick) {                                    // shake: the swarm bursts apart
+    for (int i = 0; i < N_PART; i++) {
+      float a = (esp_random() % 6283) / 1000.f, s = 6.f + (esp_random() % 800) / 100.f;
+      float ox = g_p[i].x - W * 0.5f, oy = g_p[i].y - H * 0.5f, on = sqrtf(ox * ox + oy * oy) + 1.f;
+      g_p[i].vx += cosf(a) * s + ox / on * 5.f; g_p[i].vy += sinf(a) * s + oy / on * 5.f;
+      g_p[i].hue += 60.f;
+      addTrail((int)g_p[i].x, (int)g_p[i].y, hsv565(g_hue + i * 5.f, 0.9f, 0.9f));
+    }
+  }
+  float pulse = 0.45f + g_level * 1.5f;
+  float soundHue = g_hue + g_level * 100.f + g_peak * 40.f + aud::centroid * 90.f;
+  float metaR = (g_swarmVar == SV_ORBIT) ? 220.f : 500.f;
+  float metaPull = (g_swarmVar == SV_ORBIT) ? 0.0004f : 0.0015f;
+  for (int i = 0; i < N_PART; i++)
+    for (int j = i + 1; j < N_PART; j += 3) {
+      float dx = g_p[i].x - g_p[j].x, dy = g_p[i].y - g_p[j].y, d2 = dx * dx + dy * dy;
+      if (d2 < metaR && d2 > 1.f) {
+        float tt = 1.f - d2 / metaR;
+        int br = 2 + (int)(tt * (g_swarmVar == SV_ORBIT ? 4.f : 8.f) * (0.5f + g_level + aud::bass * 0.6f));
+        canvas.fillCircle((int)((g_p[i].x + g_p[j].x) * 0.5f), (int)((g_p[i].y + g_p[j].y) * 0.5f), br,
+                          hsv565(soundHue + i + j, 0.75f, 0.2f + tt * (0.4f + aud::onset * 0.4f)));
+        g_p[i].vx -= dx * metaPull * tt; g_p[i].vy -= dy * metaPull * tt;
+        g_p[j].vx += dx * metaPull * tt; g_p[j].vy += dy * metaPull * tt;
+      }
+    }
+  for (int i = 0; i < N_PART; i++) {
+    Particle &p = g_p[i];
+    float cx = W * 0.5f + sinf(g_t * 0.6f + i * 0.1f) * 22.f * g_peak;
+    float cy = H * 0.5f + cosf(g_t * 0.5f) * 16.f * g_level;
+    if (g_swarmVar == SV_FLOCK) {
+      p.vx += (cx - p.x) * 0.0022f * pulse; p.vy += (cy - p.y) * 0.0022f * pulse;
+      for (int j = 0; j < N_PART; j += 2) {
+        if (j == i) continue;
+        float sx = p.x - g_p[j].x, sy = p.y - g_p[j].y, d2 = sx * sx + sy * sy + 0.01f;
+        if (d2 < 900.f) { p.vx += sx / d2 * 12.f; p.vy += sy / d2 * 12.f; }
+      }
+      p.vx *= 0.94f; p.vy *= 0.94f;
+    } else if (g_swarmVar == SV_ORBIT) {
+      float dx = p.x - cx, dy = p.y - cy;
+      p.vx += -dy * 0.006f * pulse - dx * 0.001f; p.vy += dx * 0.006f * pulse - dy * 0.001f;
+      p.vx *= 0.95f; p.vy *= 0.95f;
+    } else {
+      p.vx += gx * 1.2f + sinf(g_t * 2.f + p.y * 0.05f) * 0.15f * (0.3f + g_level);
+      p.vy += gy * 1.2f + cosf(g_t * 1.7f + p.x * 0.05f) * 0.15f * (0.3f + g_level);
+      p.vx *= 0.92f; p.vy *= 0.92f;
+    }
+    if (aud::onset > 0.4f) { p.vx *= 1.4f; p.vy *= 1.4f; }
+    p.x += p.vx; p.y += p.vy;
+    if (p.x < 4) { p.x = 4; p.vx *= -0.6f; }
+    if (p.x > W - 5) { p.x = W - 5; p.vx *= -0.6f; }
+    if (p.y < 16) { p.y = 16; p.vy *= -0.6f; }
+    if (p.y > H - 18) { p.y = H - 18; p.vy *= -0.6f; }
+    float h = soundHue + p.hue * 0.3f + i * 2.f, v = 0.4f + g_level * 0.5f + g_peak * 0.15f;
+    int r = 3 + (int)(g_level * 7.f + aud::bass * 5.f + aud::onset * 3.f) + (i & 1);   // the mic makes them swell and throb
+    uint16_t col = hsv565(h, 0.8f, v);
+    canvas.fillCircle((int)p.x, (int)p.y, r, col);
+    if (r > 4) canvas.fillCircle((int)p.x - 1, (int)p.y - 1, r / 2, hsv565(h + 20.f, 0.5f, fminf(1.f, v + 0.2f)));
+    if ((i & 1) == 0) addTrail((int)p.x, (int)p.y, col);
+  }
+  auto td = M5.Touch.getDetail();
+  if (td.isPressed() && td.y > 16 && td.y < H - 18) {
+    int tx = td.x, ty = td.y;
+    drawTinyMantis(tx, ty);
+    for (int i = 0; i < 8; i++) addTrail(tx + (int)(esp_random() % 11) - 5, ty + (int)(esp_random() % 11) - 5, hsv565(soundHue + 40.f, 0.9f, 0.7f));
+    for (int i = 0; i < N_PART; i++) {
+      float dx = g_p[i].x - tx, dy = g_p[i].y - ty, d2 = dx * dx + dy * dy + 0.01f;
+      if (d2 < 900.f) { g_p[i].vx += dx / d2 * 40.f; g_p[i].vy += dy / d2 * 40.f; }
+      else if (d2 < 10000.f) { g_p[i].vx -= dx * 0.012f; g_p[i].vy -= dy * 0.012f; }
     }
   }
 }
 
-static void drawEdgeArrow(const Obj &o, uint16_t col) {
-  V3 c = shipB.toLocal(o.p - shipPos);
-  float sx, sy, z;
-  if (c.z > 0.5f && project(o.p, sx, sy, z) && onScreen(sx, sy, -6)) return;
-  float ax = c.x, ay = -c.y;
-  float l = sqrtf(ax * ax + ay * ay) + 1e-4f; ax /= l; ay /= l;
-  float ex = clampf(160 + ax * 150, 12, SLIDER_X - 12), ey = clampf(120 + ay * 105, 36, 204);
-  float px = -ay, py = ax;
-  cv.fillTriangle((int)(ex + ax * 7), (int)(ey + ay * 7), (int)(ex + px * 5), (int)(ey + py * 5), (int)(ex - px * 5), (int)(ey - py * 5), col);
-}
+// ============================================================
+//  EYE — hypnotic moire, wet eyeball, real eyelids, squirting tears
+// ============================================================
+struct Tear { float x, y, vx, vy, life; uint8_t kind; };   // 0 squirt, 1 drip, 2 splash
+static Tear s_tears[48];
+static float s_pain = 0, s_flinch = 0, s_shakeEye = 0, s_dizzy = 0, s_blinkE = 0, s_blinkTE = 2.f;
+static float s_irisHue = 110.f, s_gzX = 0, s_gzY = 0, s_startle = 0, s_angry = 0;
+static int s_pokeX = 0, s_pokeY = 0;
+static uint32_t s_pokeAt = 0;
+static const int ERX = 62, ERY = 44;
 
-static void drawTargeting() {
-  chipN = 0;
-  if (target < 0 || objs[target].kind == K_NONE) { target = -1; return; }
-  Obj &o = objs[target];
-  float sx, sy, z;
-  V3 c = shipB.toLocal(o.p - shipPos);
-  if (c.z <= 0.5f || !project(o.p, sx, sy, z) || !onScreen(sx, sy, -4)) { drawEdgeArrow(o, rgb(240, 240, 255)); return; }
-  float r = clampf(o.radius * FOCAL / z, 6, 90);
-  uint16_t bc = o.hostile ? rgb(255, 90, 80) : rgb(230, 235, 245);
-  int x0 = (int)(sx - r - 3), x1 = (int)(sx + r + 3), y0 = (int)(sy - r - 3), y1 = (int)(sy + r + 3), L = 5;
-  cv.drawLine(x0, y0, x0 + L, y0, bc); cv.drawLine(x0, y0, x0, y0 + L, bc);
-  cv.drawLine(x1, y0, x1 - L, y0, bc); cv.drawLine(x1, y0, x1, y0 + L, bc);
-  cv.drawLine(x0, y1, x0 + L, y1, bc); cv.drawLine(x0, y1, x0, y1 - L, bc);
-  cv.drawLine(x1, y1, x1 - L, y1, bc); cv.drawLine(x1, y1, x1, y1 - L, bc);
-  char info[40];
-  int sd = (int)(surfaceDist(o) * 10); if (sd < 0) sd = 0;
-  if (o.kind == K_GATE && (o.gflags & GF_DEST)) snprintf(info, sizeof(info), "%dm", sd);
-  else snprintf(info, sizeof(info), "%s %dm", o.name, sd);
-  cv.setTextColor(bc);
-  cv.setCursor((int)clampf(sx - (float)strlen(info) * 3, 2, (float)(SLIDER_X - 4) - (float)strlen(info) * 6), (int)clampf((float)y1 + 3, 36, 206));
-  cv.print(info);
-  if (theater != TH_NONE) return;
-  chipN = verbsFor(o, chips);
-  int w = 62, h = 19;
-  int x = x1 + 6;
-  if (x + w > SLIDER_X - 6) x = x0 - 6 - w;
-  x = (int)clampf((float)x, 4, (float)(SLIDER_X - 6 - w));
-  int y = (int)clampf(sy - (chipN * (h + 3)) / 2.f, 36, (float)(206 - chipN * (h + 3)));
-  for (int i = 0; i < chipN; i++) {
-    Chip &ch = chips[i];
-    ch.x = x; ch.y = y + i * (h + 3); ch.w = w; ch.h = h;
-    cv.fillRoundRect(ch.x, ch.y, ch.w, ch.h, 4, ch.enabled ? shade(ch.col, 0.35f) : rgb(22, 24, 30));
-    cv.drawRoundRect(ch.x, ch.y, ch.w, ch.h, 4, ch.enabled ? ch.col : rgb(70, 72, 80));
-    cv.setTextColor(ch.enabled ? rgb(245, 250, 245) : rgb(120, 124, 132));
-    const char *lab = ch.enabled ? ch.label : ch.note;
-    cv.setCursor(ch.x + (ch.w - (int)strlen(lab) * 6) / 2, ch.y + 6);
-    cv.print(lab);
+// ---- cat & dragon irises (long-press B). The basic eye is untouched. Everything here is clipped to the
+//      eyeball ellipse so nothing spills past the lids. ----
+static float s_ecx = 160, s_ecy = 120;                          // eyeball centre (set by the eye each frame)
+static float s_rage = 0, s_catSnap = 0, s_quietT = 0; static bool s_catSlow = false;
+static inline float eyeHalfW(float y) { float u = (y - s_ecy) / (ERY - 1); return u * u >= 1.f ? -1.f : (ERX - 1) * sqrtf(1.f - u * u); }
+static void spanEllipse(float cx, float cy, float rx, float ry, uint16_t c) {   // filled ellipse ∩ eyeball
+  for (int y = (int)(cy - ry); y <= (int)(cy + ry); y++) {
+    float v = (y - cy) / ry; if (v * v > 1.f) continue;
+    float w = rx * sqrtf(1.f - v * v), ew = eyeHalfW((float)y); if (ew < 0) continue;
+    int x0 = (int)fmaxf(cx - w, s_ecx - ew), x1 = (int)fminf(cx + w, s_ecx + ew);
+    if (x1 >= x0) canvas.drawFastHLine(x0, y, x1 - x0 + 1, c);
   }
 }
-
-static void printWrapped(int x, int y, int cols, int maxLines, int lineH, const char *s) {
-  char line[64];
-  if (cols > 63) cols = 63;
-  for (int ln = 0; ln < maxLines && s && *s; ln++) {
-    int n = (int)strlen(s), cut = n;
-    if (n > cols) { cut = cols; while (cut > cols / 3 && s[cut] != ' ') cut--; if (s[cut] != ' ') cut = cols; }
-    memcpy(line, s, (size_t)cut); line[cut] = 0;
-    cv.setCursor(x, y + ln * lineH); cv.print(line);
-    s += cut; while (*s == ' ') s++;
-  }
+static inline bool inEye(float x, float y) { float ew = eyeHalfW(y); return ew >= 0 && fabsf(x - s_ecx) <= ew; }
+static void eyeLine(float x0, float y0, float x1, float y1, uint16_t c) {       // trim to the eyeball
+  if (!inEye(x0, y0)) return;
+  if (!inEye(x1, y1)) { float a = 0, b = 1; for (int k = 0; k < 6; k++) { float mm = (a + b) * 0.5f; if (inEye(x0 + (x1 - x0) * mm, y0 + (y1 - y0) * mm)) a = mm; else b = mm; } x1 = x0 + (x1 - x0) * a; y1 = y0 + (y1 - y0) * a; }
+  canvas.drawLine((int)x0, (int)y0, (int)x1, (int)y1, c);
 }
-
-static void drawBanner() {
-  if (bannerUntil > millis()) {
-    cv.setTextColor(rgb(240, 245, 250));
-    printWrapped(6, 218, 50, 2, 11, banner);
-  }
-}
-
-static void drawHud() {
-  sm::Pilot &p = sm::sheet();
-  sm::Trip &tr = sm::trip();
-  // reticle leans with the turn
-  int rx = 160 + (int)(rateYaw * 10), ry = 120 - (int)(ratePitch * 10);
-  uint16_t rc = layer == 0 ? rgb(90, 140, 140) : hsv(layerHue(layer) + 180, 0.4f, 0.8f);
-  cv.drawLine(rx - 11, ry, rx - 5, ry, rc); cv.drawLine(rx + 5, ry, rx + 11, ry, rc);
-  cv.drawLine(rx, ry - 9, rx, ry - 4, rc); cv.drawLine(rx, ry + 4, rx, ry + 9, rc);
-
-  cv.setTextSize(1);
-  cv.setTextColor(layer == 0 ? rgb(90, 210, 200) : hsv(layerHue(layer) + 40, 0.6f, 1.f));
-  cv.setCursor(4, 4);
-  cv.print(layer == 0 ? hereName : layerName(layer));
-  bool lowHull = p.hull * 4 < p.hullMax, lowFuel = p.fuel < 15;
-  cv.setCursor(196, 4);
-  cv.setTextColor(lowHull ? rgb(255, 90, 80) : rgb(200, 210, 220)); cv.printf("H%d", p.hull);
-  cv.setTextColor(lowFuel ? rgb(255, 170, 60) : rgb(200, 210, 220)); cv.printf(" F%d", p.fuel);
-  cv.setTextColor(rgb(200, 210, 220)); cv.printf(" $%ld", (long)p.credits);
-
-  if (tr.active) {   // where, how deep, which way, and the three beats of the leg
-    cv.setTextColor(rgb(240, 210, 120));
-    cv.setCursor(4, 15); cv.printf("> %s", tr.dest);
-    cv.setTextColor(rgb(170, 160, 120));
-    cv.setCursor(4, 25); cv.printf("depth %u  %s", tr.destDepth, tr.ascending ? "climbing" : "diving");
-    int bx = 4 + 6 * 18;
-    for (int s = 0; s < 3; s++) {
-      if (s == 2) cv.drawCircle(bx + s * 10, 28, 3, sm::tripPortalReady() ? rgb(210, 110, 230) : rgb(80, 70, 90));
-      else cv.fillCircle(bx + s * 10, 28, 2, s < tr.step ? rgb(120, 240, 200) : rgb(60, 70, 70));
+static void eyeIrisStyled(float ix, float iy) {
+  float slitK = 1.f - clampf(g_level * 1.4f + aud::bass * 0.6f, 0.f, 1.f);   // sound opens the slit, quiet narrows it
+  if (s_eyeStyle == 1) {                                                     // CAT: big amber-green iris, vertical slit
+    int ir = (int)(ERY - 4 + g_peak * 3.f);
+    float h0 = 95.f + sinf(g_t * 0.2f) * 10.f;
+    spanEllipse(ix, iy, ir + 2, ir + 2, rgb565(20, 30, 8));
+    for (int k = 0; k < 5; k++) spanEllipse(ix, iy, ir - k * (ir / 6), ir - k * (ir / 6), hsv565(h0 - k * 14.f, 0.9f - k * 0.05f, 0.45f + k * 0.12f + g_level * 0.1f));
+    for (int k = 0; k < 36; k++) {
+      float a = k * 0.1745f + g_t * 0.05f;
+      eyeLine(ix + cosf(a) * ir * 0.35f, iy + sinf(a) * ir * 0.35f, ix + cosf(a) * (ir - 2), iy + sinf(a) * (ir - 2), hsv565(h0 + (k % 3) * 8.f, 0.7f, (k & 1) ? 0.85f : 0.5f));
     }
-  } else if (sm::contract().live) {
-    const sm::Contract &c = sm::contract();
-    cv.setTextColor(rgb(230, 200, 100)); cv.setCursor(4, 15);
-    cv.printf("JOB %s %u/%u", c.title, c.progress, c.need);
-    cv.setTextColor(rgb(150, 130, 80)); cv.setCursor(4, 25);
-    if (dueHereNow()) cv.print("-> deliver at the dock here");
-    else if (c.dest[0]) cv.printf("-> %s  depth %u", c.dest, c.destDepth); else cv.print(sm::contractHint(c));
+    float open = (1.f - slitK) * (1.f - s_catSnap);
+    float pw = fmaxf(2.f, 3.f + open * 15.f - s_pain * 2.f), ph = ir * 0.92f;
+    spanEllipse(ix, iy, pw + 2, ph + 1, hsv565(150.f, 0.8f, 0.25f + open * 0.3f));   // tapetum glow
+    spanEllipse(ix, iy, pw, ph, rgb565(4, 4, 6));
+    if (inEye(ix - ir / 3, iy - ir / 3)) canvas.fillCircle((int)ix - ir / 3, (int)iy - ir / 3, 5, rgb565(255, 255, 255));
+    if (inEye(ix + ir / 3, iy + ir / 4)) canvas.fillCircle((int)ix + ir / 3, (int)iy + ir / 4, 2, rgb565(230, 240, 255));
+  } else {                                                                   // DRAGON: molten iris, knife slit, scales
+    int ir = ERY - 1;
+    float hot = clampf(s_rage, 0.f, 1.f);
+    float fl = 0.5f + 0.5f * sinf(g_t * 9.f) * aud::onset;
+    spanEllipse(ix, iy, ir + 2, ir + 2, rgb565(40, 4, 0));
+    for (int k = 0; k < 6; k++)
+      spanEllipse(ix, iy, ir - k * (ir / 7), ir - k * (ir / 7), hsv565(8.f + k * 9.f + g_level * 10.f + hot * 20.f, 1.f - k * 0.06f - hot * 0.3f, 0.35f + k * 0.12f + fl * 0.1f + hot * 0.2f));
+    for (int k = 0; k < 28; k++) {
+      float a = k * 0.2244f + sinf(g_t * 2.f + k) * 0.05f, fl2 = 0.55f + 0.45f * sinf(g_t * (5.f + hot * 8.f) + k * 1.7f);
+      eyeLine(ix + cosf(a) * 7.f, iy + sinf(a) * 7.f, ix + cosf(a) * (ir - 3) * fl2, iy + sinf(a) * (ir - 3) * fl2, hsv565(30.f + (k & 1) * 15.f + hot * 15.f, 0.9f - hot * 0.4f, 1.f));
+    }
+    for (int k = 0; k < 18; k++) {
+      float a = k * 0.349f, sx = ix + cosf(a) * (ir - 1), sy = iy + sinf(a) * (ir - 1);
+      if (inEye(sx, sy + 4) && inEye(sx, sy - 4)) canvas.drawCircle((int)sx, (int)sy, 4, rgb565(90, 20, 4));
+    }
+    float pw = fmaxf(1.f, 1.5f + (1.f - slitK) * 5.f - s_pain - hot * 1.5f), ph = ir * 0.95f;
+    spanEllipse(ix, iy, pw, ph, rgb565(2, 0, 0));
+    if (inEye(ix - ir / 3, iy - ir / 3)) canvas.fillCircle((int)ix - ir / 3, (int)iy - ir / 3, 4, rgb565(255, 240, 200));
   }
-
-  // depth ladder, left edge: where you are, and where the trip turns
-  for (int l = 0; l < LAYERS; l++) {
-    int y = 70 + l * 16;
-    bool here = l == layer;
-    cv.fillRect(2, y, here ? 5 : 3, 10, here ? hsv(layerHue(l) + 40, 0.6f, 1.f) : rgb(50, 56, 66));
-    if (tr.active && l == tr.destDepth) cv.drawRect(1, y - 1, 9, 12, rgb(240, 210, 120));
+}
+// dragon: pokes stoke it (embers, sparks, smoke with the tears); cat: pokes snap the pupil, quiet brings slow blinks
+struct EyeFx { float x, y, vx, vy, life, r; uint8_t kind; bool live; };
+static EyeFx s_efx[60];
+static void efx(float x, float y, float vx, float vy, float life, float r, uint8_t kind) { for (auto &e : s_efx) if (!e.live) { e = {x, y, vx, vy, life, r, kind, true}; return; } }
+static void eyeStylePoke() {
+  if (s_eyeStyle == 2) {
+    s_rage = fminf(1.5f, s_rage + 0.35f);
+    int n = 6 + (int)(s_rage * 10.f);
+    for (int k = 0; k < n; k++) {
+      bool left = k & 1;
+      float sx = s_ecx + (left ? -ERX * 0.9f : ERX * 0.9f), sy = s_ecy + 4.f;
+      efx(sx, sy, (left ? -1.f : 1.f) * (30.f + (esp_random() % 80)), -60.f - (esp_random() % 120), 0.6f + (esp_random() % 60) / 100.f, 1.f, 0);   // embers
+    }
+    if (s_rage > 0.6f) for (int k = 0; k < 3; k++) efx(s_ecx + ((int)(esp_random() % 80) - 40), s_ecy - ERY, ((int)(esp_random() % 40) - 20), -25.f, 1.6f, 4.f, 1);  // smoke
+    hapGesture(HG_CRACK);
+  } else if (s_eyeStyle == 1) s_catSnap = 1.f;
+}
+static void eyeStyleFx(float dt) {
+  s_rage = fmaxf(0.f, s_rage - dt * 0.12f);
+  s_catSnap = fmaxf(0.f, s_catSnap - dt * 0.8f);
+  if (s_eyeStyle == 2 && s_rage > 0.3f && (esp_random() % 100) < (int)(s_rage * 12.f))       // it keeps smouldering
+    efx(s_ecx + ((int)(esp_random() % 60) - 30), s_ecy - ERY + 6, ((int)(esp_random() % 30) - 15), -20.f, 1.4f, 3.f, 1);
+  if (s_eyeStyle == 1) {                                                                        // cat kiss
+    s_quietT = g_level < 0.05f ? s_quietT + dt : 0.f;
+    if (s_quietT > 4.f && (esp_random() % 1000) < 6) { s_blinkE = 1.f; s_catSlow = true; s_quietT = 0; }
+    if (s_blinkE <= 0.f) s_catSlow = false;
   }
-
-  // throttle slider, right edge: drag to set; a detent at cruise
-  int ty = SLIDER_Y1 - (int)(throttleT * (SLIDER_Y1 - SLIDER_Y0));
-  int cy = (SLIDER_Y0 + SLIDER_Y1) / 2;
-  cv.drawRect(W - 12, SLIDER_Y0, 5, SLIDER_Y1 - SLIDER_Y0, rgb(40, 50, 60));
-  cv.fillRect(W - 11, ty, 3, SLIDER_Y1 - ty, throttleT > 0.75f ? rgb(255, 170, 80) : rgb(70, 160, 170));
-  cv.drawLine(W - 15, cy, W - 5, cy, rgb(90, 110, 120));
-  cv.fillRect(W - 16, ty - 2, 13, 4, rgb(220, 230, 235));
-  if (dockTarget >= 0) { cv.setTextColor(rgb(90, 160, 255)); cv.setCursor(W - 70, 15); cv.print("AUTODOCK"); }
-
-  // guidance: the next beat of the trip, and the job's gate
-  if (navObj >= 0 && objs[navObj].kind != K_NONE) drawEdgeArrow(objs[navObj], objs[navObj].kind == K_PORTAL ? rgb(210, 110, 230) : rgb(110, 240, 200));
-  for (auto &o : objs) if (o.kind == K_GATE && (o.gflags & GF_JOB)) drawEdgeArrow(o, rgb(240, 200, 90));
-
-  if (hitFlash > 0) {
-    uint16_t c = rgb(200, 30, 20);
-    cv.drawRect(0, 0, W, H, c); cv.drawRect(1, 1, W - 2, H - 2, c);
+  for (auto &e : s_efx) {
+    if (!e.live) continue;
+    e.life -= dt; if (e.life <= 0) { e.live = false; continue; }
+    if (e.kind == 0) { e.vy += 90.f * dt; e.x += e.vx * dt; e.y += e.vy * dt;
+      canvas.fillCircle((int)e.x, (int)e.y, e.life > 0.4f ? 2 : 1, (esp_random() & 1) ? rgb565(255, 200, 60) : rgb565(255, 110, 20)); }
+    else { e.x += e.vx * dt; e.y += e.vy * dt; e.r += dt * 9.f; canvas.drawCircle((int)e.x, (int)e.y, (int)e.r, rgb565((uint8_t)(60 * e.life), (uint8_t)(55 * e.life), (uint8_t)(55 * e.life))); }
   }
-  if (bannerUntil > millis()) drawBanner();
-  else { cv.setTextColor(rgb(70, 95, 105)); cv.setCursor(14, 229); cv.print(target >= 0 ? "tap a verb   A: next target" : "tilt: aim   slide: yaw/roll   tap: target"); }
 }
 
-static void drawStation() {
-  sm::Contract &off = sm::contractOfferPeek();
-  sm::Contract &c = sm::contract();
-  sm::Pilot &p = sm::sheet();
-  cv.fillRect(8, 4, 304, 206, rgb(5, 10, 16));
-  cv.drawRoundRect(8, 4, 304, 206, 8, rgb(70, 150, 255));
-  const Obj *stn = stationIdx >= 0 && objs[stationIdx].kind == K_STATION ? &objs[stationIdx] : nullptr;
-  uint8_t br = stn ? stn->uses : (uint8_t)BR_LIMINAR;
-  const BrandLook &bl = brandLook(br);
-  static const int8_t brandLogo[5] = {LOGO_LIMINAR, -1, LOGO_MALTAPLEX, LOGO_DESERET, LOGO_FREEHOLD};
-  int lg = br < 5 ? brandLogo[br] : -1;
-  int tx = 18;
-  if (lg >= 0) { drawLogoFlat(14, 7, lg); tx = 44; }
-  cv.setTextSize(2); cv.setTextColor(bl.light); cv.setCursor(tx, 8); cv.print(bl.name); cv.setTextSize(1);
-  const char *kind = stn ? strchr(stn->name, ' ') : nullptr;
-  cv.setTextColor(rgb(120, 134, 150)); cv.setCursor(tx, 25); cv.print(stn && strncmp(stn->name, "DEEP", 4) == 0 ? "DEEP OUTPOST" : (kind ? kind + 1 : "STATION"));
-  cv.setTextColor(rgb(140, 150, 165)); cv.setCursor(176, 10); cv.printf("$%ld  H%d/%d", (long)p.credits, p.hull, p.hullMax);
-  cv.setCursor(176, 20); cv.printf("F%d/%d  hold %u/%u", p.fuel, p.fuelCap, p.holdUsed, p.holdCap);
-  char mood[48]; strncpy(mood, stationMoodText, 46); mood[46] = 0;
-  cv.setTextColor(rgb(110, 125, 140)); cv.setCursor(18, 35); cv.print(mood);
+static void spawnTear(float x, float y, float vx, float vy, uint8_t kind) {
+  for (auto &t : s_tears) if (t.life <= 0) { t = {x, y, vx, vy, 1.f, kind}; return; }
+}
+static void eyePoke(int x, int y) {
+  eyeStylePoke();
+  float cx = W / 2 + g_lookX * 12.f, cy = H / 2 + g_lookY * 10.f;
+  float dx = (x - cx) / ERX, dy = (y - cy) / ERY;
+  if (dx * dx + dy * dy > 1.25f) return;
+  float ix = cx + s_gzX, iy = cy + s_gzY;
+  bool bull = (x - ix) * (x - ix) + (y - iy) * (y - iy) < 16 * 16;     // right in the pupil!
+  float hurt = bull ? 0.55f : 0.35f;
+  s_pain = fminf(1.6f, s_pain + hurt);
+  s_flinch = 1.f; s_shakeEye = 1.f; s_angry = fminf(1.f, s_angry + 0.4f);
+  s_pokeX = x; s_pokeY = y; s_pokeAt = millis();
+  hap(255, bull ? 140 : 90);
+  int n = 6 + (int)(s_pain * 8.f) + (bull ? 6 : 0);
+  for (int i = 0; i < n; i++) {
+    bool left = i & 1;
+    float sx = cx + (left ? -ERX * 0.92f : ERX * 0.92f), sy = cy + 6.f;
+    float sp = 90.f + (esp_random() % 120) + s_pain * 80.f;
+    spawnTear(sx, sy, (left ? -1.f : 1.f) * sp * (0.6f + (esp_random() % 50) / 100.f), -120.f - (esp_random() % 140) - s_pain * 60.f, 0);
+  }
+}
 
-  char rows[STATION_ROWS][56];
-  int rc = refuelCost();
-  if (rc > 0) snprintf(rows[0], 56, "REFUEL / REPAIR   %dcr", rc); else snprintf(rows[0], 56, "REFUEL / REPAIR   topped up");
-  bool dueHere = dueHereNow();
-  if (dueHere) snprintf(rows[1], 56, "DELIVER: %s  +%dcr", c.title, c.pay);
-  else if (c.live) snprintf(rows[1], 56, "DROP LEAD: %s", c.title);
-  else snprintf(rows[1], 56, "WORK: %s  +%dcr", off.title, off.pay);
-  if (layer > 0) snprintf(rows[2], 56, "RUMORS: nobody sells names here");
-  else snprintf(rows[2], 56, "BUY A RUMOR   %dcr", rumorPrice());
-  int sell = sellableValue(false);
-  if (sell > 0) snprintf(rows[3], 56, "SELL HAUL   +%dcr", sell);
+static void moireBg() {
+  // Set A: audio rings (centre breathes with bass, spacing with level, spin with mids)
+  // Set B: IMU rings (centre slides with tilt, colour from tilt direction)
+  static float phA = 0, phB = 0;
+  phA += g_dt * (40.f + aud::bass * 260.f);
+  phB += g_dt * (25.f + (fabsf(g_gx) + fabsf(g_gy)) * 0.6f);
+  int fA = (int)(1500 + g_level * 900.f + aud::onset * 400.f);        // ring frequency, 1/64 steps
+  int fB = (int)(1620 + (fabsf(g_lookX) + fabsf(g_lookY)) * 500.f);
+  int twist = (int)(aud::mid * 4.f);
+  int cax = 80 + (int)(sinf(g_t * 0.7f) * 6.f * (0.3f + aud::bass)), cay = 60 + (int)(cosf(g_t * 0.5f) * 4.f);
+  int cbx = 80 - (int)(g_lookX * 55.f), cby = 60 + (int)(g_lookY * 42.f);
+  int pA = (int)phA, pB = (int)phB;
+  auto rows_ = [&](int y0, int y1) {
+    for (int y = y0; y < y1; y++) {
+    uint8_t *row = fx::buf + y * fx::LW;
+    for (int x = 0; x < fx::LW; x++) {
+      int ra = fx::radAt(x - cax, y - cay);
+      int aa = twist ? (fx::tunAt(x - cax, y - cay) >> 8) * twist : 0;
+      int rb = fx::radAt(x - cbx, y - cby);
+      int a = fx::sn[(uint8_t)(((ra * fA) >> 6) + aa - pA)] + 128;
+      int b = fx::sn[(uint8_t)(((rb * fB) >> 6) + pB)] + 128;
+      row[x] = (uint8_t)(((a >> 4) << 4) | (b >> 4));
+    }
+  }
+  };
+  fx::parallel(rows_);
+  float hA = g_hue + g_level * 140.f + aud::centroid * 120.f;
+  float hB = atan2f(g_lookY, g_lookX + 0.0001f) * 57.3f + 180.f + g_hue * 0.3f;
+  uint16_t ca = hsv565(hA, 0.9f, 1.f), cb = hsv565(hB, 0.85f, 1.f);
+  float ar = ((ca >> 11) << 3), ag = (((ca >> 5) & 63) << 2), ab = ((ca & 31) << 3);
+  float br = ((cb >> 11) << 3), bg = (((cb >> 5) & 63) << 2), bb = ((cb & 31) << 3);
+  float gA = 0.34f + g_level * 0.35f, gB = 0.3f + fminf(0.3f, fabsf(g_lookX) + fabsf(g_lookY)) * 0.5f;
+  for (int i = 0; i < 16; i++)
+    for (int j = 0; j < 16; j++) {
+      float wa = i / 15.f, wb = j / 15.f;
+      wa = wa * wa * gA; wb = wb * wb * gB;
+      fx::palSet(i * 16 + j, (uint8_t)clampf(ar * wa + br * wb, 0, 255), (uint8_t)clampf(ag * wa + bg * wb, 0, 255),
+                 (uint8_t)clampf(ab * wa + bb * wb, 0, 255));
+    }
+  fx::present(canvas);
+}
+
+static void modeEye() {
+  float dt = g_dt;
+  moireBg();
+
+  if (g_shakeKick) { s_irisHue = (float)(esp_random() % 360); s_dizzy = 1.2f; }
+  s_dizzy = fmaxf(0.f, s_dizzy - dt);
+  s_pain = fmaxf(0.f, s_pain - dt * 0.22f);
+  s_flinch = fmaxf(0.f, s_flinch - dt * 2.2f);
+  s_shakeEye = fmaxf(0.f, s_shakeEye - dt * 3.f);
+  s_angry = fmaxf(0.f, s_angry - dt * 0.12f);
+  if (aud::onset > 0.6f && s_pain < 0.3f) s_startle = 1.f;
+  s_startle = fmaxf(0.f, s_startle - dt * 3.f);
+
+  float jit = s_shakeEye * (3.f + s_pain * 4.f);
+  float cx = W / 2 + (g_eyeTrack ? g_lookX * 12.f : 0) + ((int)(esp_random() % 21) - 10) * jit * 0.1f;
+  float cy = H / 2 + (g_eyeTrack ? g_lookY * 10.f : 0) + ((int)(esp_random() % 21) - 10) * jit * 0.1f;
+
+  // gaze target: tilt, or glare at the finger that hurt it, or dizzy spin
+  float tx = g_eyeTrack ? clampf(g_lookX * 30.f, -26.f, 26.f) : 0, ty = g_eyeTrack ? clampf(g_lookY * 22.f, -16.f, 16.f) : 0;
+  if (millis() - s_pokeAt < 1500) { tx = clampf((s_pokeX - cx) * 0.5f, -26.f, 26.f); ty = clampf((s_pokeY - cy) * 0.5f, -16.f, 16.f); }
+  if (s_dizzy > 0) { float r = 24.f * fminf(1.f, s_dizzy); tx = cosf(g_t * 30.f) * r; ty = sinf(g_t * 30.f) * r * 0.65f; }
+  float gk = clampf(dt * (s_dizzy > 0 ? 25.f : 10.f), 0, 1);
+  s_gzX += (tx - s_gzX) * gk; s_gzY += (ty - s_gzY) * gk;
+
+  // lids: 0 = open. blink, flinch squeeze, pain squint, startle wide
+  s_blinkTE -= dt;
+  if (s_blinkTE < 0) { s_blinkE = 1.f; s_blinkTE = 2.5f + (esp_random() % 3000) / 1000.f; }
+  s_blinkE = fmaxf(0.f, s_blinkE - dt * (s_eyeStyle == 1 && s_catSlow ? 1.6f : 6.5f));
+  float blink = s_blinkE > 0.5f ? (1.f - s_blinkE) * 2.f : s_blinkE * 2.f;
+  float squeeze = fmaxf(blink, s_flinch > 0.55f ? 1.f : s_flinch * 1.3f);
+  float cU = clampf(0.08f + s_pain * 0.22f + squeeze * 0.5f - s_startle * 0.14f + sinf(g_t * 40.f) * 0.02f * s_pain, -0.1f, 0.52f);
+  float cL = clampf(0.04f + s_pain * 0.16f + squeeze * 0.5f - s_startle * 0.06f, -0.05f, 0.5f);
+
+  float skH = 285.f + s_pain * 45.f + sinf(g_t * 0.3f) * 12.f;
+  uint16_t skin = hsv565(skH, 0.42f + s_pain * 0.25f, 0.62f);
+  uint16_t skinS = hsv565(skH, 0.55f + s_pain * 0.2f, 0.36f);
+  uint16_t skinD = hsv565(skH, 0.6f, 0.16f);
+  uint16_t crease = hsv565(skH, 0.65f, 0.28f);
+  uint16_t scl = rgb565(236, (uint8_t)(234 - s_pain * 70.f), (uint8_t)(228 - s_pain * 90.f));
+
+  // socket + sclera
+  canvas.fillEllipse((int)cx, (int)cy, ERX + 11, ERY + 11, skinD);
+  canvas.fillEllipse((int)cx, (int)cy, ERX + 9, ERY + 9, skin);
+  canvas.fillEllipse((int)cx, (int)cy, ERX, ERY, scl);
+  // bloodshot veins
+  int nv = (int)(s_pain * 10.f);
+  for (int v = 0; v < nv; v++) {
+    float a = v * 2.39996f, r = 1.f;
+    float x0 = cx + cosf(a) * ERX * r, y0 = cy + sinf(a) * ERY * r;
+    for (int s = 0; s < 4; s++) {
+      float nr = r - 0.14f;
+      float x1 = cx + cosf(a + sinf(v * 7.f + s * 3.f) * 0.18f) * ERX * nr, y1 = cy + sinf(a + cosf(v * 5.f + s) * 0.18f) * ERY * nr;
+      canvas.drawLine((int)x0, (int)y0, (int)x1, (int)y1, rgb565(200, 30, 40));
+      x0 = x1; y0 = y1; r = nr;
+    }
+  }
+  s_ecx = cx; s_ecy = cy;
+  if (s_eyeStyle != 0) eyeIrisStyled(cx + s_gzX, cy + s_gzY);
   else {
-    char cn[16]; snprintf(cn, sizeof(cn), "%s", sm::capName((sm::CapId)gearCap)); upcase(cn);
-    snprintf(rows[3], 56, "BUY %s %u   %dcr", cn, sm::capTier((sm::CapId)gearCap) + 1, gearPrice());
+  // iris with striations, pupil dilates with sound, pinpoints with pain
+  float ix = cx + s_gzX, iy = cy + s_gzY;
+  int ir = (int)(25 + g_peak * 4.f - s_pain * 3.f);
+  uint16_t irisC = hsv565(s_irisHue + g_level * 40.f, 0.85f, 0.65f + g_level * 0.25f);
+  canvas.fillCircle((int)ix, (int)iy, ir + 1, hsv565(s_irisHue, 0.9f, 0.22f));
+  canvas.fillCircle((int)ix, (int)iy, ir - 1, irisC);
+  for (int k = 0; k < 20; k++) {
+    float a = k * 0.314f + g_t * 0.2f;
+    int r0 = 8, r1 = ir - 2;
+    canvas.drawLine((int)(ix + cosf(a) * r0), (int)(iy + sinf(a) * r0), (int)(ix + cosf(a) * r1), (int)(iy + sinf(a) * r1),
+                    hsv565(s_irisHue + (k & 1 ? 25.f : -20.f), 0.8f, (k & 1) ? 0.95f : 0.4f));
   }
-  if (opportunityTaken) snprintf(rows[4], 56, "BOARD: (taken)"); else snprintf(rows[4], 56, "BOARD: %s +%d", stationOpportunity.title, stationOpportunity.reward);
-  snprintf(rows[5], 56, "LAUNCH");
-  for (int i = 0; i < STATION_ROWS; ++i) {
-    int y = ROW_Y0 + i * ROW_PITCH; bool sel = i == stationChoice;
-    cv.fillRoundRect(18, y, 284, ROW_H, 4, sel ? rgb(25, 90, 90) : rgb(16, 24, 32));
-    cv.setTextColor(i == 1 && dueHere ? rgb(255, 215, 110) : sel ? rgb(120, 255, 210) : rgb(180, 190, 200));
-    cv.setCursor(28, y + 6); cv.print(rows[i]);
+  canvas.drawCircle((int)ix, (int)iy, ir / 2 + 2, hsv565(s_irisHue + 60.f, 0.5f, 0.9f));
+  int pr = (int)(9 + g_level * 7.f + aud::bass * 3.f - s_pain * 5.f - s_startle * 3.f);
+  if (pr < 2) pr = 2;
+  canvas.fillCircle((int)(ix + s_gzX * 0.15f), (int)(iy + s_gzY * 0.15f), pr, rgb565(6, 4, 10));
+  canvas.fillCircle((int)ix - 8, (int)iy - 9, 4, rgb565(255, 255, 255));
+  canvas.fillCircle((int)ix + 7, (int)iy + 6, 2, rgb565(230, 240, 255));
   }
-  char dbuf[112] = "";
-  switch (stationChoice) {
-    case 0: snprintf(dbuf, sizeof(dbuf), "fuel %dcr/u  hull %dcr/u. you stay docked.", sm::fuelPrice(), sm::repairPrice()); break;
-    case 1: {
-      if (dueHere) { snprintf(dbuf, sizeof(dbuf), "the cargo is expected here. hand it over and get paid."); break; }
-      const sm::Contract &j = c.live ? c : off;
-      if (j.dest[0]) snprintf(dbuf, sizeof(dbuf), "to %s, depth %u. taking it sets your course.", j.dest, j.destDepth);
-      else snprintf(dbuf, sizeof(dbuf), "%s", sm::contractHint(j));
+
+  // eyelids: arcs that follow the eyeball's curvature; angry slant after pokes
+  int lashC = rgb565(15, 8, 20);
+  for (int x = -ERX - 9; x <= ERX + 9; x++) {
+    float u = (float)x / ERX;
+    float e = u * u < 1.f ? sqrtf(1.f - u * u) : 0.f;
+    float us = (float)x / (ERX + 9);
+    float soc = us * us < 1.f ? (ERY + 9) * sqrtf(1.f - us * us) : 0.f;
+    float slant = s_angry * (x < 0 ? -x : x) * -0.12f;           // inner corners drop
+    float yu = cy - ERY * (1.f - 2.f * cU) * e + slant * (1.f - e) + s_angry * 6.f * e;
+    float yl = cy + ERY * (1.f - 2.f * cL) * e;
+    if (yu > yl) { float m = (yu + yl) * 0.5f; yu = yl = m; }
+    int X = (int)cx + x;
+    int top = (int)(cy - soc), bot = (int)(cy + soc);
+    if (yu > top) {
+      int sh = (int)yu - top < 7 ? (int)yu - top : 7;           // lid rolls into shadow at the edge
+      canvas.drawFastVLine(X, top, (int)yu - top - sh, skin);
+      canvas.drawFastVLine(X, (int)yu - sh, sh, skinS);
+      int cr = (int)(yu - 7.f - e * 5.f * (1.f - cU));
+      if (e > 0 && cr > top + 1 && cU < 0.4f) canvas.drawPixel(X, cr, crease);
+    }
+    if (bot > yl) {
+      canvas.drawFastVLine(X, (int)yl, bot - (int)yl + 1, skin);
+      canvas.drawFastVLine(X, (int)yl, 3, skinS);
+    }
+    if (e > 0) {
+      canvas.drawFastVLine(X, (int)yu - 1, 3, lashC);
+      canvas.drawPixel(X, (int)yl, rgb565(200, 90, 110));
+      if ((x & 7) == 0 && cU < 0.45f) {
+        float lx = u * 5.f;
+        canvas.drawLine(X, (int)yu - 1, X + (int)lx, (int)yu - 6 - (int)(e * 3.f), lashC);
+      }
+    }
+  }
+
+  // tears: squirt from the corners, arc, splat, dribble
+  if (s_pain > 0.4f && (esp_random() % 100) < (int)(s_pain * 30.f)) {
+    float u = ((int)(esp_random() % 160) - 80) / 100.f;
+    spawnTear(cx + u * ERX, cy + ERY * 0.75f * sqrtf(fmaxf(0.f, 1.f - u * u)), 0, 10.f, 1);
+  }
+  for (auto &t : s_tears) {
+    if (t.life <= 0) continue;
+    float gdrop = t.kind == 1 ? 140.f : 520.f;
+    t.vy += gdrop * dt; t.x += t.vx * dt; t.y += t.vy * dt;
+    t.life -= dt * (t.kind == 2 ? 2.5f : 0.35f);
+    if (t.y > H - 16 && t.kind != 2) {
+      for (int k = 0; k < 3; k++) spawnTear(t.x, H - 17.f, ((int)(esp_random() % 120) - 60), -60.f - (esp_random() % 80), 2);
+      t.life = 0; continue;
+    }
+    uint16_t tc = rgb565(120, 200, 255);
+    int r = t.kind == 2 ? 1 : (t.kind == 0 ? 4 : 3);
+    float tl = t.kind == 0 ? 0.045f : 0.08f;
+    for (int k = -1; k <= 1; k++)
+      canvas.drawLine((int)t.x + k, (int)t.y, (int)(t.x - t.vx * tl), (int)(t.y - t.vy * tl), rgb565(90, 160, 230));
+    canvas.fillCircle((int)t.x, (int)t.y, r, tc);
+    canvas.drawPixel((int)t.x - 1, (int)t.y - 1, rgb565(255, 255, 255));
+  }
+  if (s_eyeStyle) eyeStyleFx(dt);
+  if (millis() - s_pokeAt < 260) {
+    for (int k = 0; k < 8; k++) {
+      float a = k * 0.785f; int r0 = 8, r1 = 16 + (int)(s_pain * 8);
+      canvas.drawLine(s_pokeX + (int)(cosf(a) * r0), s_pokeY + (int)(sinf(a) * r0), s_pokeX + (int)(cosf(a) * r1),
+                      s_pokeY + (int)(sinf(a) * r1), rgb565(255, 230, 80));
+    }
+  }
+}
+
+// ============================================================
+//  TUNNEL — dive / recede (audio-sliced, bendable), fractal, portal
+// ============================================================
+struct Slice { uint8_t b[16]; int8_t ox, oy; uint8_t en; };
+static Slice s_sl[256];
+static float s_tz = 0, s_camX = 0, s_camY = 0, s_bendX = 0, s_bendY = 0, s_scrape = 0;
+static int s_zi = 0;
+static int16_t s_offX[256], s_offY[256];
+static uint8_t s_fog[256], s_twist[256];
+
+static inline float pathX(float z) { return sinf(z * 0.021f) * 0.95f + sinf(z * 0.047f + 1.3f) * 0.5f; }
+static inline float pathY(float z) { return cosf(z * 0.017f) * 0.55f + sinf(z * 0.039f) * 0.4f; }
+static void fillSlice(Slice &s, float ox, float oy) {
+  for (int i = 0; i < 16; i++) {
+    float v = (aud::bands[i * 2] + aud::bands[i * 2 + 1]) * 0.5f;
+    s.b[i] = (uint8_t)clampf(40.f + v * 200.f, 0, 255);
+  }
+  s.en = (uint8_t)clampf(aud::onset * 255.f + g_level * 60.f, 0, 255);   // beats become rings you fly through
+  s.ox = (int8_t)clampf(ox * 50.f, -127, 127);
+  s.oy = (int8_t)clampf(oy * 50.f, -127, 127);
+}
+
+static void tunnelRender(bool dive) {
+  float dt = g_dt;
+  float speed = 16.f + g_level * 45.f + aud::bass * 30.f;
+  auto td = M5.Touch.getDetail();
+  static int ptx = -1, pty = -1;
+  float dragX = 0, dragY = 0;
+  if (td.isPressed() && td.y > 14 && td.y < H - 14) {
+    if (ptx >= 0) { dragX = (td.x - ptx) * 0.02f; dragY = (td.y - pty) * 0.02f; }
+    ptx = td.x; pty = td.y;
+  } else ptx = -1;
+
+  if (dive) {
+    s_tz += speed * dt;
+    int zi = (int)s_tz;
+    while (s_zi < zi) {
+      s_zi++;
+      float z = (float)(s_zi + 255);
+      fillSlice(s_sl[(s_zi + 255) & 255], pathX(z) + aud::bass * 0.25f * sinf(z * 0.3f), pathY(z));
+    }
+    // steer: tilt (and drag) moves the camera inside the tube
+    s_camX += (g_flyX * 1.9f + dragX * 8.f) * dt * (1.f + g_level * 0.5f);
+    s_camY += (g_flyY * 1.6f + dragY * 8.f) * dt * (1.f + g_level * 0.5f);
+    float nx = s_sl[(s_zi + 6) & 255].ox / 50.f, ny = s_sl[(s_zi + 6) & 255].oy / 50.f;
+
+    float ex = s_camX - nx, ey = s_camY - ny, er = sqrtf(ex * ex + ey * ey);
+    if (er > 0.62f) {
+      s_camX = nx + ex / er * 0.6f; s_camY = ny + ey / er * 0.6f;
+      if (s_scrape < 0.3f) hap(170, 25);
+      s_scrape = 1.f;
+    }
+  } else {
+    s_tz -= speed * dt;
+    int zi = (int)floorf(s_tz);
+    s_bendX += (g_flyX * 1.8f + dragX * 10.f + sinf(g_t * 3.f) * aud::bass * 0.8f) * dt;
+    s_bendY += (g_flyY * 1.5f + dragY * 10.f + cosf(g_t * 2.3f) * aud::mid * 0.6f) * dt;
+    s_bendX = clampf(s_bendX, -2.4f, 2.4f); s_bendY = clampf(s_bendY, -2.4f, 2.4f);
+    while (s_zi > zi) { s_zi--; fillSlice(s_sl[(s_zi + 2) & 255], s_bendX, s_bendY); }
+    s_camX += (s_bendX - s_camX) * clampf(dt * 8.f, 0, 1);
+    s_camY += (s_bendY - s_camY) * clampf(dt * 8.f, 0, 1);
+  }
+  s_scrape = fmaxf(0.f, s_scrape - dt * 3.f);
+  if (s_scrape > 0.05f) hapRumble(0.3f + s_scrape * 0.5f, 26.f, 0.9f);
+
+  // per-depth tables
+  float spin = g_t * (dive ? 20.f : -14.f) + g_gz * 0.05f;
+  for (int d = 0; d < 256; d++) {
+    const Slice &s = s_sl[(s_zi + d) & 255];
+    float R = 900.f / (d + 0.6f);
+    s_offX[d] = (int16_t)clampf((s.ox / 50.f - s_camX) * R, -150.f, 150.f);
+    s_offY[d] = (int16_t)clampf((s.oy / 50.f - s_camY) * R, -110.f, 110.f);
+    float fog = d < 5 ? d / 5.f : 1.f - (d - 5) / 250.f;
+    s_fog[d] = (uint8_t)(clampf(fog, 0, 1) * 255.f);
+    s_twist[d] = (uint8_t)(spin + d * (0.3f + aud::mid * 1.5f));
+  }
+  int cx = 80, cy = 60;
+  uint8_t ph = (uint8_t)(g_t * 60.f);
+  uint8_t ringPh = (uint8_t)(s_tz * 4.f);
+  auto rows_ = [&](int y0, int y1) {
+    for (int y = y0; y < y1; y++) {
+    uint8_t *row = fx::buf + y * fx::LW;
+    for (int x = 0; x < fx::LW; x++) {
+      int d1 = fx::tunAt(x - cx, y - cy) & 255;
+      uint16_t t = fx::tunAt(x - cx - s_offX[d1], y - cy - s_offY[d1]);
+      int d = t & 255;
+      int a = (t >> 8) + s_twist[d];
+      const Slice &s = s_sl[(s_zi + d) & 255];
+      int sec = (a >> 3) & 31;
+      int bv = s.b[sec < 16 ? sec : 31 - sec];
+      int wz = s_zi + d;
+      int stripe = fx::sn[(uint8_t)(a * 4 + d * 3 + ph)];
+      int xr = ((a << 1) ^ (wz << 2)) & 127;                     // old-school XOR texture, flowing in world space
+      int rim = ((wz & 7) == 0) ? 40 : 0;
+      int v = (xr >> 1) + ((bv * (128 + stripe)) >> 8) + (s.en >> 1);
+      v += rim + (fx::sn[(uint8_t)(d * 8 - ringPh)] > 100 ? 24 : 0);
+      v = (v * s_fog[d]) >> 8;
+      row[x] = (uint8_t)(v > 255 ? 255 : v);
+    }
+  }
+  };
+  fx::parallel(rows_);
+  float h = g_hue / 360.f;
+  if (dive) fx::palCosine(0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 1.f, 1.f, 1.f, 0.0f + h, 0.33f + h + aud::centroid * 0.3f, 0.67f + h, g_t * 0.05f);
+  else fx::palCosine(0.5f, 0.4f, 0.6f, 0.5f, 0.45f, 0.4f, 1.f, 0.8f, 0.6f, 0.8f + h, 0.2f + h, 0.5f + h, -g_t * 0.04f);
+  fx::palOpal(0.22f + g_level * 0.15f, 0.5f + g_lookX * 0.35f + g_lookY * 0.25f + g_t * 0.03f, g_t * 0.05f, 0.35f + aud::onset * 0.5f);
+  fx::palFlash(s_scrape * 0.7f + aud::onset * 0.25f);
+  fx::present(canvas);
+  {  // geometric wireframe glitching through the ether, riding the tube's bend
+    float vpX = 160.f + s_offX[40] * 2.f, vpY = 120.f + s_offY[40] * 2.f;
+    float gl = 0.06f + aud::onset * 0.9f + g_level * 0.15f + s_scrape * 0.6f;
+    wire::tunnelRings(vpX, vpY, s_tz * 0.07f, 0.25f * sinf(g_t * 0.4f) + aud::mid * 0.3f, g_level + aud::bass * 0.5f, gl, !dive);
+    if (aud::onset > 0.5f)                                        // on hits: a crystal phases through
+      wire::tesseract(vpX, vpY, 16.f + aud::bass * 22.f, g_t * 1.3f, g_t * 0.9f, g_t * 0.5f, 0.5f, wire::LIME);
+  }
+
+  if (dive) {    // reticle shows where the tube heads next
+    int rx = 160 + (int)(s_offX[40] * 2), ry = 120 + (int)(s_offY[40] * 2);
+    canvas.drawCircle(160, 120, 9, rgb565(255, 255, 200));
+    canvas.drawLine(rx - 4, ry, rx + 4, ry, hsv565(g_hue + 180.f, 0.6f, 1.f));
+    canvas.drawLine(rx, ry - 4, rx, ry + 4, hsv565(g_hue + 180.f, 0.6f, 1.f));
+  }
+}
+
+// ---- fractal: morphing Julia, adaptive quality, orbit-trap colouring (no flat fields) ----
+static float s_fx = 0, s_fy = 0, s_fs = 3.2f / 160.f, s_frot = 0, s_fzoomDir = -1.f;
+static float s_reborn = 0, s_empty = 0;          // dissolve progress, time spent in a void
+static int s_fIt = 22, s_preset = 0;
+static float s_cTr = 1.f;
+static float s_cr0 = -0.8f, s_ci0 = 0.156f, s_crP = -0.8f, s_ciP = 0.156f;
+static const float PRESETS[][2] = {{-0.8f, 0.156f}, {0.285f, 0.01f}, {-0.4f, 0.6f}, {-0.70176f, -0.3842f},
+                                   {0.355f, 0.355f}, {-0.835f, -0.2321f}, {-0.1f, 0.651f}, {0.37f, -0.1f}};
+static void fractalRender() {
+  float dt = g_dt;
+  uint32_t t0 = micros();
+  auto td = M5.Touch.getDetail();
+  static int ptx = -1, pty = -1, dragAcc = 0;
+  static uint32_t downAt = 0;
+  if (td.isPressed() && td.y > 14 && td.y < H - 14) {
+    if (ptx < 0) { downAt = millis(); dragAcc = 0; }
+    else {
+      int dx = td.x - ptx, dy = td.y - pty; dragAcc += abs(dx) + abs(dy);
+      float c = cosf(s_frot), s = sinf(s_frot);
+      s_fx -= (c * dx - s * dy) * s_fs * 0.5f; s_fy -= (s * dx + c * dy) * s_fs * 0.5f;
+    }
+    ptx = td.x; pty = td.y;
+  } else {
+    if (ptx >= 0 && dragAcc < 10 && millis() - downAt < 350) {       // tap = new world
+      s_preset = (s_preset + 1) % 8; s_crP = s_cr0; s_ciP = s_ci0; s_cTr = 0; hap(120, 40);
+    }
+    ptx = -1;
+  }
+  s_cTr = fminf(1.f, s_cTr + dt * 0.8f);
+  float tr = s_cTr * s_cTr * (3.f - 2.f * s_cTr);
+  s_cr0 = s_crP + (PRESETS[s_preset][0] - s_crP) * tr;
+  s_ci0 = s_ciP + (PRESETS[s_preset][1] - s_ciP) * tr;
+  float cr = s_cr0 + 0.006f * cosf(g_t * 0.31f), ci = s_ci0 + 0.006f * sinf(g_t * 0.23f);   // near-steady: keeps the self-similarity exact
+
+  // ======== a TRUE fractal dive ========
+  // The Julia set of z^2+c has a repelling fixed point z* = (1 + sqrt(1-4c))/2 with multiplier L = f'(z*) = 2 z*.
+  // Near z* the set is exactly self-similar: scaled by |L| and rotated by arg(L) it maps onto itself, and every
+  // escape count shifts by one. So: zoom into z* by one factor of |L| while rotating by -arg(L), then wrap the
+  // camera back (offset from z* multiplied by L) and shift the colours one step. The picture continues exactly:
+  // an infinite dive that keeps revealing the same structure inside itself, never running out of float precision.
+  // Preimages of z* (the points that map onto it) are self-similar with the same L: the autopilot pulls you toward
+  // whichever of them is nearest to where YOU are aiming.
+  auto csq = [](float ar, float ai, float &rr, float &ri) {        // principal complex square root
+    float m = sqrtf(ar * ar + ai * ai); rr = sqrtf(fmaxf(0.f, (m + ar) * 0.5f)); ri = copysignf(sqrtf(fmaxf(0.f, (m - ar) * 0.5f)), ai);
+  };
+  float wr, wi; csq(1.f - 4.f * cr, -4.f * ci, wr, wi);
+  float zsr = (1.f + wr) * 0.5f, zsi = wi * 0.5f;
+  if (zsr * zsr + zsi * zsi < 0.25f) { zsr = (1.f - wr) * 0.5f; zsi = -wi * 0.5f; }        // the repelling one (|2z*| > 1)
+  float lr = 2.f * zsr, li = 2.f * zsi, lAbs = sqrtf(lr * lr + li * li), lArg = atan2f(li, lr);
+  if (lAbs < 1.05f) { lAbs = 1.05f; }
+  // self-similar targets: z*, -z*, and preimages (+-sqrt(p - c)), breadth-first
+  float TX[15], TY[15]; int nT = 0;
+  TX[nT] = zsr; TY[nT++] = zsi; TX[nT] = -zsr; TY[nT++] = -zsi;
+  for (int q = 1; q < 7 && nT < 15; q++) {
+    float pr, pi; csq(TX[q] - cr, TY[q] - ci, pr, pi);
+    if (nT < 15) { TX[nT] = pr; TY[nT++] = pi; }
+    if (nT < 15) { TX[nT] = -pr; TY[nT++] = -pi; }
+  }
+  static int tg = 0; static float s_du = 0; static int s_colOff = 0, s_wraps = 0;
+  const float S0 = 2.2f / 160.f;
+  // steer with tilt / drag (the autopilot only helps, it doesn't fight you)
+  float c = cosf(s_frot), s = sinf(s_frot);
+  s_fx += (c * g_flyX - s * g_flyY) * s_fs * 140.f * dt;
+  s_fy += (s * g_flyX + c * g_flyY) * s_fs * 140.f * dt;
+  bool piloting = fabsf(g_flyX) + fabsf(g_flyY) > 0.06f || ptx >= 0;
+  {  // target = the self-similar point nearest to where you're aiming (with hysteresis)
+    float bd = 1e9f; int bi = tg;
+    for (int k = 0; k < nT; k++) { float dx = TX[k] - s_fx, dy = TY[k] - s_fy, d = dx * dx + dy * dy; if (d < bd) { bd = d; bi = k; } }
+    float cdx = TX[tg % nT] - s_fx, cdy = TY[tg % nT] - s_fy;
+    if (bi != tg && bd < 0.36f * (cdx * cdx + cdy * cdy)) tg = bi;
+    tg %= nT;
+  }
+  float tx0 = TX[tg], ty0 = TY[tg];
+  float pull = clampf(dt * (piloting ? 0.35f : 1.8f), 0.f, 1.f);              // autopilot: into the detail
+  s_fx += (tx0 - s_fx) * pull; s_fy += (ty0 - s_fy) * pull;
+  // dive: continuous zoom by |L| per level, turning with it
+  s_du += dt * (0.14f + g_level * 0.3f + aud::bass * 0.15f);
+  s_frot += (g_gz * 0.004f + 0.03f) * dt;
+  if (s_du >= 1.f) {
+    float dxr = s_fx - tx0, dxi = s_fy - ty0, view = S0 * 160.f;
+    if (dxr * dxr + dxi * dxi < view * view) {                                // wrap: same picture, one level shallower
+      s_du -= 1.f; s_colOff += 9; s_wraps++;
+      s_fx = tx0 + (dxr * lr - dxi * li); s_fy = ty0 + (dxr * li + dxi * lr); // offset from the target scales by L
+      if (s_wraps % 10 == 0) { s_preset = (s_preset + 1 + (esp_random() % 3)) % 8; s_crP = s_cr0; s_ciP = s_ci0; s_cTr = 0; }   // now and then, drift to another world
+    }
+  }
+  s_fs = S0 * powf(lAbs, -s_du);
+  float rotNow = s_frot - lArg * s_du;
+  if (s_fs < 3e-6f) {                                                          // steered far off the path: re-enter the dive
+    memcpy(fx::back, fx::buf, fx::LW * fx::LH);
+    s_du = 0; s_fx = tx0; s_fy = ty0; s_reborn = 1.f; hapGesture(HG_REBIRTH);
+    s_fs = S0;
+  }
+  c = cosf(rotNow); s = sinf(rotNow);
+  float sc = s_fs * (1.f - aud::bass * 0.08f);
+
+  float ux = c * sc, uy = s * sc, vx = -s * sc, vy = c * sc;
+  float ox = s_fx - ux * 80.f - vx * 60.f, oy = s_fy - uy * 80.f - vy * 60.f;
+  const int maxIt = s_fIt;
+  int ph = (int)(g_t * 40.f) + s_colOff;
+  auto rows_ = [&](int y0, int y1) {
+    for (int y = y0; y < y1; y++) {
+    uint8_t *row = fx::buf + y * fx::LW;
+    float zr0 = ox + vx * y, zi0 = oy + vy * y;
+    for (int x = 0; x < fx::LW; x++) {
+      float zr = zr0 + ux * x, zi = zi0 + uy * x;
+      float trap = 10.f, trap2 = 100.f;            // cross trap (outside), point trap (inside)
+      int k = 0;
+      for (; k < maxIt; k++) {
+        float r2 = zr * zr, i2 = zi * zi;
+        if (r2 + i2 > 16.f) break;
+        zi = 2.f * zr * zi + ci; zr = r2 - i2 + cr;
+        float ax = fabsf(zr), ay = fabsf(zi);
+        float tx = ax < ay ? ax : ay; if (tx < trap) trap = tx;
+        float tp = (zr - 0.15f) * (zr - 0.15f) + zi * zi; if (tp < trap2) trap2 = tp;
+      }
+      int v;
+      if (k < maxIt) {
+        float m = zr * zr + zi * zi;
+        int fine = (int)(clampf(1.f - (m - 16.f) / (m + 16.f), 0.f, 1.f) * 12.f);
+        v = 24 + ((k * 9 + fine + (int)(sqrtf(trap) * 110.f) + ph) & 127);
+      } else v = 152 + (((int)(sqrtf(trap2) * 240.f) + (int)(trap * 40.f) - ph * 2) & 103);
+      row[x] = (uint8_t)v;
+    }
+  }
+  };
+  fx::parallel(rows_);
+  if (s_reborn > 0) {                                  // dither-dissolve: the old view keeps falling inward
+    s_reborn = fmaxf(0.f, s_reborn - dt * 0.9f);
+    float zf = 1.f + (1.f - s_reborn) * 1.5f;
+    int thr = (int)(s_reborn * 255.f);
+    for (int y = 0; y < fx::LH; y++)
+      for (int x = 0; x < fx::LW; x++) {
+        uint32_t hsh = (uint32_t)(x * 73856093u ^ y * 19349663u); hsh ^= hsh >> 13; hsh *= 0x5bd1e995u; hsh ^= hsh >> 15;
+        if ((int)(hsh & 255) < thr) {
+          int sx = 80 + (int)((x - 80) / zf), sy = 60 + (int)((y - 60) / zf);
+          fx::buf[y * fx::LW + x] = fx::back[sy * fx::LW + sx];
+        }
+      }
+  }
+  float h = g_hue / 360.f + aud::centroid * 0.4f;
+  fx::palCosine(0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 2.f, 1.f, 1.f + g_level, 0.5f + h, 0.2f + h, 0.25f + h, g_t * 0.03f);
+  fx::palOpal(0.25f, 0.5f + g_lookX * 0.35f + g_lookY * 0.25f, g_t * 0.04f, 0.3f + aud::onset * 0.6f);
+  fx::palFlash(aud::onset * 0.3f + s_reborn * 0.2f);
+  fx::present(canvas);
+  uint32_t took = micros() - t0;                       // adaptive quality, demo-style
+  if (took > 21000 && s_fIt > 12) s_fIt--;
+  else if (took < 14000 && s_fIt < 40) s_fIt++;
+}
+
+// ---- portal: fly the ether; thread 3 hoops to summon a portal; fly INTO the next dimension ----
+struct Star { float x, y, z, pz; };
+static Star s_st[200];
+static float s_pcx = 0, s_pcy = 0, s_emerge = 0;
+static int s_dim = 0;
+static float s_dimP[12], s_nextP[12];
+static float s_hx = 0, s_hy = 0, s_hz = 0, s_hoopFlash = 0;   // the current hoop (world x/y, depth)
+static bool s_hoopAlive = false;
+static int s_hoopN = 0;                                          // consecutive hoops threaded (0..3)
+static uint32_t s_hoopNext = 0;
+static float s_ptx = 0, s_pty = 0, s_ptz = 0;                  // the portal
+static bool s_portal = false;
+static uint16_t s_palN[256];                                     // next dimension's palette (byte-swapped 565)
+static inline uint16_t mix565c(uint16_t a, uint16_t b, float u) {
+  u = clampf(u, 0.f, 1.f); int ra = a >> 11, ga = (a >> 5) & 63, ba = a & 31, rb = b >> 11, gb = (b >> 5) & 63, bb = b & 31;
+  return (uint16_t)(((int)(ra + (rb - ra) * u) << 11) | ((int)(ga + (gb - ga) * u) << 5) | (int)(ba + (bb - ba) * u));
+}
+// ---- stellar landmarks flown past between gates ----
+enum BodyT : uint8_t { BD_STAR = 0, BD_PLANET, BD_GIANT, BD_DWARF, BD_NEUTRON, BD_HOLE };
+struct Body { float x, y, z, r, seed; uint8_t type; bool live; };
+static Body s_body = {0, 0, 0, 0, 0, 0, false};
+static uint32_t s_bodyNext = 4000;
+static float s_lensX = -999, s_lensY = -999, s_lensR = 0;          // black-hole lens in lores coords (for the warp + gates)
+static inline void lensShift(float &x, float &y) {                 // screen-space gate positions bend around a black hole
+  if (s_lensR <= 0) return;
+  float dx = x * 0.5f - s_lensX, dy = y * 0.5f - s_lensY, d2 = dx * dx + dy * dy + 1.f;
+  float k = s_lensR * s_lensR * 1.6f / d2; if (k > 3.f) k = 3.f;
+  x += dx * k * 2.f; y += dy * k * 2.f;
+}
+static void drawBody(const Body &b, float pcx, float pcy, float alien) {
+  float z = fmaxf(b.z, 0.2f);
+  float px = 160.f + (b.x - pcx) / z * 60.f, py = 120.f + (b.y - pcy) / z * 60.f, pr = b.r / z * 60.f;
+  if (pr > 420.f || px < -pr - 40 || px > W + pr + 40) return;
+  int X = (int)px, Y = (int)py, R = (int)fmaxf(1.f, pr);
+  uint32_t sd = (uint32_t)(b.seed * 1e6f);
+  switch (b.type) {
+    case BD_STAR: {                                              // a sun: glow, disc, corona spikes
+      float temp = (sd % 100) / 100.f;
+      uint16_t core = temp < 0.33f ? rgb565(255, 190, 110) : (temp < 0.66f ? rgb565(255, 245, 200) : rgb565(190, 220, 255));
+      for (int k = 4; k >= 1; k--) canvas.fillCircle(X, Y, R + k * R / 3, mix565c(rgb565(0, 0, 0), core, 0.12f * (5 - k)));
+      canvas.fillCircle(X, Y, R, core);
+      for (int k = 0; k < 8; k++) { float a = k * 0.785f + g_t * 0.05f; canvas.drawLine(X, Y, X + (int)(cosf(a) * R * 2.4f), Y + (int)(sinf(a) * R * 2.4f), mix565c(core, 0, 0.5f)); }
       break;
     }
-    case 2: snprintf(dbuf, sizeof(dbuf), "a place you haven't heard of. buying it sets your course."); break;
-    case 3: snprintf(dbuf, sizeof(dbuf), "%s", layer > 0 ? "rock and ore fetch double down here. they buy deep scans."
-                                                  : sell > 0 ? "hold lines your lead doesn't own" : "earned capability is equipped at once"); break;
-    case 4: asciiCopy(dbuf, sizeof(dbuf), opportunityTaken ? "" : stationOpportunity.detail); break;
-    case 5: snprintf(dbuf, sizeof(dbuf), "back out among the gates"); break;
-  }
-  cv.setTextColor(rgb(200, 180, 110));
-  printWrapped(18, ROW_Y0 + STATION_ROWS * ROW_PITCH + 2, 46, 2, 10, dbuf);
-  if (bannerUntil > millis()) drawBanner();
-  else { cv.setTextColor(rgb(70, 95, 105)); cv.setCursor(6, 229); cv.print("tap row, tap again   A launch  C next"); }
-}
-
-static void drawDockSequence() {
-  // the slot swallows the view, lights streaming past
-  cv.fillSprite(rgb(2, 3, 6));
-  for (int i = 0; i < 9; i++) {
-    float z = fmodf(i * 0.11f + tNow * 1.6f, 1.f);
-    int w = (int)(30 + z * z * 330), h = w / 3;
-    cv.drawRect(160 - w / 2, 120 - h / 2, w, h, shade(rgb(90, 170, 255), 0.3f + z * 0.7f));
-  }
-  for (int i = 0; i < 6; i++)
-    cv.fillRect(70 + i * 36, 150, 4, 2, (((int)(tNow * 8) + i) & 1) ? rgb(255, 200, 90) : rgb(80, 60, 30));
-  cv.setTextColor(rgb(120, 180, 255)); cv.setCursor(139, 200); cv.print("DOCKING");
-}
-
-
-
-static void drawMantisBodyIcon(int ox, int oy) {
-  for (int y = 0; y < MANTIS_BODY_H; y++) {
-    for (int x = 0; x < MANTIS_BODY_W; x++) {
-      uint16_t c = MANTIS_BODY_ICON[y * MANTIS_BODY_W + x];
-      if (c) cv.drawPixel(ox + x, oy + y, c);
+    case BD_PLANET: case BD_GIANT: {                             // shaded sphere, bands on giants, sometimes rings
+      float hue = (sd % 360) + alien * 120.f;
+      uint16_t base = hsv565(hue, 0.35f + alien * 0.4f, 0.55f), dark = hsv565(hue, 0.5f, 0.12f);
+      bool rings = (sd >> 9) % 3 == 0;
+      if (rings) canvas.drawEllipse(X, Y, (int)(R * 2.1f), (int)(R * 0.5f), hsv565(hue + 30.f, 0.3f, 0.6f));
+      canvas.fillCircle(X, Y, R, base);
+      if (b.type == BD_GIANT) for (int k = -3; k <= 3; k++) { int yy = Y + k * R / 4; float w = sqrtf(fmaxf(0.f, 1.f - (float)(k * k) / 16.f)) * R; canvas.drawFastHLine(X - (int)w, yy, (int)(w * 2), hsv565(hue + k * 12.f, 0.45f, 0.4f + (k & 1) * 0.15f)); }
+      canvas.fillCircle(X + R / 3, Y + R / 4, (int)(R * 0.95f), dark);                 // night side
+      canvas.fillCircle(X - R / 4, Y - R / 4, (int)(R * 0.75f), base);
+      if (rings) canvas.drawEllipse(X, Y, (int)(R * 2.1f), (int)(R * 0.5f), hsv565(hue + 30.f, 0.3f, 0.75f));
+      break;
+    }
+    case BD_DWARF: {                                             // tiny, fierce, blue-white glare
+      canvas.fillCircle(X, Y, R + 2, rgb565(200, 230, 255));
+      for (int k = 0; k < 4; k++) { float a = k * 1.5708f; canvas.drawLine(X, Y, X + (int)(cosf(a) * (R + 30)), Y + (int)(sinf(a) * (R + 30)), rgb565(170, 210, 255)); }
+      break;
+    }
+    case BD_NEUTRON: {                                           // pulsar: two sweeping beams
+      float a = g_t * 6.f;
+      for (int s = -1; s <= 1; s += 2) for (int k = -1; k <= 1; k++) canvas.drawLine(X, Y, X + (int)(cosf(a + k * 0.03f) * 260.f * s), Y + (int)(sinf(a + k * 0.03f) * 260.f * s), k ? rgb565(80, 140, 200) : rgb565(200, 240, 255));
+      canvas.fillCircle(X, Y, R + 2, rgb565(230, 245, 255));
+      break;
+    }
+    default: {                                                   // black hole: accretion disk, photon ring, darkness
+      canvas.drawEllipse(X, Y, (int)(R * 3.2f), (int)(R * 0.9f), rgb565(255, 150, 60));
+      canvas.drawEllipse(X, Y, (int)(R * 2.6f), (int)(R * 0.7f), wire::PLUM);
+      canvas.fillCircle(X, Y, R + 3, rgb565(255, 220, 160));
+      canvas.fillCircle(X, Y, R, rgb565(0, 0, 0));
+      canvas.drawEllipse(X, Y - R, (int)(R * 1.4f), (int)(R * 0.5f), rgb565(255, 190, 110));   // disk light bent over the top
+      break;
     }
   }
 }
-
-static void drawBoot() {
-  cv.fillRect(10, 28, 300, 184, rgb(3, 5, 12));
-  cv.drawRoundRect(10, 28, 300, 184, 8, rgb(70, 120, 140));
-  int ix = 22;
-  int iy = 40 + (160 - MANTIS_BODY_H) / 2;
-  if (iy < 36) iy = 36;
-  drawMantisBodyIcon(ix, iy);
-  cv.setTextSize(2);
-  cv.setTextColor(rgb(140, 220, 210));
-  cv.setCursor(118, 72);
-  cv.print("SpaceMantis");
-  cv.setTextSize(1);
-  cv.setTextColor(rgb(180, 190, 200));
-  cv.setCursor(118, 100);
-  cv.print("by BasaltSoftWorks");
-  cv.setTextColor(rgb(100, 120, 130));
-  cv.setCursor(118, 130);
-  cv.print("lost in space");
-  cv.setCursor(22, 190);
-  cv.print("tap to continue");
-  cv.setTextColor(rgb(90, 104, 116));
-  cv.setCursor(118, 160);
-  cv.print("hold A + C: new game");
-  if (newGameHold > 0.f || newGameDone > 0.f) {
-    float u = newGameDone > 0.f ? 1.f : clampf(newGameHold / 2.0f, 0.f, 1.f);
-    bool red = u >= 0.75f;
-    cv.drawRect(118, 172, 180, 8, rgb(60, 70, 80));
-    cv.fillRect(119, 173, (int)(178 * u), 6, red ? rgb(230, 50, 40) : rgb(0, 115, 115));
-    cv.setTextColor(red ? rgb(255, 120, 100) : rgb(150, 200, 200));
-    cv.setCursor(118, 182);
-    cv.print(newGameDone > 0.f ? "save cleared. new pilot." : (red ? "clearing the saved game..." : "keep holding"));
+static void rollDim(float *p) { for (int i = 0; i < 12; i++) p[i] = (esp_random() % 1000) / 1000.f; }
+static inline float alienOf(int dim) { return clampf((dim - 1) / 8.f, 0.f, 1.f); }   // 0 = real space .. 1 = witch space
+static void dimPalette(const float *p, float t, int set, float alien) {
+  // real space: black sky, faint dusty nebula (blue / violet / rust), white-blue stars.
+  // deeper: more saturation, stranger hue pairs, mantis colours, then outright alien skies.
+  float hA = (p[0] < 0.5f ? 220.f : 280.f) + (p[0] - 0.5f) * 60.f + alien * (p[1] * 300.f) + t * 6.f * alien;
+  float hB = hA + 30.f + alien * (60.f + p[2] * 180.f);
+  float sat = 0.25f + alien * 0.65f, deep = 0.02f + alien * 0.08f;
+  for (int i = 0; i < 256; i++) {
+    float u = i / 255.f; uint16_t c;
+    if (u < 0.3f) c = hsv565(hA, sat, deep + u * (0.35f + alien * 0.9f));                       // sky + nebula
+    else if (u < 0.75f) c = hsv565(hA + (hB - hA) * (u - 0.3f) / 0.45f, sat * (1.f - (u - 0.3f) * 0.8f), 0.12f + u * (0.55f + alien * 0.35f));
+    else c = hsv565(alien > 0.5f ? hB : 210.f, (1.f - u) * (0.6f + alien), 0.75f + 0.25f * u);    // stars: white-blue, alien-tinted deeper
+    if (alien > 0.6f && i > 40 && i < 120) c = mix565c(c, (i & 16) ? wire::LIME : wire::PLUM, (alien - 0.6f) * 0.6f);   // witch space
+    if (set == 0) fx::palSet(i, (uint8_t)(((c >> 11) & 31) << 3), (uint8_t)(((c >> 5) & 63) << 2), (uint8_t)((c & 31) << 3));
+    else s_palN[i] = (uint16_t)((c >> 8) | (c << 8));
   }
 }
+static inline int nebulaAt(const float *p, int x, int y, float t, int ox, int oy) {
+  uint8_t t1 = (uint8_t)(t * (8.f + p[5] * 20.f)), t2 = (uint8_t)(t * 13.f), t3 = (uint8_t)(-t * 11.f);
+  int f1 = 1 + (int)(p[6] * 3.f), f2 = 1 + (int)(p[7] * 3.f);
+  return fx::sn[(uint8_t)((x + ox) * f1 + t1)] + fx::sn[(uint8_t)((y + oy) * f2 + t2)] + fx::sn[(uint8_t)((x + y + ox) * 2 + t3)];
+}
+static void portalRender() {
+  float dt = g_dt;
+  static bool init = false;
+  if (!init) {
+    init = true; rollDim(s_dimP); rollDim(s_nextP); s_dim = 1;
+    for (auto &s : s_st) { s.x = ((int)(esp_random() % 2000) - 1000) / 1000.f; s.y = ((int)(esp_random() % 2000) - 1000) / 1000.f; s.z = s.pz = (esp_random() % 1000) / 1000.f + 0.05f; }
+    s_hoopNext = millis() + 1500;
+  }
+  float speed = 0.45f + aud::bass * 1.3f + g_level * 0.6f + aud::onset * 0.8f;
+  auto td = M5.Touch.getDetail();
+  float steerX = g_flyX, steerY = g_flyY;
+  static int pdx = -1, pdy = -1;
+  static float s_svx = 0, s_svy = 0;                             // ship velocity (world units / s)
+  if (td.isPressed() && td.y > 14 && td.y < H - 14) {
+    steerX += (td.x - 160) / 80.f; steerY += (td.y - 120) / 60.f;   // hold: fly toward your finger
+    if (pdx >= 0) { s_pcx -= (td.x - pdx) * 0.006f; s_pcy -= (td.y - pdy) * 0.006f; }   // drag: grab the space and pull it
+    pdx = td.x; pdy = td.y;
+  } else pdx = -1;
+#ifdef PORTAL_AUTOPILOT
+  { float ax_ = s_portal ? s_ptx - s_pcx : s_hx - s_pcx, ay_ = s_portal ? s_pty - s_pcy : s_hy - s_pcy; steerX = clampf(ax_ * 3.f, -1.f, 1.f); steerY = clampf(ay_ * 3.f, -1.f, 1.f); }
+#endif
+#ifdef PORTAL_TILTPILOT
+  {   // test pilot: tilts the DEVICE toward what it sees, like a person would (goes through the real IMU path)
+    extern m5_imu_data_t g_mockImu;
+    float ox_ = s_portal ? s_ptx - s_pcx : s_hx - s_pcx, oy_ = s_portal ? s_pty - s_pcy : s_hy - s_pcy;
+    float rx = clampf(ox_ * 1.2f, -TP_MAX, TP_MAX), ry = clampf(oy_ * 1.2f, -TP_MAX, TP_MAX);   // max tilt (radians)
+    g_mockImu.accel = {-sinf(rx), sinf(ry), cosf(rx) * cosf(ry)};
+  }
+#endif
+  s_svx += (clampf(steerX, -3.f, 3.f) * 0.75f - s_svx) * clampf(dt * 5.f, 0.f, 1.f);
+  s_svy += (clampf(steerY, -3.f, 3.f) * 0.75f - s_svy) * clampf(dt * 5.f, 0.f, 1.f);
+  s_pcx += s_svx * dt; s_pcy += s_svy * dt;
+  if (s_hoopAlive && s_hz < 1.4f) {                              // close to a hoop and nearly lined up: a gentle nudge
+    float ox = s_hx - s_pcx, oy = s_hy - s_pcy;
+    if (ox * ox + oy * oy < 0.3f * 0.3f) { s_pcx += ox * dt * 1.2f; s_pcy += oy * dt * 1.2f; }
+  }
 
-static void drawMantisPodIcon(int ox, int oy) {
-  for (int y = 0; y < MANTIS_POD_H; y++) {
-    for (int x = 0; x < MANTIS_POD_W; x++) {
-      uint16_t c = MANTIS_POD_ICON[y * MANTIS_POD_W + x];
-      if (c) cv.drawPixel(ox + x, oy + y, c);
+  // ---- this dimension: feedback streaks + nebula + stars ----
+  fx::swap();
+  float alienNow = alienOf(s_dim);
+  float swirl = (s_dimP[3] - 0.5f) * (0.01f + 0.07f * alienNow) + g_gz * 0.0004f;
+  float zoom = 1.035f + aud::bass * 0.05f;
+  float c = cosf(swirl), s = sinf(swirl);
+  for (int j = 0; j < fx::GH; j++)
+    for (int i = 0; i < fx::GW; i++) {
+      float dx = i * 8.f - 80.f, dy = j * 8.f - 60.f;
+      fx::gx[j][i] = 80.f + (c * dx + s * dy) / zoom; fx::gy[j][i] = 60.f + (-s * dx + c * dy) / zoom;
     }
-  }
-}
-
-static void drawLost() {
-  cv.fillRect(10, 28, 300, 184, rgb(3, 5, 12));
-  cv.drawRoundRect(10, 28, 300, 184, 8, rgb(70, 120, 140));
-  // icon left; copy right — clean conversion, black skipped
-  drawMantisPodIcon(22, 52);
-  cv.setTextSize(1);
-  cv.setTextColor(rgb(140, 190, 200));
-  cv.setCursor(104, 48);
-  cv.print("ESCAPE POD RECOVERED");
-  cv.setTextColor(rgb(210, 220, 230));
-  static const char *lines[] = {
-    "Your escape pod was",
-    "recovered somewhere",
-    "far away.",
-    "",
-    "You continue to wander,",
-    "lost in space..."
-  };
-  for (int i = 0; i < 6; i++) {
-    cv.setCursor(104, 70 + i * 14);
-    cv.print(lines[i]);
-  }
-  cv.setTextColor(rgb(100, 120, 130));
-  cv.setCursor(22, 190);
-  cv.printf("life %lu   tap to continue", (unsigned long)sm::sheet().lives);
-}
-
-
-// ============================================================
-//  status: pilot license (survives the pod) + ship diagnostic (this hull)
-//  A visual reference only — nothing here can be acted on.
-// ============================================================
-static void drawSprite565(const uint16_t *px, int w, int h, int ox, int oy) {
-  for (int y = 0; y < h; y++)
-    for (int x = 0; x < w; x++) {
-      uint16_t c = px[y * w + x];
-      if (c) cv.drawPixel(ox + x, oy + y, c);
-    }
-}
-
-static void statusBar(int x, int y, int w, int h, int v, int mx, uint16_t c) {
-  cv.drawRect(x, y, w, h, rgb(40, 50, 60));
-  int k = mx > 0 ? (w - 2) * clampf((float)v / mx, 0, 1) : 0;
-  if (k > 0) cv.fillRect(x + 1, y + 1, k, h - 2, c);
-}
-
-static void statusPips(int x, int y, int lit, int n, uint16_t on) {
-  for (int i = 0; i < n; i++) cv.fillRect(x + i * 5, y, 4, 5, i < lit ? on : rgb(40, 46, 56));
-}
-
-static void drawStatus() {
-  const sm::Pilot &p = sm::sheet();
-  const uint16_t TEAL = rgb(0, 115, 115), TEAL_D = rgb(0, 52, 56), TEAL_L = rgb(60, 170, 160);
-  const uint16_t MAG = rgb(93, 0, 93), MAG_L = rgb(150, 50, 150);
-  const uint16_t LIME = rgb(150, 225, 30), LIME_L = rgb(210, 255, 120), LILAC = rgb(185, 160, 255);
-  const uint16_t TXT = rgb(205, 215, 220), DIM = rgb(110, 124, 134);
-  char callsign[16];
-  snprintf(callsign, sizeof(callsign), "MANTIS-%04X", (unsigned)((ESP.getEfuseMac() >> 24) & 0xFFFF));
-  int charted = 0;
-  for (int i = 0; i < sm::landmarkCount(); i++) if (sm::landmarkAt(i) && sm::landmarkDiscovered(sm::landmarkAt(i)->id)) charted++;
-
-  cv.fillSprite(rgb(4, 6, 12));
-  cv.setTextSize(1);
-  // ---- pilot license: these records ride in the escape pod ----
-  cv.fillRoundRect(3, 3, 314, 106, 6, rgb(6, 14, 18));
-  cv.drawRoundRect(3, 3, 314, 106, 6, TEAL);
-  cv.fillRect(4, 4, 312, 12, MAG);
-  cv.setTextColor(LIME_L); cv.setCursor(9, 6); cv.print("LIMINAR TRANSIT - PILOT LICENSE");
-  cv.setTextColor(rgb(230, 190, 230)); cv.setCursor(252, 6); cv.print("POD RECORD");
-  cv.fillRect(8, 20, 76, 78, TEAL_D); cv.drawRect(8, 20, 76, 78, TEAL_L);
-  drawSprite565(PILOT_HELMET, PILOT_HELMET_W, PILOT_HELMET_H, 10, 22);
-  cv.setTextColor(LIME); cv.setCursor(8, 100); cv.print(callsign);
-  int x = 92;
-  cv.setTextColor(DIM); cv.setCursor(x, 21); cv.print("CALLSIGN");
-  cv.setTextColor(TXT); cv.setCursor(x + 54, 21); cv.print(callsign);
-  cv.setTextColor(DIM); cv.setCursor(x, 32); cv.print("LIFE");
-  cv.setTextColor(TXT); cv.setCursor(x + 54, 32); cv.printf("#%lu", (unsigned long)(p.lives + 1));
-  cv.setTextColor(DIM); cv.setCursor(x + 96, 32); cv.print("BANK");
-  cv.setTextColor(LIME); cv.setCursor(x + 124, 32); cv.printf("%ld cr", (long)p.credits);
-  cv.setTextColor(DIM); cv.setCursor(x, 43); cv.print("FIXED POINTS");
-  cv.setTextColor(LILAC); cv.setCursor(x + 78, 43); cv.printf("%d / %d", charted, sm::landmarkCount());
-  cv.drawLine(x, 54, 311, 54, TEAL_D);
-  static const char *careers[] = {"HAULER", "GUN HAND", "PROSPECTOR", "RESCUER", "TRADER", "WANDERER", "DEPTH RUNNER", "GHOST"};
-  // strongest careers first, two columns of four
-  int ord[sm::CR_COUNT];
-  for (int i = 0; i < sm::CR_COUNT; i++) ord[i] = i;
-  for (int i = 1; i < sm::CR_COUNT; i++) {
-    int k = ord[i], j = i - 1;
-    while (j >= 0 && p.rank[ord[j]] < p.rank[k]) { ord[j + 1] = ord[j]; j--; }
-    ord[j + 1] = k;
-  }
-  for (int i = 0; i < sm::CR_COUNT && i < 8; i++) {
-    int c = ord[i], r = p.rank[c];
-    int cx = x + (i / 4) * 112, cy = 58 + (i % 4) * 11;
-    cv.setTextColor(r ? TXT : DIM); cv.setCursor(cx, cy); cv.print(careers[c]);
-    statusPips(cx + 74, cy + 1, (r + 4) / 5, 4, LIME);   // a pip per five ranks (ranks run to 20)
-    if (r) { cv.setTextColor(DIM); cv.setCursor(cx + 96, cy); cv.printf("%d", r); }
-  }
-
-  // ---- ship diagnostic: this hull, lost with it ----
-  cv.fillRoundRect(3, 112, 314, 125, 6, rgb(8, 6, 14));
-  cv.drawRoundRect(3, 112, 314, 125, 6, MAG_L);
-  cv.fillRect(4, 113, 312, 12, TEAL_D);
-  cv.setTextColor(TEAL_L); cv.setCursor(9, 115); cv.print("SHIP DIAGNOSTIC - THIS HULL");
-  cv.setTextColor(DIM); cv.setCursor(230, 115); cv.print("RESETS ON LOSS");
-  for (int gx = 8; gx < 170; gx += 12) cv.drawLine(gx, 128, gx, 222, rgb(16, 22, 30));
-  for (int gy = 128; gy < 224; gy += 12) cv.drawLine(8, gy, 170, gy, rgb(16, 22, 30));
-  drawSprite565(SHIP_ART, SHIP_ART_W, SHIP_ART_H, 10, 134);
-  int X = 176;
-  struct G { const char *l; int v, mx; uint16_t c; } gs[] = {
-    {"HULL", p.hull, p.hullMax, TEAL_L}, {"FUEL", p.fuel, p.fuelCap, LIME}, {"HOLD", p.holdUsed, p.holdCap, MAG_L}};
-  for (int i = 0; i < 3; i++) {
-    bool low = i < 2 && gs[i].v * 4 < gs[i].mx;
-    cv.setTextColor(DIM); cv.setCursor(X, 130 + i * 14); cv.print(gs[i].l);
-    statusBar(X + 28, 131 + i * 14, 80, 6, gs[i].v, gs[i].mx, low ? rgb(255, 120, 70) : gs[i].c);
-    cv.setTextColor(TXT); cv.setCursor(X + 112, 130 + i * 14); cv.printf("%d", gs[i].v);
-  }
-  // depth rating: which layers this hull is rated to reach without glitching
-  int safe = sm::depthQuery(4).maxBand; if (safe > 4) safe = 4;
-  cv.setTextColor(DIM); cv.setCursor(X, 174); cv.print("RATED");
-  statusPips(X + 34, 175, safe, 4, LILAC);
-  cv.setTextColor(LILAC); cv.setCursor(X + 56, 174); cv.print(layerName(safe));
-  static const char *capShort[] = {"WEAPONS", "SHIELDS", "MINING", "SCANNER", "TRAILER", "STABILZ", "BULKHD", "CLOAK", "FUELSYS"};
-  for (int i = 0; i < sm::CAP_COUNT && i < 10; i++) {
-    int v = p.cap[i];
-    int cx = X + (i % 2) * 70, cy = 186 + (i / 2) * 9;
-    cv.setTextColor(v ? TXT : DIM); cv.setCursor(cx, cy); cv.print(capShort[i]);
-    cv.setTextColor(v ? LIME : DIM); cv.setCursor(cx + 46, cy);
-    if (v) cv.printf("MK%d", v); else cv.print("--");
-  }
-  cv.setTextColor(rgb(70, 95, 105)); cv.setCursor(10, 226); cv.print("tap: close");
-  cv.setTextColor(rgb(110, 130, 140)); cv.setCursor(82, 226); cv.print("hold C: journal");
-}
-
-// ============================================================
-//  journal + active lead (status page 2, hold C)
-// ============================================================
-static void drawJournal() {
-  const uint16_t TEAL = rgb(0, 115, 115), TEAL_D = rgb(0, 52, 56), TEAL_L = rgb(60, 170, 160), MAG = rgb(93, 0, 93);
-  const uint16_t LIME_L = rgb(210, 255, 120), GOLD = rgb(240, 200, 90), TXT = rgb(205, 215, 220), DIM = rgb(110, 124, 134);
-  cv.fillSprite(rgb(4, 6, 12));
-  cv.setTextSize(1);
-  // the active lead
-  cv.fillRoundRect(3, 3, 314, 62, 6, rgb(10, 10, 8));
-  cv.drawRoundRect(3, 3, 314, 62, 6, GOLD);
-  cv.fillRect(4, 4, 312, 12, rgb(70, 56, 16));
-  cv.setTextColor(rgb(255, 230, 150)); cv.setCursor(9, 6); cv.print("ACTIVE LEAD");
-  const sm::Contract &c = sm::contract();
-  const sm::Trip &tr = sm::trip();
-  if (c.live) {
-    cv.setTextColor(GOLD); cv.setCursor(9, 20); cv.printf("%s", c.title);
-    cv.setTextColor(LIME_L); cv.setCursor(240, 20); cv.printf("+%dcr", c.pay);
-    cv.setTextColor(TXT); cv.setCursor(9, 31);
-    if (c.dest[0]) cv.printf("to %s, depth %u", c.dest, c.destDepth); else cv.print(sm::contractHint(c));
-    cv.setTextColor(DIM); cv.setCursor(9, 42); cv.printf("progress %u/%u   %s", c.progress, c.need, c.dest[0] ? "find its gate and fly it" : "");
-  } else { cv.setTextColor(DIM); cv.setCursor(9, 24); cv.print("no lead. the boards are always hiring."); }
-  if (tr.active) { cv.setTextColor(TEAL_L); cv.setCursor(9, 53); cv.printf("COURSE %s  depth %u  %s", tr.dest, tr.destDepth, tr.ascending ? "climbing" : "diving"); }
-  // the journal: newest first
-  cv.fillRoundRect(3, 68, 314, 168, 6, rgb(6, 10, 14));
-  cv.drawRoundRect(3, 68, 314, 168, 6, TEAL);
-  cv.fillRect(4, 69, 312, 12, MAG);
-  cv.setTextColor(LIME_L); cv.setCursor(9, 71); cv.print("PILOT JOURNAL");
-  cv.setTextColor(rgb(230, 190, 230)); cv.setCursor(252, 71); cv.print("POD RECORD");
-  int y = 85;
-  for (int k = 0; y < 214; k++) {
-    const sm::JournalEntry *e = sm::journalNewest(k);
-    if (!e) { if (k == 0) { cv.setTextColor(DIM); cv.setCursor(9, y); cv.print("nothing written yet."); } break; }
-    cv.setTextColor(k == 0 ? TEAL_L : TEAL_D); cv.setCursor(9, y); cv.printf("L%u", e->life);
-    cv.setTextColor(k == 0 ? TXT : DIM);
-    printWrapped(33, y, 46, 2, 10, e->text);
-    y += (strlen(e->text) > 46 ? 21 : 11);
-  }
-  cv.setTextColor(rgb(70, 95, 105)); cv.setCursor(10, 226); cv.print("tap to close");
-  cv.setTextColor(rgb(110, 130, 140)); cv.setCursor(226, 226); cv.print("hold C: license");
-}
-
-// ============================================================
-//  the atlas: subspace memory drawn as "the deep is small"
-//  Rings are layers (real space outside, the cove at the centre). Places you
-//  have been sit on the rim, in network order; places only seen as gates sit
-//  just outside; fixed points sit on their own rings. No coordinates, ever.
-// ============================================================
-static const float MAP_CX = 160.f, MAP_CY = 116.f, MAP_SX = 1.22f, MAP_SY = 0.80f;
-static const float MAP_R[5] = {96, 74, 54, 35, 16};
-static float mapX[sm::ATLAS_PLACES], mapY[sm::ATLAS_PLACES], mapAng[sm::ATLAS_PLACES];
-static uint8_t mapRole[sm::ATLAS_PLACES];   // 0 hidden, 1 rim, 2 outer, 3 fixed
-
-static uint16_t depthCol(int d) {
-  switch (d) { case 1: return rgb(80, 200, 215); case 2: return rgb(140, 110, 230); case 3: return rgb(205, 70, 190); default: return rgb(150, 225, 30); }
-}
-
-static void layoutMap() {
-  sm::Atlas &a = sm::atlas();
-  int vis[sm::ATLAS_PLACES], nv = 0;
-  for (int k = 0; k < sm::ATLAS_PLACES; k++) {
-    mapRole[k] = 0;
-    if ((a.place[k].flags & sm::AP_USED) && (a.place[k].flags & sm::AP_VISITED) && !(a.place[k].flags & sm::AP_FIXED)) vis[nv++] = k;
-  }
-  for (int i = 1; i < nv; i++) { int v = vis[i], j = i - 1; while (j >= 0 && a.place[vis[j]].lastSeen < a.place[v].lastSeen) { vis[j + 1] = vis[j]; j--; } vis[j + 1] = v; }
-  if (nv > sm::ATLAS_VISITED_KEEP) nv = sm::ATLAS_VISITED_KEEP;
-  bool inSet[sm::ATLAS_PLACES] = {false}, done[sm::ATLAS_PLACES] = {false};
-  for (int i = 0; i < nv; i++) inSet[vis[i]] = true;
-  // ring order: walk the network from here so linked places sit side by side
-  int order[sm::ATLAS_PLACES], no = 0, stack[sm::ATLAS_PLACES * 2], sp = 0;
-  int start = (a.here != 255 && inSet[a.here]) ? a.here : (nv ? vis[0] : -1);
-  if (start >= 0) stack[sp++] = start;
-  while (sp > 0 || no < nv) {
-    if (sp == 0) { for (int i = 0; i < nv; i++) if (!done[vis[i]]) { stack[sp++] = vis[i]; break; } if (sp == 0) break; }
-    int c = stack[--sp];
-    if (done[c]) continue;
-    done[c] = true; order[no++] = c;
-    for (auto &l : a.link) {
-      if (!(l.flags & sm::AL_USED)) continue;
-      int o = l.a == c ? l.b : (l.b == c ? l.a : -1);
-      if (o >= 0 && inSet[o] && !done[o] && sp < sm::ATLAS_PLACES * 2) stack[sp++] = o;
-    }
-  }
-  for (int i = 0; i < no; i++) {
-    int k = order[i];
-    mapAng[k] = i * 6.2831853f / (no > 0 ? no : 1);
-    mapX[k] = MAP_CX + MAP_R[0] * MAP_SX * cosf(mapAng[k]); mapY[k] = MAP_CY + MAP_R[0] * MAP_SY * sinf(mapAng[k]); mapRole[k] = 1;
-  }
-  // names seen as gates (and rumors) sit just outside the place they hang from
-  int perAnchor[sm::ATLAS_PLACES] = {0};
-  static const float off[] = {0.24f, -0.24f, 0.46f, -0.46f, 0.66f, -0.66f};
-  for (int k = 0; k < sm::ATLAS_PLACES; k++) {
-    const sm::AtlasPlace &p = a.place[k];
-    if (!(p.flags & sm::AP_USED) || mapRole[k] || (p.flags & sm::AP_VISITED)) continue;
-    int anchor = -1;
-    for (auto &l : a.link) {
-      if (!(l.flags & sm::AL_USED)) continue;
-      int o = l.a == k ? l.b : (l.b == k ? l.a : -1);
-      if (o >= 0 && mapRole[o] == 1) { anchor = o; break; }
-    }
-    if (anchor < 0) continue;
-    bool fixed = p.flags & sm::AP_FIXED;
-    int n = perAnchor[anchor]++;
-    float ang = mapAng[anchor] + off[n % 6] * (fixed ? 0.8f : 1.f);
-    float r = fixed ? MAP_R[p.depth > 4 ? 4 : p.depth] : MAP_R[0] + 14.f;
-    mapAng[k] = ang;
-    mapX[k] = MAP_CX + r * MAP_SX * cosf(ang); mapY[k] = MAP_CY + r * MAP_SY * sinf(ang);
-    mapRole[k] = fixed ? 3 : 2;
-  }
-  // fixed points with no surface thread this life still float on their rings
-  int loose = 0;
-  for (int k = 0; k < sm::ATLAS_PLACES; k++) {
-    const sm::AtlasPlace &p = a.place[k];
-    if (!(p.flags & sm::AP_USED) || mapRole[k] || !(p.flags & sm::AP_FIXED)) continue;
-    float ang = 0.7f + loose++ * 1.3f;
-    float r = MAP_R[p.depth > 4 ? 4 : p.depth];
-    mapAng[k] = ang; mapX[k] = MAP_CX + r * MAP_SX * cosf(ang); mapY[k] = MAP_CY + r * MAP_SY * sinf(ang); mapRole[k] = 3;
-  }
-}
-
-static void mapDashed(float x0, float y0, float x1, float y1, uint16_t c, int on, int offp) {
-  float L = sqrtf((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0));
-  if (L < 1) return;
-  for (float s = 0; s < L; s += on + offp) {
-    float e = fminf(L, s + on);
-    cv.drawLine((int)(x0 + (x1 - x0) * s / L), (int)(y0 + (y1 - y0) * s / L), (int)(x0 + (x1 - x0) * e / L), (int)(y0 + (y1 - y0) * e / L), c);
-  }
-}
-
-// a lane between two rim places bows inward as deep as it goes
-static void mapArc(int a, int b, int depth, uint16_t col, int style, int width, int via = -1) {
-  float x0 = mapX[a], y0 = mapY[a], x1 = mapX[b], y1 = mapY[b];
-  bool throughHub = via >= 0 && via < sm::ATLAS_PLACES && mapRole[via];
-  bool rimPair = (mapRole[a] == 1 && mapRole[b] == 1) || throughHub;
-  float px = 0, py = 0;
-  int steps = rimPair ? 16 : 1;
-  float cx = (x0 + x1) * 0.5f, cy = (y0 + y1) * 0.5f;
-  if (throughHub) { cx = 2.f * mapX[via] - cx; cy = 2.f * mapY[via] - cy; }   // the curve passes the hub
-  else if (rimPair) {
-    float m = atan2f((cy - MAP_CY) / MAP_SY, (cx - MAP_CX) / MAP_SX);
-    float span = fabsf(fmodf(mapAng[a] - mapAng[b] + 9.42477796f, 6.2831853f) - 3.1415927f);
-    float rr = span > 0.5f ? MAP_R[depth > 4 ? 4 : depth] : MAP_R[0] - 10.f * depth;
-    cx = MAP_CX + rr * MAP_SX * cosf(m); cy = MAP_CY + rr * MAP_SY * sinf(m);
-  }
-  for (int k = 0; k <= steps; k++) {
-    float u = (float)k / steps;
-    float x = rimPair ? (1 - u) * (1 - u) * x0 + 2 * u * (1 - u) * cx + u * u * x1 : x0 + (x1 - x0) * u;
-    float y = rimPair ? (1 - u) * (1 - u) * y0 + 2 * u * (1 - u) * cy + u * u * y1 : y0 + (y1 - y0) * u;
-    if (k > 0) {
-      if (style == 0 || (style == 1 && (k & 1))) {
-        cv.drawLine((int)px, (int)py, (int)x, (int)y, col);
-        if (width > 1) cv.drawLine((int)px + 1, (int)py, (int)x + 1, (int)y, col);
-        if (width > 2) cv.drawLine((int)px, (int)py + 1, (int)x, (int)y + 1, col);
-      } else if (style == 2) mapDashed(px, py, x, y, col, 1, 3);
-      else if (style == 1 && !rimPair) mapDashed(px, py, x, y, col, 3, 3);
-    }
-    px = x; py = y;
-  }
-}
-
-static void drawMap() {
-  sm::Atlas &a = sm::atlas();
-  layoutMap();
-  const uint16_t TEAL_D = rgb(0, 52, 56), TEAL_L = rgb(60, 170, 160), LIME = rgb(150, 225, 30), LIME_L = rgb(210, 255, 120);
-  const uint16_t LILAC = rgb(185, 160, 255), GOLD = rgb(240, 200, 90), TXT = rgb(205, 215, 220), DIM = rgb(100, 114, 124), WHITE = rgb(245, 250, 240);
-  cv.fillSprite(rgb(4, 6, 12));
-  for (int i = 0; i < 5; i++) {
-    cv.fillEllipse((int)MAP_CX, (int)MAP_CY, (int)(MAP_R[i] * MAP_SX), (int)(MAP_R[i] * MAP_SY), rgb(4 + i * 3, 8 + i * 2, 14 + i * 4));
-    cv.drawEllipse((int)MAP_CX, (int)MAP_CY, (int)(MAP_R[i] * MAP_SX), (int)(MAP_R[i] * MAP_SY), rgb(14 + i * 6, 26 + i * 3, 34 + i * 6));
-  }
-  static const char *rn[] = {"SHALLOWS", "ROADS", "BELOW", "COVE"};
-  cv.setTextColor(rgb(56, 70, 80));
-  for (int i = 1; i < 5; i++) { cv.setCursor((int)MAP_CX - (int)strlen(rn[i - 1]) * 3, (int)(MAP_CY - MAP_R[i] * MAP_SY) + 2); cv.print(rn[i - 1]); }
-  // lanes
-  for (auto &l : a.link) {
-    if (!(l.flags & sm::AL_USED) || !mapRole[l.a] || !mapRole[l.b]) continue;
-    bool fixed = mapRole[l.a] == 3 || mapRole[l.b] == 3;
-    if (fixed) { mapDashed(mapX[l.a], mapY[l.a], mapX[l.b], mapY[l.b], rgb(120, 100, 190), 2, 3); continue; }
-    if (l.flags & sm::AL_TETHER) { mapDashed(mapX[l.a], mapY[l.a], mapX[l.b], mapY[l.b], TEAL_L, 1, 3); continue; }
-    bool flown = l.flags & sm::AL_FLOWN;
-    mapArc(l.a, l.b, l.depth, depthCol(l.depth), flown ? 0 : 1, flown && l.depth > 1 ? 2 : 1, l.via != 255 ? l.via : -1);
-  }
-  // the traced way from here
-  int path[sm::ATLAS_PLACES], pn = 0;
-  if (mapTrace >= 0 && a.here != 255) pn = sm::atlasPath(a.here, mapTrace, path, sm::ATLAS_PLACES);
-  for (int i = 0; i + 1 < pn; i++) {
-    int d = 1;
-    int via = -1;
-    for (auto &l : a.link) if ((l.flags & sm::AL_USED) && ((l.a == path[i] && l.b == path[i + 1]) || (l.b == path[i] && l.a == path[i + 1]))) { d = l.depth; via = l.via != 255 ? l.via : -1; }
-    mapArc(path[i], path[i + 1], d, WHITE, 0, 3, via);
-  }
-  // places and names (names placed so they don't sit on each other)
-  int boxes[sm::ATLAS_PLACES][4], nb = 0;
-  const sm::Contract &c = sm::contract();
-  for (int pass = 0; pass < 2; pass++)
-    for (int k = 0; k < sm::ATLAS_PLACES; k++) {
-      if (!mapRole[k]) continue;
-      const sm::AtlasPlace &p = a.place[k];
-      bool here = k == a.here, job = c.live && sm::sameName(p.name, c.dest), traced = false;
-      for (int i = 1; i < pn; i++) if (path[i] == k) traced = true;
-      bool important = here || job || traced || k == mapTrace;
-      if ((pass == 0) != important) continue;   // the important names claim space first
-      int x = (int)mapX[k], y = (int)mapY[k];
-      uint16_t col = TXT;
-      if (here) { cv.drawCircle(x, y, 5, LIME_L); cv.fillCircle(x, y, 3, LIME); col = LIME; }
-      else if (mapRole[k] == 3) { cv.fillTriangle(x, y - 4, x + 4, y, x, y + 4, LILAC); cv.fillTriangle(x, y - 4, x - 4, y, x, y + 4, LILAC); col = LILAC; }
-      else if (job) { cv.fillRect(x - 3, y - 3, 7, 7, GOLD); col = GOLD; }
-      else if (p.flags & sm::AP_RUMOR) { cv.drawCircle(x, y, 3, TEAL_L); col = TEAL_L; }
-      else if (mapRole[k] == 2) { cv.fillCircle(x, y, 3, rgb(4, 6, 12)); cv.drawCircle(x, y, 3, TXT); col = DIM; }
-      else cv.fillCircle(x, y, 3, TXT);
-      if (traced || k == mapTrace) cv.drawCircle(x, y, 6, WHITE);
-      char lab[24]; asciiCopy(lab, sizeof(lab), p.name); upcase(lab);
-      if (mapRole[k] == 3 && strlen(lab) > 12) { char *sp2 = strchr(lab + 4, ' '); if (sp2) *sp2 = 0; }
-      if (p.flags & sm::AP_RUMOR) strncat(lab, " ?", sizeof(lab) - strlen(lab) - 1);
-      int w = (int)strlen(lab) * 6;
-      bool right = x >= (int)MAP_CX;
-      int cand[4][2] = {{right ? x + 7 : x - 7 - w, y - 4}, {right ? x - 7 - w : x + 7, y - 4}, {x - w / 2, y - 13}, {x - w / 2, y + 6}};
-      for (int ci = 0; ci < 4; ci++) {
-        int lx = cand[ci][0], ly = cand[ci][1];
-        lx = lx < 1 ? 1 : (lx + w > 319 ? 319 - w : lx);
-        ly = ly < 14 ? 14 : (ly > 202 ? 202 : ly);
-        bool clash = false;
-        for (int b = 0; b < nb && !clash; b++)
-          clash = !(lx + w < boxes[b][0] || lx > boxes[b][2] || ly + 8 < boxes[b][1] || ly > boxes[b][3]);
-        if (clash && !(important && ci == 3)) continue;
-        cv.setTextColor(col); cv.setCursor(lx, ly); cv.print(lab);
-        if (nb < sm::ATLAS_PLACES) { boxes[nb][0] = lx - 1; boxes[nb][1] = ly - 1; boxes[nb][2] = lx + w + 1; boxes[nb][3] = ly + 9; nb++; }
-        break;
+  if (s_lensR > 0)                                                   // gravitational lensing warps the view
+    for (int j = 0; j < fx::GH; j++)
+      for (int i = 0; i < fx::GW; i++) {
+        float dx = i * 8.f - s_lensX, dy = j * 8.f - s_lensY, d2 = dx * dx + dy * dy + 4.f;
+        float k = s_lensR * s_lensR / d2; if (k > 0.9f) k = 0.9f;
+        fx::gx[j][i] += dx * k; fx::gy[j][i] += dy * k;
       }
-    }
-  // header + way strip
-  int places = 0; for (int k = 0; k < sm::ATLAS_PLACES; k++) if (mapRole[k] == 1) places++;
-  cv.fillRect(0, 0, 320, 12, TEAL_D);
-  cv.setTextColor(TEAL_L); cv.setCursor(4, 2); cv.print("THE DEEP IS SMALL");
-  cv.setTextColor(DIM); cv.setCursor(196, 2); cv.printf("LIFE #%lu  %d PLACES", (unsigned long)(sm::sheet().lives + 1), places);
-  if (mapTrace >= 0) {
-    cv.fillRect(0, 203, 320, 23, rgb(18, 24, 30));
-    char way[160] = "WAY:"; size_t o = 4;
-    if (pn < 2) snprintf(way, sizeof(way), "NO REMEMBERED WAY FROM HERE");
-    else for (int i = 1; i < pn && o < sizeof(way) - 30; i++) {
-      int d = 1;
-      for (auto &l : a.link) if ((l.flags & sm::AL_USED) && ((l.a == path[i - 1] && l.b == path[i]) || (l.b == path[i - 1] && l.a == path[i]))) d = l.depth;
-      char nm[24]; asciiCopy(nm, sizeof(nm), a.place[path[i]].name); upcase(nm);
-      o += snprintf(way + o, sizeof(way) - o, "%s %s d%d", i > 1 ? " >" : "", nm, d);
-    }
-    cv.setTextColor(WHITE); printWrapped(3, 205, 52, 2, 10, way);
-  } else {
-    cv.setTextColor(DIM); cv.setCursor(4, 213); cv.print("solid flown  dashed seen gate  ? rumor");
-  }
-  cv.setTextColor(rgb(110, 130, 140)); cv.setCursor(4, 228); cv.print("hold A: this system");
-  cv.setTextColor(rgb(70, 95, 105)); cv.setCursor(160, 228); cv.print("tap a place: trace");
-}
-
-static void mapTap(int x, int y) {
-  if (mapPage == 0) {
-    layoutMap();
-    int best = -1; float bd = 15.f;
-    for (int k = 0; k < sm::ATLAS_PLACES; k++) {
-      if (!mapRole[k]) continue;
-      float d = sqrtf((mapX[k] - x) * (mapX[k] - x) + (mapY[k] - y) * (mapY[k] - y));
-      if (d < bd) { bd = d; best = k; }
-    }
-    if (best >= 0 && best != sm::atlas().here) { mapTrace = best; hx::pop(0.18f, 0.015f); return; }
-  }
-  mapOpen = false; hx::pop(0.15f, 0.01f);
-}
-
-// ============================================================
-//  this system (map page 2): what the scanner sees right here
-// ============================================================
-static const char *gateMaker(const char *name) {
-  // every lane was built by someone; one of them keeps an older calendar
-  uint32_t h = 2166136261u;
-  for (const char *c = name; *c; c++) { h ^= (uint8_t)(*c | 32); h *= 16777619u; }
-  switch (h % 11) { case 0: case 1: case 2: case 3: return "PORTEX"; case 4: case 5: case 6: return "MALTAPLEX";
-                    case 7: case 8: return "LIMINAR RELAY"; case 9: return "DESERET"; default: return "NO MAKER'S MARK"; }
-}
-
-static void sysRow(int &y, uint16_t glyph, const char *label, const char *detail, uint16_t col) {
-  if (y > 208) return;
-  cv.fillRect(8, y + 1, 6, 6, glyph);
-  cv.setTextColor(col); cv.setCursor(20, y); cv.print(label);
-  if (detail && detail[0]) { cv.setTextColor(rgb(110, 124, 134)); cv.setCursor(316 - (int)strlen(detail) * 6, y); cv.print(detail); }
-  y += 11;
-}
-
-static void distLabel(char *out, size_t n, float d) {
-  float m = d * 10.f;
-  if (m < 1000.f) snprintf(out, n, "%dm", (int)m); else snprintf(out, n, "%.1fkm", m / 1000.f);
-}
-
-static void drawSystemMap() {
-  const uint16_t TEAL_D = rgb(0, 52, 56), TEAL_L = rgb(60, 170, 160), LILAC = rgb(185, 160, 255), GOLD = rgb(240, 200, 90);
-  const uint16_t TXT = rgb(205, 215, 220), DIM = rgb(110, 124, 134), BLUE = rgb(70, 150, 255);
-  cv.fillSprite(rgb(4, 6, 12));
-  cv.fillRect(0, 0, 320, 12, TEAL_D);
-  cv.setTextColor(TEAL_L); cv.setCursor(4, 2);
-  char title[48];
-  if (layer == 0) snprintf(title, sizeof(title), "THIS SYSTEM - %s", hereName); else snprintf(title, sizeof(title), "%s", layerName(layer));
-  cv.print(title);
-  int y = 18; char d[24], l[64];
-  if (layer == 0) {
-    static const char *st[] = {"RED DWARF", "ORANGE STAR", "YELLOW STAR", "WHITE STAR", "BLUE GIANT", "RED GIANT", "WHITE DWARF"};
-    if (!nearStar) sysRow(y, sunCol, st[sunType], "the local sun", TXT);
-    for (auto &o : objs) if (o.kind == K_BODY) { distLabel(d, sizeof(d), surfaceDist(o)); sysRow(y, o.col, o.name, d, TXT); }
-    for (auto &o : objs) if (o.kind == K_STATION) { distLabel(d, sizeof(d), distTo(o)); snprintf(l, sizeof(l), "%s - docking", o.name); sysRow(y, BLUE, l, d, rgb(120, 180, 255)); }
-    int rocks = countKind(K_ROCK), ships = countKind(K_SHIP);
-    if (rocks) { snprintf(l, sizeof(l), "%d asteroids on scope", rocks); sysRow(y, rgb(150, 120, 80), l, "", TXT); }
-    if (ships) { snprintf(l, sizeof(l), "%d contacts on scope", ships); sysRow(y, rgb(200, 200, 210), l, "", TXT); }
-    y += 3; cv.drawLine(8, y, 312, y, rgb(20, 30, 40)); y += 4;
-    cv.setTextColor(DIM); cv.setCursor(8, y); cv.print("GATES IN THIS SYSTEM"); y += 11;
-    for (auto &o : objs) {
-      if (o.kind != K_GATE || !(o.gflags & GF_DEST)) continue;
-      const char *tag = (o.gflags & GF_JOB) ? "JOB" : (o.gflags & GF_FIXED) ? "FIXED" : (o.gflags & GF_RUMOR) ? "RUMOR" : (o.gflags & GF_KNOWN) ? "BEEN" : "NEW";
-      snprintf(l, sizeof(l), "%-14.14s d%u %-5s", o.name, o.depth, tag);
-      char viaName[24] = "";
-      if (o.lmId && !(o.gflags & GF_FIXED))
-        for (int i = 0; i < sm::landmarkCount(); i++) if (sm::landmarkAt(i) && (int)sm::landmarkAt(i)->id == o.lmId) { snprintf(viaName, sizeof(viaName), "via %.14s", sm::landmarkAt(i)->name); }
-      sysRow(y, gateColor(o), l, viaName[0] ? viaName : gateMaker(o.name), gateColor(o));
-    }
-  } else {
-    static const char *lore[5][2] = {
-      {"", ""},
-      {"The liminal wake. Sub-pirates drift here,", "between the surface and the roads."},
-      {"Worn lanes of the deep trade. Ghost fleet", "couriers keep to the dark edges."},
-      {"Deseret and Liminar are building something", "down here. Tunnelers camp in its shadow."},
-      {"Here the layer remembers itself: same light,", "same names, every life. The ghost fleet's home."}};
-    cv.setTextColor(TXT);
-    cv.setCursor(8, y); cv.print(lore[layer][0]); y += 10;
-    cv.setCursor(8, y); cv.print(lore[layer][1]); y += 14;
-    const sm::Trip &tr = sm::trip();
-    if (tr.active) { snprintf(l, sizeof(l), "COURSE %s", tr.dest); snprintf(d, sizeof(d), "d%u %s", tr.destDepth, tr.ascending ? "up" : "down"); sysRow(y, GOLD, l, d, GOLD); }
-    if (navObj >= 0 && objs[navObj].kind != K_NONE) {
-      distLabel(d, sizeof(d), distTo(objs[navObj]));
-      sysRow(y, objs[navObj].kind == K_PORTAL ? rgb(210, 110, 230) : rgb(110, 240, 200), objs[navObj].kind == K_PORTAL ? "PORTAL" : "NEXT GATE", d, TXT);
-    }
-    for (auto &o : objs) {
-      if (o.kind == K_BODY) { distLabel(d, sizeof(d), surfaceDist(o)); sysRow(y, o.col ? o.col : rgb(255, 200, 120), o.name, d, TXT); }
-      if (o.kind == K_LANDMARK) {
-        distLabel(d, sizeof(d), distTo(o)); sysRow(y, LILAC, o.name, d, LILAC);
-        for (int i = 0; i < sm::landmarkCount(); i++) {
-          const sm::Landmark *lm = sm::landmarkAt(i);
-          if (lm && (int)lm->id == o.lmId) {
-            char ln[112]; asciiCopy(ln, sizeof(ln), sm::landmarkLine(*lm, (uint32_t)o.lmId * 7u));
-            cv.setTextColor(DIM); printWrapped(20, y, 49, 2, 10, ln); y += 21;
-          }
+  fx::warp((uint8_t)(12 + s_dimP[4] * 10.f), false);
+  {
+    int ox = (int)(s_pcx * 40.f), oy = (int)(s_pcy * 40.f), lift = (int)(14 + alienNow * 40.f) + (int)(aud::mid * 40.f);
+    float t = g_t;
+    auto rows_ = [&](int y0, int y1) {
+      for (int y = y0; y < y1; y++) {
+        uint8_t *row = fx::buf + y * fx::LW;
+        for (int x = 0; x < fx::LW; x++) {
+          int n = nebulaAt(s_dimP, x, y, t, ox, oy);
+          n = n > 0 ? (n * lift) >> 8 : 0;
+          if (n > row[x]) row[x] = (uint8_t)n;
         }
       }
-      if (o.kind == K_SHIP && o.ghost) sysRow(y, rgb(170, 190, 200), "GHOST FLEET hull", "running dark", TXT);
-    }
-    y += 3; cv.drawLine(8, y, 312, y, rgb(20, 30, 40)); y += 5;
-    cv.setTextColor(DIM); cv.setCursor(8, y); cv.print("SCANNER PICKS UP"); y += 11;
-    char w[112]; asciiCopy(w, sizeof(w), sm::deepWhisper((uint8_t)layer, (uint32_t)(millis() / 20000u) * 2654435761u));
-    cv.setTextColor(LILAC); printWrapped(20, y, 49, 3, 10, w);
+    };
+    fx::parallel(rows_);
   }
-  cv.setTextColor(rgb(110, 130, 140)); cv.setCursor(4, 228); cv.print("hold A: subspace map");
-  cv.setTextColor(rgb(70, 95, 105)); cv.setCursor(226, 228); cv.print("tap to close");
+  float fov = 95.f + aud::bass * 30.f;
+  for (auto &st : s_st) {
+    st.pz = st.z;
+    st.z -= speed * dt * (0.6f + s_dimP[6]);
+    if (st.z < 0.03f) { st.x = ((int)(esp_random() % 2000) - 1000) / 1000.f; st.y = ((int)(esp_random() % 2000) - 1000) / 1000.f; st.z = st.pz = 1.f; continue; }
+    float sx0 = 80.f + (st.x - s_pcx * 0.3f) / st.pz * fov * 0.5f, sy0 = 60.f + (st.y - s_pcy * 0.3f) / st.pz * fov * 0.5f;
+    float sx = 80.f + (st.x - s_pcx * 0.3f) / st.z * fov * 0.5f, sy = 60.f + (st.y - s_pcy * 0.3f) / st.z * fov * 0.5f;
+    uint8_t b = (uint8_t)clampf(90.f + 200.f * (1.f - st.z) + aud::treble * 60.f, 60, 255);
+    fx::line((int)sx0, (int)sy0, (int)sx, (int)sy, b);
+    if (st.z < 0.3f) fx::line((int)sx0 + 1, (int)sy0, (int)sx + 1, (int)sy, b);
+  }
+  dimPalette(s_dimP, g_t, 0, alienOf(s_dim));
+  fx::palFlash(s_emerge * 0.6f + s_hoopFlash * 0.25f + aud::onset * 0.2f);
+  s_emerge = fmaxf(0.f, s_emerge - dt * 1.2f);
+  s_hoopFlash = fmaxf(0.f, s_hoopFlash - dt * 3.f);
+  fx::present(canvas);
+
+  // ---- stellar landmarks ----
+  if (!s_body.live && millis() > s_bodyNext) {
+    uint32_t r = esp_random() % 1000; float al = alienNow;
+#ifdef FORCE_HOLE
+    r = 999;
+#endif
+    uint8_t t = r < 330 ? BD_STAR : (r < 660 ? BD_PLANET : (r < 850 ? BD_GIANT : (r < 920 ? BD_DWARF : (r < 975 - (int)(al * 30) ? BD_NEUTRON : BD_HOLE))));
+    static const float RW[6] = {0.22f, 0.3f, 0.75f, 0.05f, 0.04f, 0.25f};
+    float side = (esp_random() & 1) ? 1.f : -1.f;
+    s_body = {s_pcx + side * (0.9f + (esp_random() % 100) / 90.f), s_pcy + ((int)(esp_random() % 160) - 80) / 100.f, 7.f, RW[t], (esp_random() % 10000) / 10000.f, t, true};
+  }
+  s_lensR = 0;
+  if (s_body.live) {
+    s_body.z -= dt * (0.3f + speed * 0.25f);
+    if (s_body.z < 0.25f) { s_body.live = false; s_bodyNext = millis() + 3000 + esp_random() % 6000; }
+    else {
+      drawBody(s_body, s_pcx, s_pcy, alienNow);
+      if (s_body.type == BD_HOLE) {
+        float z = s_body.z;
+        s_lensX = 80.f + (s_body.x - s_pcx) / z * 30.f; s_lensY = 60.f + (s_body.y - s_pcy) / z * 30.f;
+        s_lensR = fminf(60.f, s_body.r / z * 30.f * 2.2f);
+      }
+    }
+  }
+
+  // ---- hoops: thread three in a row ----
+  float approach = dt * (0.42f + speed * 0.28f);
+  if (!s_portal && !s_hoopAlive && millis() > s_hoopNext) {
+    s_hoopAlive = true; s_hz = 3.2f;
+    s_hx = s_pcx + ((int)(esp_random() % 140) - 70) / 100.f; s_hy = s_pcy + ((int)(esp_random() % 100) - 50) / 100.f;
+  }
+  if (s_hoopAlive) {
+    s_hz -= approach;
+    float ox = s_hx - s_pcx, oy = s_hy - s_pcy;
+    if (s_hz < 0.18f) {
+      bool in = ox * ox + oy * oy < 0.34f * 0.34f;
+      if (in) { s_hoopN++; s_hoopFlash = 1.f; hapGesture(s_hoopN >= 3 ? HG_CHAIN : HG_THREAD); stats::event(stats::EV_HOOP); } else { s_hoopN = 0; hapGesture(HG_MISS); }
+#if defined(PORTAL_AUTOPILOT) || defined(PORTAL_TILTPILOT)
+      printf("t=%.1f hoop %s (off %.2f,%.2f) chain=%d\n", millis() / 1000.f, in ? "THREAD" : "miss", ox, oy, s_hoopN);
+#endif
+      s_hoopAlive = false; s_hoopNext = millis() + 900;
+      if (s_hoopN >= 3) { s_portal = true; s_ptz = 4.2f; s_ptx = s_pcx + ((int)(esp_random() % 120) - 60) / 100.f; s_pty = s_pcy + ((int)(esp_random() % 80) - 40) / 100.f; }
+    } else {
+      float px = 160.f + ox / s_hz * 60.f, py = 120.f + oy / s_hz * 60.f, r = 20.f / s_hz;
+      lensShift(px, py);
+      float pulse = 1.f + aud::bass * 0.15f;
+      uint16_t main = (s_hoopN == 2) ? rgb565(255, 230, 120) : wire::LIME;
+      for (int k = 0; k < 3; k++) canvas.drawEllipse((int)px, (int)py, (int)(r * pulse) + k, (int)(r * pulse * 0.9f) + k, k == 0 ? wire::PLUM : (k == 1 ? main : wire::TEAL));
+      for (int k = 0; k < 10; k++) {                                   // beads spin faster with the music
+        float a = k * 0.6283f + g_t * (1.5f + g_level * 4.f);
+        canvas.fillCircle((int)(px + cosf(a) * r * pulse), (int)(py + sinf(a) * r * pulse * 0.9f), r > 30 ? 2 : 1, main);
+      }
+    }
+  }
+
+  // ---- the portal: its inside is the next dimension; fly into it ----
+  if (s_portal) {
+    s_ptz -= dt * (0.30f + speed * 0.18f);
+    float ox = s_ptx - s_pcx, oy = s_pty - s_pcy;
+    if (s_ptz < 2.0f && ox * ox + oy * oy < 0.6f * 0.6f) { s_pcx += ox * dt * 1.2f; s_pcy += oy * dt * 1.2f; }   // aim assist once it's close
+    float px = 80.f + ox / s_ptz * 30.f, py = 60.f + oy / s_ptz * 30.f;          // lores
+    float r = 13.f / s_ptz * (1.f + aud::bass * 0.12f);
+    bool aligned = ox * ox + oy * oy < 0.45f * 0.45f;
+    {  // a massive disruption in space-time: you feel it before you reach it
+      float u = clampf((4.2f - s_ptz) / 4.085f, 0.f, 1.f);
+      float amt = (0.14f + 0.86f * powf(u, 2.4f)) * (0.9f + aud::bass * 0.25f);
+      hapRumble(amt, 4.f + u * u * 20.f, 0.15f + u * 0.7f);
+    }
+    float t = g_t;
+    uint8_t fly = (uint8_t)(t * 120.f), spin = (uint8_t)(t * 60.f);
+    int lift = 40 + (int)(aud::mid * 40.f);
+    auto inside = [&](int x, int y) -> int {                           // the next world, seen down its own tunnel
+      float dx = x - px, dy = y - py;
+      uint16_t tt = fx::tunAt((int)(dx * 40.f / fmaxf(r, 1.f)), (int)(dy * 40.f / fmaxf(r, 1.f)));
+      int dd = tt & 255, aa = tt >> 8;
+      int n = nebulaAt(s_nextP, x, y, t, 0, 0);
+      n = (n > 0 ? (n * lift) >> 8 : 0) + ((fx::sn[(uint8_t)(dd * 5 - fly)] + fx::sn[(uint8_t)(aa * 3 + spin)]) >> 2) + 60;
+      return n < 0 ? 0 : (n > 255 ? 255 : n);
+    };
+    if (s_ptz < 0.115f) {                                              // the portal now covers the whole view
+      if (aligned) {                                                   // we're through: this IS the new world now
+        for (int y = 0; y < fx::LH; y++) for (int x = 0; x < fx::LW; x++) fx::buf[y * fx::LW + x] = (uint8_t)inside(x, y);
+        memcpy(s_dimP, s_nextP, sizeof(s_dimP)); rollDim(s_nextP); s_dim++;
+        s_emerge = 0.f; s_hoopN = 0; s_portal = false; s_hoopNext = millis() + 2500;
+        hapCut(350);                                                     // ...and then: silence. we're through.
+        stats::event(stats::EV_PORTAL);
+#if defined(PORTAL_AUTOPILOT) || defined(PORTAL_TILTPILOT)
+        printf("t=%.1f THROUGH PORTAL -> dim %d\n", millis() / 1000.f, s_dim);
+#endif
+      } else { s_ptz = 4.2f; s_ptx = s_pcx + ((int)(esp_random() % 120) - 60) / 100.f; s_pty = s_pcy; hapGesture(HG_MISS); }
+    } else {
+      dimPalette(s_nextP, g_t, 1, alienOf(s_dim + 1));
+      uint16_t *fb = (uint16_t *)canvas.getBuffer();
+      int x0 = (int)fmaxf(0.f, px - r), x1 = (int)fminf(159.f, px + r), y0 = (int)fmaxf(0.f, py - r), y1 = (int)fminf(119.f, py + r);
+      float r2 = r * r;
+      for (int y = y0; y <= y1 && fb; y++)
+        for (int x = x0; x <= x1; x++) {
+          float dx = x - px, dy = y - py;
+          if (dx * dx + dy * dy > r2) continue;
+          uint16_t v = s_palN[inside(x, y)];
+          fb[(y * 2) * W + x * 2] = v; fb[(y * 2) * W + x * 2 + 1] = v;
+          fb[(y * 2 + 1) * W + x * 2] = v; fb[(y * 2 + 1) * W + x * 2 + 1] = v;
+        }
+      int R = (int)(r * 2.f), X = (int)(px * 2.f), Y = (int)(py * 2.f);       // crisp rim, full res
+      for (int k = 0; k < 5; k++) canvas.drawCircle(X, Y, R + k, wire::PLUM);                                  // deep plum rim
+      for (int k = 0; k < 3; k++) canvas.drawCircle(X, Y, R + 6 + k * 3, mix565c(rgb565(140, 200, 255), rgb565(0, 0, 0), k * 0.35f));   // light-blue glow
+      int arcs = 24;
+      for (int k = 0; k < arcs; k++) {                                                                        // teal plasma fringe
+        float a0 = k * 6.2831853f / arcs + g_t * 1.7f, a1 = a0 + 0.2f;
+        float j0 = 1.f + 0.05f * sinf(g_t * 13.f + k * 2.1f) * (1.f + g_level * 2.f), j1 = 1.f + 0.05f * sinf(g_t * 11.f + k * 1.3f);
+        canvas.drawLine(X + (int)(cosf(a0) * R * j0), Y + (int)(sinf(a0) * R * j0), X + (int)(cosf(a1) * R * j1), Y + (int)(sinf(a1) * R * j1), wire::TEAL);
+      }
+      for (int k = 0; k < 10 + (int)(g_level * 12); k++) {                                                   // lime sparks spitting off the rim
+        float a = (esp_random() % 628) / 100.f, rr = R * (1.02f + (esp_random() % 20) / 100.f);
+        int sx = X + (int)(cosf(a) * rr), sy = Y + (int)(sinf(a) * rr);
+        canvas.drawLine(sx, sy, sx + (int)(cosf(a) * 5), sy + (int)(sinf(a) * 5), wire::LIME);
+      }
+    }
+  }
+
+  // ---- HUD: aim point, hoop chain, dimension ----
+  {
+    int rx = 160 + (int)(s_svx * 22.f), ry = 120 + (int)(s_svy * 22.f);   // the ship leans where you steer
+    canvas.drawLine(160, 120, rx, ry, wire::TEAL);
+    canvas.drawCircle(rx, ry, 6, rgb565(255, 255, 220));
+    canvas.drawCircle(160, 120, 2, wire::PLUM);
+  }
+  float tx = 0, ty = 0; bool target = false;
+  if (s_portal) { tx = s_ptx - s_pcx; ty = s_pty - s_pcy; target = true; }
+  else if (s_hoopAlive) { tx = s_hx - s_pcx; ty = s_hy - s_pcy; target = true; }
+  if (target) { float d = sqrtf(tx * tx + ty * ty); if (d > 0.2f) canvas.fillCircle(160 + (int)(tx / d * 18.f), 120 + (int)(ty / d * 18.f), 2, wire::LIME); }
+  for (int k = 0; k < 3; k++) {
+    int cx = W / 2 - 16 + k * 16;
+    if (k < s_hoopN || s_portal) canvas.fillCircle(cx, 22, 4, wire::LIME); else canvas.drawCircle(cx, 22, 4, wire::TEAL);
+  }
+  canvas.setTextSize(1); canvas.setTextColor(wire::TEAL); canvas.setCursor(W - 50, 18); canvas.printf("dim %d", s_dim);
+}
+
+static void modeTunnel() {
+  switch (g_tunnelMode) {
+    case TM_DIVE: tunnelRender(true); break;
+    case TM_RECEDE: tunnelRender(false); break;
+    case TM_FRACTAL: fractalRender(); break;
+    default: portalRender(); break;
+  }
 }
 
 // ============================================================
-//  the visitors: an encounter below the roads
+//  PULSE — audio feedback visualizers, increasingly cross-mapped
 // ============================================================
-static const char *alienName(int c) { static const char *n[] = {"THE CHOIR", "THE LATTICE", "THE MOTH"}; return n[c % 3]; }
+struct Mote { float x, y, life; };
+static Mote s_mote[64];
+static float s_shock = -1;
+static float s_palSeed[9] = {0.f, 0.33f, 0.67f, 1.f, 1.f, 1.f, 0.5f, 0.5f, 0.5f};
 
-static void alienBegin() {
-  alien = AlienEncounter{};
-  alien.active = true;
-  alien.cls = (uint8_t)(rnd() % 3);
-  alien.outcome = (uint8_t)(rnd() % 6);
-  alien.p = shipPos + shipB.f * 95.f + shipB.r * rf(-20, 20) + shipB.u * rf(-10, 10);
-  theater = TH_NONE; target = -1; dockTarget = -1;
-  setBanner("SOMETHING IS PACING YOU", 2600);
-}
-
-static void alienApply() {
-  sm::Pilot &p = sm::sheet();
-  const char *toast = "", *note = "";
-  uint8_t out = alien.outcome;
-  auto bump = [&](sm::CapId c) -> bool { uint8_t t = sm::capTier(c); if (t >= 10) return false; sm::earnCap(c, (uint8_t)(t + 1)); return true; };
-  if (out == 1 && !bump(sm::CAP_SHIELDS)) out = 5;
-  if (out == 2 && !bump(sm::CAP_STABILIZER)) out = 5;
-  if (out == 4 && !bump(sm::CAP_SCANNERS)) out = 5;
-  switch (out) {
-    case 0: sm::setFuel(p.fuelCap); toast = "SYSTEMS UP. FUEL READS FULL. YOU DID NOT FILL IT."; note = "fuel full when the lights came back."; break;
-    case 1: toast = "SHIELDS REPORT A NEW MARK. NOBODY INSTALLED IT."; note = "the shields are stronger. no idea how."; break;
-    case 2: toast = "THE STABILIZER HUMS A NOTE IT NEVER KNEW."; note = "the stabilizer sings now."; break;
-    case 3: sm::repairHull(p.hullMax); toast = "HULL INTEGRITY 100%. THE SCARS ARE GONE. ALL OF THEM."; note = "every scar on the hull is gone."; break;
-    case 4: toast = "SCANNERS SEE FURTHER NOW. SOMETHING LOOKED THROUGH THEM FIRST."; note = "it looked through my scanners."; break;
-    default: toast = "NOTHING IS MISSING. YOU CHECK TWICE. NOTHING IS MISSING."; note = "nothing taken. I checked twice."; break;
-  }
-  setBanner(toast, 5200);
-  char jb[72]; snprintf(jb, sizeof(jb), "%s held me in the dark. %s", alienName(alien.cls), note);
-  sm::journalAdd(jb);
-  sm::flagSet("visited", (int8_t)(sm::flagGet("visited") < 120 ? sm::flagGet("visited") + 1 : 120), true);
-  saveAll();
-}
-
-static void alienTick() {
-  if (alienCooldown > 0.f) alienCooldown -= dt;
-  if (!alien.active && alienPending > 0.f && layer >= 3 && !stationOpen) {
-    alienPending -= dt;
-    if (alienPending <= 0.f) { alienPending = -1.f; if (countKind(K_LANDMARK) == 0) alienBegin(); }
-  }
-  if (!alien.active) return;
-  float t0 = alien.t;
-  alien.t += dt;
-  float t = alien.t;
-  auto crossed = [&](float at) { return t0 < at && t >= at; };
-  // it comes in fast and stops too close
-  V3 hold = shipPos + shipB.f * 26.f + shipB.u * 3.f;
-  // it holds station on the ship the whole time: you cannot drift away from it
-  if (t < 22.f) alien.p = lerp3(alien.p, hold, clampf(dt * (t < 4.f ? 1.6f : 4.f), 0, 1));
-  if (crossed(4.f)) { hx::cut(0.6f); setBanner("POWER LOSS", 1800); }
-  if (crossed(6.5f)) {
-    static const char *scan[] = {"IT IS SINGING AT THE HULL", "IT IS MEASURING EVERYTHING", "IT IS TOUCHING THE SHIP ALL OVER"};
-    setBanner(scan[alien.cls], 3200);
-  }
-  if (crossed(15.f)) setBanner(alien.cls == 1 ? "THE GRID GOES THROUGH YOU" : alien.cls == 0 ? "THE NOTE IS INSIDE THE COCKPIT" : "THEY ARE ON THE GLASS", 3000);
-  // the alien rhythm: two pulse trains against each other (3 over 2), each visitor its own way
-  bool scanning = t >= 4.6f && t < 22.f;
-  float amp = t < 4.f ? 0.25f + 0.1f * t : (scanning ? 0.6f : 0.f);
-  if (amp > 0.f) {
-    alien.beatA -= dt; alien.beatB -= dt; alien.beatC -= dt;
-    float pa = alien.cls == 2 ? 0.27f : 0.6f, pb = pa * 2.f / 3.f;
-    if (alien.beatA <= 0) { hx::pop(amp, alien.cls == 1 ? 0.02f : 0.06f); alien.beatA += pa; }
-    if (alien.beatB <= 0) { hx::pop(amp * 0.6f, 0.03f); alien.beatB += pb; }
-    if (alien.cls == 0 && scanning) hx::hum(hx::HUM_DEEP, 0.32f, 1.66f, 0.05f);
-    if (alien.cls == 1 && scanning && alien.beatC <= 0) { hx::stutter(0.55f, 3, 0.05f); alien.beatC = 1.2f; }
-    if (alien.cls == 2 && scanning && alien.beatC <= 0) { hx::pop(0.2f, 0.01f); alien.beatC = rf(0.04f, 0.16f); }
-  }
-  // leaving: everything is pulled inward, then gone
-  if (crossed(22.f)) { hx::swell(1.f, 0.85f, 0.04f); setBanner("", 1); }
-  if (crossed(22.9f)) { hx::cut(0.5f); crossFlash = 1.f; }
-  if (crossed(27.6f)) setBanner("SYSTEMS REBOOTING...", 1400);
-  if (crossed(29.f) && !alien.applied) { alien.applied = true; alienApply(); }
-  if (t >= 30.f) { alien.active = false; alienCooldown = 480.f; }
-}
-
-// the scan itself, drawn over the world
-static void drawAlienScan(float ax, float ay) {
-  float t = alien.t;
-  if (t < 4.6f || t >= 22.f) return;
-  float k = t - 4.6f;
-  if (alien.cls == 0) {   // the choir: rings that pass through you
-    for (int i = 0; i < 4; i++) {
-      float r = fmodf(k * 95.f + i * 80.f, 340.f);
-      cv.drawCircle((int)ax, (int)ay, (int)r, hsv(170 + i * 30 + k * 40, 0.4f, 0.9f - r / 500.f));
+static void gridWarp(float cx, float cy, float zoom, float rot, float wobA, float wobF, float wobT) {
+  float c = cosf(rot), s = sinf(rot);
+  for (int j = 0; j < fx::GH; j++)
+    for (int i = 0; i < fx::GW; i++) {
+      float dx = i * 8.f - cx, dy = j * 8.f - cy;
+      float sx = cx + (c * dx + s * dy) / zoom, sy = cy + (-s * dx + c * dy) / zoom;
+      if (wobA != 0.f) { sx += sinf(j * wobF + wobT) * wobA; sy += cosf(i * wobF * 1.3f - wobT) * wobA; }
+      fx::gx[j][i] = sx; fx::gy[j][i] = sy;
     }
-  } else if (alien.cls == 1) {   // the lattice: a grid that sweeps the cockpit
-    int sy = (int)fmodf(k * 70.f, 240.f), sx = (int)fmodf(k * 110.f, 320.f);
-    cv.drawLine(0, sy, 319, sy, rgb(255, 80, 230)); cv.drawLine(0, sy + 1, 319, sy + 1, rgb(120, 20, 110));
-    cv.drawLine(sx, 0, sx, 239, rgb(255, 80, 230));
-    if (fmodf(k, 1.2f) < 0.12f) for (int g = 0; g < 320; g += 32) { cv.drawLine(g, 0, g, 239, rgb(70, 10, 70)); if (g < 240) cv.drawLine(0, g, 319, g, rgb(70, 10, 70)); }
-  } else {   // the moth: dust that crawls toward the glass
-    for (int i = 0; i < 40; i++) {
-      float u = fmodf(k * 0.35f + i * 0.0251f, 1.f);
-      float a = i * 2.39996f + fsin(k * 3.f + i) * 0.4f;
-      int x = (int)(ax + cosf(a) * u * 260.f), y = (int)(ay + sinf(a) * u * 200.f);
-      cv.fillRect(x, y, 1 + (int)(u * 3), 1 + (int)(u * 3), hsv(280 + i * 3, 0.5f, 0.4f + u * 0.6f));
-    }
-  }
 }
 
-// the visitor: drawn through its own lens, three times over, never quite in focus
-static void drawAlienShape() {
-  float t = alien.t;
-  if (t >= 22.9f) return;
-  float collapse = t > 22.f ? 1.f - (t - 22.f) / 0.9f : 1.f;
-  float sc = 9.f * collapse;
-  for (int ghost = 0; ghost < 3; ghost++) {
-    float jx = fsin(t * 17.f + ghost * 2.1f) * 2.5f, jy = fcos(t * 13.f + ghost * 1.3f) * 2.5f;
-    uint16_t col = alien.cls == 0 ? hsv(180 + ghost * 40 + t * 30, 0.35f, 1.f - ghost * 0.25f)
-                 : alien.cls == 1 ? hsv(300 + ghost * 25, 0.7f, 1.f - ghost * 0.25f)
-                                  : hsv(265 + ghost * 30, 0.5f, 0.85f - ghost * 0.2f);
-    if (alien.cls == 0) {   // three rings in three planes
-      for (int r = 0; r < 3; r++) {
-        float px = 0, py = 0; bool pv = false;
-        for (int s = 0; s <= 24; s++) {
-          float a = s * 0.2618f + t * (0.6f + r * 0.3f);
-          V3 axis1 = r == 0 ? shipB.r : (r == 1 ? shipB.u : norm(shipB.r + shipB.f));
-          V3 axis2 = r == 2 ? shipB.u : shipB.f;
-          V3 w = alien.p + (axis1 * cosf(a) + axis2 * sinf(a)) * (sc * (1.f + 0.15f * r));
-          float x, y, z;
-          bool ok = project(w, x, y, z);
-          if (ok && pv) cv.drawLine((int)(px + jx), (int)(py + jy), (int)(x + jx), (int)(y + jy), col);
-          px = x; py = y; pv = ok;
+// ---- the crystal glass panel: a rosette of facets (mandala-symmetric Voronoi) ----
+static uint8_t *s_fid = nullptr;
+static const int NFAC = 37;
+static float s_fnx[NFAC], s_fny[NFAC];
+static int8_t s_fdx[NFAC], s_fdy[NFAC];
+static int16_t s_fsh[NFAC];
+static void crystallize() {
+  if (!s_fid) s_fid = (uint8_t *)malloc(fx::LW * fx::LH);
+  float sx[NFAC], sy[NFAC];
+  float rot = (esp_random() % 628) / 100.f;
+  int n = 0;
+  sx[n] = 80; sy[n] = 60; n++;
+  const int ringN[3] = {6, 12, 18}; const float ringR[3] = {20.f, 44.f, 74.f};
+  for (int r = 0; r < 3; r++)
+    for (int k = 0; k < ringN[r]; k++) {
+      float a = rot + (k + (r & 1) * 0.5f) * 6.2831853f / ringN[r];
+      float j = ((int)(esp_random() % 100) - 50) * 0.04f;
+      sx[n] = 80 + cosf(a) * (ringR[r] + j) * 1.25f; sy[n] = 60 + sinf(a) * (ringR[r] + j); n++;
+    }
+  for (int i = 0; i < NFAC; i++) { float a = (esp_random() % 628) / 100.f; s_fnx[i] = cosf(a); s_fny[i] = sinf(a); }
+  for (int y = 0; y < fx::LH; y++)
+    for (int x = 0; x < fx::LW; x++) {
+      int best = 0; float bd = 1e9f;
+      for (int i = 0; i < NFAC; i++) { float dx = x - sx[i], dy = (y - sy[i]) * 1.25f, d = dx * dx + dy * dy; if (d < bd) { bd = d; best = i; } }
+      s_fid[y * fx::LW + x] = (uint8_t)best;
+    }
+}
+
+static void modePulse() {
+  float dt = g_dt;
+  const int16_t *sc = aud::scope;
+  int cx = 80 - (int)(g_lookX * 20.f), cy = 60 + (int)(g_lookY * 15.f);
+  if (g_shakeKick) for (int i = 0; i < 9; i++) s_palSeed[i] = (esp_random() % 1000) / 1000.f * (i < 3 ? 1.f : 1.5f) + (i >= 3 && i < 6 ? 0.5f : 0.f);
+  if (aud::onset > 0.45f) { s_shock = 4.f; if (!aud::speakerLive()) hap(40, 12); }
+  if (s_shock >= 0) s_shock += dt * 140.f;
+  if (s_shock > 110) s_shock = -1;
+  fx::swap();
+  float t = g_t;
+  switch (g_pulsePat) {
+    case 0: {  // BLOOM: scope ring blossoms outward
+      gridWarp(cx, cy, 1.02f + aud::bass * 0.035f, 0.012f + aud::mid * 0.04f, 0, 0, 0);
+      fx::warp(5, true);
+      int px = 0, py = 0;
+      for (int i = 0; i <= 128; i++) {
+        int k = i & 127;
+        float a = k / 128.f * 6.2831853f + t * 0.4f;
+        float v = sc[(k < 64 ? k : 127 - k) * 2] / 9000.f;
+        float r = 18.f + g_level * 18.f + v * 26.f;
+        int x = cx + (int)(cosf(a) * r), y = cy + (int)(sinf(a) * r * 0.9f);
+        if (i) fx::line(px, py, x, y, 255);
+        px = x; py = y;
+      }
+      fx::palCosine(0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 1.f, 1.f, 1.f, 0.f + aud::centroid, 0.33f, 0.67f, t * 0.05f);
+      break;
+    }
+    case 1: {  // KALEIDO: mirrored waveform wedges, implosion swirl steered by tilt
+      gridWarp(cx, cy, 0.975f + aud::bass * 0.08f, (g_lookX >= 0 ? 1.f : -1.f) * (0.03f + aud::mid * 0.06f), 0, 0, 0);
+      fx::warp(4, true);
+      for (int w = 0; w < 8; w++) {
+        float base = w * 0.785398f + t * 0.3f;
+        float mir = (w & 1) ? -1.f : 1.f;
+        int px = cx, py = cy;
+        for (int i = 0; i < 48; i++) {
+          float rr = 4.f + i * 1.3f;
+          float off = sc[i * 5] / 12000.f * mir;
+          float a = base + off;
+          int x = cx + (int)(cosf(a) * rr), y = cy + (int)(sinf(a) * rr);
+          fx::line(px, py, x, y, (uint8_t)(140 + i * 2));
+          px = x; py = y;
         }
       }
-    } else if (alien.cls == 1) {   // a lattice that turns the wrong way
-      float sx[27], sy[27]; bool ok[27];
-      for (int i = 0; i < 27; i++) {
-        V3 m{(float)(i % 3 - 1), (float)((i / 3) % 3 - 1), (float)(i / 9 - 1)};
-        float a = t * 0.7f, b = -t * 0.45f;
-        V3 r1{m.x * cosf(a) - m.z * sinf(a), m.y, m.x * sinf(a) + m.z * cosf(a)};
-        V3 r2{r1.x, r1.y * cosf(b) - r1.z * sinf(b), r1.y * sinf(b) + r1.z * cosf(b)};
-        float z; ok[i] = project(alien.p + shipB.toWorld(r2 * sc * 0.8f), sx[i], sy[i], z);
+      fx::palCosine(0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 1.f, 1.f, 0.5f, 0.8f + g_lookX * 0.2f, 0.9f, 0.3f + g_lookY * 0.2f, t * 0.07f);
+      break;
+    }
+    case 2: {  // SPECTRUM STAR: 64 band spokes rocketing through a hyperspace zoom
+      gridWarp(cx, cy, 1.05f + aud::bass * 0.05f, g_lookX * 0.06f + 0.01f, 0, 0, 0);
+      fx::warp(7, true);
+      for (int b = 0; b < 64; b++) {
+        int band = b < 32 ? b : 63 - b;
+        float a = b / 64.f * 6.2831853f + t * 0.25f;
+        float v = aud::bands[band];
+        float r0 = 8.f + aud::bass * 8.f, r1 = r0 + v * 55.f;
+        fx::line(cx + (int)(cosf(a) * r0), cy + (int)(sinf(a) * r0), cx + (int)(cosf(a) * r1), cy + (int)(sinf(a) * r1),
+                 (uint8_t)(120 + v * 110.f));
       }
-      for (int i = 0; i < 27; i++) {
-        int x = i % 3, y = (i / 3) % 3, zz = i / 9;
-        int nbr[3] = {x < 2 ? i + 1 : -1, y < 2 ? i + 3 : -1, zz < 2 ? i + 9 : -1};
-        for (int nidx : nbr) if (nidx >= 0 && ok[i] && ok[nidx]) cv.drawLine((int)(sx[i] + jx), (int)(sy[i] + jy), (int)(sx[nidx] + jx), (int)(sy[nidx] + jy), col);
+      if (s_shock >= 0) fx::ring(cx, cy, (int)s_shock, 255);
+      fx::disc(cx, cy, 3 + (int)(aud::bass * 8.f), 255);
+      fx::palCosine(0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 1.f, 0.7f, 0.4f, 0.f, 0.15f + aud::bass * 0.2f, 0.2f, t * 0.03f);
+      break;
+    }
+    case 3: {  // PHASE SPACE: lissajous of the sound against itself, liquid warp
+      gridWarp(80, 60, 1.0f + aud::bass * 0.03f, 0.004f, 1.5f + aud::mid * 5.f, 0.25f + aud::treble * 0.6f, t * 3.f);
+      fx::warp(3, true);
+      int lag = 3 + (int)(aud::centroid * 40.f);
+      float rot = t * 0.4f + g_lookX;
+      float cr = cosf(rot), sr = sinf(rot);
+      int px = 0, py = 0;
+      for (int i = 0; i < 200; i++) {
+        float xa = sc[i] / 11000.f * 44.f, ya = sc[(i + lag) & 255] / 11000.f * 44.f;
+        for (int m = 0; m < 4; m++) {
+          float mx = (m & 1) ? -xa : xa, my = (m & 2) ? -ya : ya;
+          int x = cx + (int)(cr * mx - sr * my), y = cy + (int)(sr * mx + cr * my);
+          if (m == 0 && i) fx::line(px, py, x, y, 230);
+          else fx::plot(x, y, 200);
+          if (m == 0) { px = x; py = y; }
+        }
       }
-    } else {   // the moth: two lobes of dust, beating
-      float flap = 0.5f + 0.5f * fsin(t * 7.f);
-      for (int i = 0; i < 48; i++) {
-        float a = i * 0.1309f, side = (i & 1) ? 1.f : -1.f;
-        float rr = sc * (0.6f + 0.6f * fabsf(fsin(a * 2.f)));
-        V3 w = alien.p + shipB.r * (side * rr * cosf(a) * (0.4f + flap)) + shipB.u * (rr * sinf(a) * 0.7f) + shipB.f * (side * flap * 2.f);
-        float x, y, z;
-        if (project(w, x, y, z)) cv.fillRect((int)(x + jx), (int)(y + jy), 2, 2, col);
+      float tl = atan2f(g_lookY, g_lookX + 0.001f) / 6.2831853f;
+      fx::palCosine(0.6f, 0.5f, 0.5f, 0.4f, 0.5f, 0.5f, 1.f, 1.f, 1.f, tl, tl + 0.2f, tl + 0.5f, t * 0.02f);
+      break;
+    }
+    default: {  // SYNESTHESIA: spectrum sculpts the flow field; motes paint it; everything cross-maps
+      float big = aud::bass, fine = aud::treble, loud = g_level;
+      float cxs = cx, cys = cy;
+      auto td = M5.Touch.getDetail();
+      if (td.isPressed() && td.y > 14 && td.y < H - 14) { cxs = td.x / 2.f; cys = td.y / 2.f; }
+      for (int j = 0; j < fx::GH; j++)
+        for (int i = 0; i < fx::GW; i++) {
+          float x = i * 8.f, y = j * 8.f, dx = x - cxs, dy = y - cys;
+          float r = sqrtf(dx * dx + dy * dy) + 1.f;
+          float sw = (0.4f + big * 2.5f) / (1.f + r * 0.03f);              // inverse: near centre spins hardest
+          float rip = sinf(r * (0.08f + fine * 0.5f) - t * 4.f) * (1.f + loud * 4.f);
+          fx::gx[j][i] = x + (-dy / r) * sw * 6.f + dx / r * rip * 0.8f + sinf(y * 0.05f + t) * 0.6f;
+          fx::gy[j][i] = y + (dx / r) * sw * 6.f + dy / r * rip * 0.8f + cosf(x * 0.05f - t) * 0.6f;
+        }
+      fx::warp(loud > 0.5f ? 7 : 3, true);
+      if (aud::onset > 0.3f)
+        for (int k = 0; k < 10; k++) {
+          for (auto &m : s_mote) if (m.life <= 0) { float a = (esp_random() % 628) / 100.f; m = {cxs + cosf(a) * 6.f, cys + sinf(a) * 6.f, 1.f}; break; }
+        }
+      for (auto &m : s_mote) {
+        if (m.life <= 0) continue;
+        int gi = (int)(m.x / 8.f), gj = (int)(m.y / 8.f);
+        if (gi < 0 || gj < 0 || gi >= fx::GW || gj >= fx::GH) { m.life = 0; continue; }
+        m.x += (m.x - fx::gx[gj][gi]) * 1.6f; m.y += (m.y - fx::gy[gj][gi]) * 1.6f;
+        m.life -= dt * 0.4f;
+        fx::disc((int)m.x, (int)m.y, 1, (uint8_t)(120 + m.life * 135.f));
       }
+      if (td.isPressed() && td.y > 14 && td.y < H - 14) fx::disc(td.x / 2, td.y / 2, 3 + (int)(loud * 4), 255);
+      int px = 0, py = 0;                                  // scope ring gets twisted into spirals by the field
+      for (int i = 0; i <= 96; i++) {
+        float a = (i % 96) / 96.f * 6.2831853f;
+        float rr = 14.f + big * 10.f + sc[(i % 96) * 2] / 9000.f * 10.f;
+        int x = (int)cxs + (int)(cosf(a) * rr), y = (int)cys + (int)(sinf(a) * rr);
+        if (i) fx::line(px, py, x, y, (uint8_t)(150 + fine * 100.f));
+        px = x; py = y;
+      }
+      // quiet = deep saturated slow colour; loud = fast pastel strobe (inverse, nonlinear)
+      float spd = 0.02f + loud * loud * 0.6f;
+      static float ph = 0; ph += dt * spd * 10.f;
+      float amp = 0.5f - loud * 0.2f;
+      fx::palCosine(0.5f + loud * 0.2f, 0.5f + loud * 0.2f, 0.5f + loud * 0.2f, amp, amp, amp,
+                    s_palSeed[3], s_palSeed[4], s_palSeed[5], s_palSeed[0], s_palSeed[1], s_palSeed[2], ph);
+      break;
     }
   }
-  // its core: a hole that the eye refuses
-  float cx, cy, cz;
-  if (project(alien.p, cx, cy, cz)) cv.fillCircle((int)cx, (int)cy, (int)clampf(sc * 0.35f * FOCAL / cz, 1, 14), rgb(0, 0, 0));
-}
+  // mantis opal over the pattern's own colours; big hits let the original colours bloom through
+  static float bloom = 0;
+  bloom = fmaxf(aud::onset, bloom - dt * 1.5f);
+  float sheen = 0.5f + g_lookX * 0.4f + g_lookY * 0.3f + t * 0.015f;           // tilt it like labradorite
+  // the body game: jumping lands a shock bloom; moving then freezing into a pose gets a crystal flash
+  static float jumpB = 0, poseB = 0, motion = 0; static uint32_t jumpAt = 0;
+  float gyr = fabsf(g_gyroX) + fabsf(g_gyroY) + fabsf(g_gyroZ);
+  if (g_jolt > 0.5f && millis() - jumpAt > 250) { jumpAt = millis(); jumpB = 1.f; hap(120, 20); }
+  if (motion > 140.f && gyr < 25.f) { poseB = 1.f; motion = 0; hapGesture(HG_THREAD); }
+  motion += (gyr - motion) * clampf(dt * 8.f, 0.f, 1.f);
+  jumpB = fmaxf(0.f, jumpB - dt * 2.5f); poseB = fmaxf(0.f, poseB - dt * 1.2f);
+  fx::palOpal(0.5f - bloom * 0.3f, sheen, t * 0.05f, 0.45f + aud::onset * 0.5f + poseB * 0.8f);
+  fx::palFlash(aud::onset * 0.15f + jumpB * 0.3f);
 
-// dim the cockpit: power is out
-static void drawPowerLoss() {
-  for (int y = 0; y < H; y += 2) cv.drawLine(0, y, W - 1, y, rgb(0, 0, 0));
-  if (((int)(tNow * 3)) & 1) { cv.setTextColor(rgb(200, 40, 30)); cv.setCursor(6, 228); cv.print("NO POWER"); }
-}
-
-// after it leaves: dark, then the glitch of systems coming back
-static bool drawAlienAftermath() {
-  float t = alien.t;
-  if (!alien.active || t < 23.15f || t >= 27.6f) return false;
-  cv.fillSprite(rgb(0, 0, 0));
-  float k = 1.f - (t - 23.15f) / 4.45f;
-  int bars = (int)(14 * k * k) + (rnd() % 3);
-  for (int i = 0; i < bars; i++) {
-    int y = (int)(rnd() % H), h = 1 + (int)(rnd() % 6), x = (int)(rnd() % W), w = 10 + (int)(rnd() % 140);
-    static const uint16_t cols[] = {rgb(150, 225, 30), rgb(93, 0, 93), rgb(0, 115, 115), rgb(200, 200, 210)};
-    cv.fillRect(x, y, w, h, shade(cols[rnd() % 4], 0.3f + 0.7f * k));
+  // crystal glass panel (display only): facets refract with the bass and flash with the tilt
+  if (!s_fid || g_shakeKick) crystallize();
+  float refr = 1.5f + aud::bass * 4.f + g_level * 1.5f;
+  for (int i = 0; i < NFAC; i++) {
+    s_fdx[i] = (int8_t)(s_fnx[i] * refr); s_fdy[i] = (int8_t)(s_fny[i] * refr);
+    float f = s_fnx[i] * g_lookX + s_fny[i] * g_lookY;                         // facet faces the light?
+    s_fsh[i] = (int16_t)(f * 34.f + (f > 0.55f ? 40.f : 0.f) * (0.4f + g_level));
   }
-  if (k > 0.6f) cv.drawCircle((int)alienLX, (int)alienLY, (int)(30 * k), rgb((int)(120 * k), (int)(120 * k), (int)(140 * k)));
-  return true;
-}
-
-// ============================================================
-//  session: capture, resume, new game
-// ============================================================
-static void captureSession(Session &ss) {
-  memset(&ss, 0, sizeof(ss));
-  ss.magic = SESSION_MAGIC;
-  ss.layer = (uint8_t)layer;
-  ss.station = countKind(K_STATION) > 0 ? 1 : 0;
-  ss.docked = (stationOpen || dockAnim > 0) ? 1 : 0;
-  ss.trip = sm::trip();
-  asciiCopy(ss.here, sizeof(ss.here), hereName);
-  asciiCopy(ss.origin, sizeof(ss.origin), tripOrigin);
-  ss.throttle = throttleT;
-}
-
-// Pick up where the pilot left off: same place, same lanes, same leg of the dive.
-static bool resumeSession(const Session &ss) {
-  if (ss.magic != SESSION_MAGIC || !ss.here[0] || ss.layer > 4) return false;
-  asciiCopy(tripOrigin, sizeof(tripOrigin), ss.origin);
-  if (ss.layer == 0 || !ss.trip.active) {
-    makeRealScene(ss.here, ss.station != 0);
-    if (ss.trip.active && ss.trip.layer == 0) { sm::trip() = ss.trip; spawnNextOnPath(); }
-    if (ss.docked) for (int i = 0; i < MAX_OBJ; i++) if (objs[i].kind == K_STATION) { stationIdx = i; openBoard(); break; }
-  } else {
-    // mid-dive: back in the same layer, the chain waiting ahead
-    makeRealScene(ss.here, false);       // sky, place and lanes
-    sm::trip() = ss.trip;
-    layer = ss.layer;
-    makeLayerScene();
-    spawnNextOnPath();
+  fx::presentCrystal(canvas, s_fid, s_fdx, s_fdy, s_fsh, (uint8_t)(14 + g_level * 30.f + poseB * 90.f));
+  if (jumpB > 0.05f) for (int k = 0; k < 3; k++) {                               // shock bloom rings
+    int r = (int)((1.f - jumpB) * 170.f) + k * 12;
+    canvas.drawCircle(cx * 2, cy * 2, r, k == 1 ? wire::TEAL : wire::LIME);
   }
-  throttleT = clampf(ss.throttle, 0.f, 1.f);
-  return true;
-}
 
-static void startNewGame() {
-  sm::sdDeleteSave();
-  sm::sheetInit();
-  sm::universeReseed(millis() * 2654435761u ^ rnd() ^ (uint32_t)ESP.getEfuseMac());
-  sm::sheet().universeSeed = sm::universeSeed();
-  sm::contractsInit();
-  sm::tripEnd();
-  sm::atlasClear();
-  sm::journalClear();
-  livesSeen = sm::sheet().lives;
-  rngState = sm::universeSeed() ? sm::universeSeed() : 0xA341316Cu;
-  theater = TH_NONE; stationOpen = false; dockAnim = 0; launchAnim = 0; endingOpen = false; lostOpen = false;
-  mapOpen = false; statusOpen = false; tripOrigin[0] = 0;
-  makeRealScene(nullptr, true);
-  sm::journalAdd("New license issued. Every name ahead is unwritten.");
-  saveAll();
-  serviceSD(true);
-  setBanner("NEW PILOT. NEW SKY.", 3000);
-}
-
-static void drawEnding() {
-  cv.fillRect(18, 34, 284, 160, rgb(4, 4, 10));
-  cv.drawRoundRect(18, 34, 284, 160, 8, rgb(220, 190, 90));
-  cv.setTextSize(2); cv.setTextColor(rgb(240, 215, 120)); cv.setCursor(58, 48); cv.print("THE DEEP IS SMALL"); cv.setTextSize(1);
-  cv.setTextColor(rgb(230, 210, 150)); cv.setCursor(34, 76); cv.print(endingName);
-  cv.setTextColor(rgb(200, 205, 215));
-  static const char *lines[] = {"You have charted this place before.", "Not in this sky. In one you lost.",
-                                "Up there the stars change every life.", "Down here the roads keep their names."};
-  for (int i = 0; i < 4; i++) { cv.setCursor(34, 96 + i * 14); cv.print(lines[i]); }
-  cv.setTextColor(rgb(120, 130, 150)); cv.setCursor(34, 174); cv.printf("lives %lu   tap to keep flying", (unsigned long)sm::sheet().lives);
-}
-
-static void draw() {
-  if (dockAnim > 0) { drawDockSequence(); cv.pushSprite(0, 0); return; }
-  if (drawAlienAftermath()) { cv.pushSprite(0, 0); return; }
-  if (stationOpen) { cv.fillSprite(rgb(2, 4, 8)); drawStation(); cv.pushSprite(0, 0); return; }
-  if (layer == 0) {
-    alienLensOn = false;
-    cv.fillSprite(rgb(1, 2, 5));
-    drawNebulae();
-    drawStarsReal();
-    drawSun();
-    drawDustReal();
-  } else {
-    alienLensOn = false;
-    if (alien.active && alien.t < 22.9f) {
-      float ax, ay, az;
-      lensOn = false;
-      if (project(alien.p, ax, ay, az)) {
-        alienLensOn = true; alienLX = ax; alienLY = ay;
-        alienLR = (20.f + 10.f * fsin(tNow * (alien.cls == 2 ? 9.f : 2.3f))) * (alien.t > 22.f ? 1.f + (alien.t - 22.f) * 3.f : 1.f);
+  // ---- crisp layers: no echo, so they read as glass against the liquid ----
+  int CX = cx * 2, CY = cy * 2;
+  wire::engrave(CX, CY, 36.f + aud::bass * 10.f, t * 0.04f + g_lookX * 0.15f, 1 + (int)(g_level * 2.f + aud::onset * 4.f));
+  // the waveform: bent by the same flow as the liquid, torn by loud entropy, leaves a faint ghost in the feedback
+  {
+    int py = -1, px = 0;
+    float ent = g_level * 0.35f + aud::onset * 0.3f;
+    uint32_t r = (uint32_t)(t * 1000.f);
+    for (int x = 0; x < W; x += 2) {
+      int gi = x / 16, gj = CY / 16; if (gi > fx::GW - 1) gi = fx::GW - 1; if (gj > fx::GH - 1) gj = fx::GH - 1; if (gj < 0) gj = 0;
+      float dxw = (gi * 8.f - fx::gx[gj][gi]) * 6.f, dyw = (gj * 8.f - fx::gy[gj][gi]) * 6.f;
+      int k0 = (x >> 1) & 255;
+      float sv = (sc[k0] + sc[(k0 + 1) & 255] + sc[(k0 + 2) & 255] + sc[(k0 + 3) & 255]) * 0.25f;   // flowing, not spiky
+      int y = CY + (int)(sv / 9000.f * (26.f + g_level * 30.f) + dyw);
+      int xx = x + (int)dxw;
+      r = r * 1664525u + 1013904223u;
+      bool tear = ((r >> 24) & 255) < (uint32_t)(ent * 255.f);
+      if (py >= 0 && !tear) {
+        canvas.drawLine(px, py + 2, xx, y + 2, wire::PLUM);
+        canvas.drawLine(px, py, xx, y, wire::LIME);
+        fx::line(px / 2, py / 2, xx / 2, y / 2, 70);
       }
-    }
-    drawField(layer);
-    if (alienLensOn) { lensOn = true; lensX = alienLX; lensY = alienLY; lensR = alienLR; }
-    drawStarsDeep();
-    drawStreamers();
-  }
-  drawObjects();
-  drawBoomsAndBolts();
-  if (alienHolds()) drawPowerLoss();            // the cockpit goes dark...
-  if (alien.active && layer > 0) { drawAlienScan(alienLX, alienLY); drawAlienShape(); }   // ...it does not
-  if (!alienHolds()) { drawTargeting(); drawHud(); }
-  if (launchAnim > 0) {
-    float u = launchAnim / 0.9f;
-    for (int i = 0; i < 12; i++) {
-      float a = i * 0.5236f;
-      int r0 = (int)(40 + (1 - u) * 160), r1 = r0 + 30;
-      cv.drawLine(160 + (int)(cosf(a) * r0), 120 + (int)(sinf(a) * r0), 160 + (int)(cosf(a) * r1), 120 + (int)(sinf(a) * r1), rgb(90, 170, 255));
+      px = xx; py = y;
     }
   }
-  if (crossFlash > 0.f) {
-    // the crossing: a moment of pure white that falls away into the new layer
-    float k = clampf(crossFlash, 0, 1);
-    if (k > 0.55f) cv.fillSprite(mix565(hsv(layerHue(layer), 0.3f, 1.f), rgb(255, 255, 255), (k - 0.55f) / 0.45f));
-    else if (k > 0.2f) for (int i = 0; i < 6; i++) cv.drawCircle(160, 120, (int)((1 - k) * 260) + i * 9, hsv(layerHue(layer) + i * 20, 0.5f, 1.f));
-  }
-  if (statusOpen) { if (statusPage) drawJournal(); else drawStatus(); }
-  if (mapOpen) { if (mapPage) drawSystemMap(); else drawMap(); }
-  if (bootOpen) drawBoot();
-  if (lostOpen) drawLost();
-  if (endingOpen) drawEnding();
-  cv.pushSprite(0, 0);
+  // the sage's crystal: a tesseract turning in four dimensions
+  float ts = (g_pulsePat == 2 ? 12.f : 18.f) + aud::bass * 22.f + poseB * 26.f;
+  wire::tesseract(CX, CY, ts, t * 0.7f + aud::mid, t * 0.5f + aud::treble * 2.f, t * 0.3f, aud::onset * 0.6f, rgb565(40, 220, 200));
 }
 
 // ============================================================
-//  Arduino entry points
+//  chrome, modes, buttons
 // ============================================================
+static void drawChrome() {
+  static const char *names[] = {"swarm", "eye", "tunnel", "pulse", "calm", "mantis", "rooms", "garden", "meditate"};
+  canvas.fillRect(0, 0, W, 13, rgb565(3, 10, 12));
+  canvas.fillRect(0, H - 13, W, 13, rgb565(3, 10, 12));
+  canvas.drawFastHLine(0, 13, W, wire::PLUM); canvas.drawFastHLine(0, H - 14, W, wire::PLUM);
+  canvas.drawFastHLine(0, 13, (int)(W * clampf(g_level, 0.f, 1.f)), wire::LIME);            // live mic meter
+  canvas.setTextSize(1);
+  {  // battery: a small outline cell, fill = charge (lime > 30 %, amber > 15 %, red below), a spark when charging
+    static int lvl = -1; static uint32_t at = 0; static bool chg = false;
+    if (lvl < 0 || millis() - at > 5000) { at = millis(); lvl = M5.Power.getBatteryLevel(); chg = M5.Power.isCharging(); }
+    int L = lvl < 0 ? 0 : (lvl > 100 ? 100 : lvl);
+    canvas.drawRect(8, 3, 22, 8, rgb565(90, 110, 110)); canvas.fillRect(30, 5, 2, 4, rgb565(90, 110, 110));
+    uint16_t bc = L > 30 ? wire::LIME : (L > 15 ? rgb565(255, 190, 40) : rgb565(255, 60, 60));
+    canvas.fillRect(10, 5, (18 * L) / 100, 4, bc);
+    if (chg) { canvas.drawLine(20, 4, 17, 7, rgb565(255, 255, 255)); canvas.drawLine(17, 7, 21, 7, rgb565(255, 255, 255)); canvas.drawLine(21, 7, 18, 10, rgb565(255, 255, 255)); }
+  }
+  canvas.setTextColor(rgb565(40, 190, 180)); canvas.setCursor(40, 3); canvas.print(g_mode == MODE_ROOMS ? roomsName() : (g_mode == MODE_GARDEN ? gardenName() : names[g_mode]));
+  int orb = 2 + (int)(g_level * 5.f + g_peak * 3.f);
+  if (orb > 6) orb = 6;
+  canvas.fillCircle(W - 12, 6, orb + 1, wire::PLUM);
+  canvas.fillCircle(W - 12, 6, orb, aud::onset > 0.3f ? wire::LIME : hsv565(g_hue + g_level * 60.f, 0.7f, 0.45f + g_level * 0.4f));
+
+  const char *bl = "";
+  switch (g_mode) {
+    case MODE_SWARM: { static const char *v[] = {"flock", "orbit", "chaos"}; bl = v[g_swarmVar]; break; }
+    case MODE_EYE: bl = g_eyeTrack ? "gaze" : "stare"; break;
+    case MODE_TUNNEL: { static const char *v[] = {"dive", "recede", "fractal", "portal"}; bl = v[g_tunnelMode]; break; }
+    case MODE_PULSE: { static const char *v[] = {"bloom", "kaleido", "star", "phase", "synesthesia"}; bl = v[g_pulsePat]; break; }
+    case MODE_MANTIS: bl = g_mantisMode == 2 ? (aud::caveState() == 0 ? "lean in" : "...") : (g_mantisSing ? "sing" : "dance"); break;
+    case MODE_GARDEN: bl = "switch"; break;
+    case MODE_MEDITATE: bl = "begin / end"; break;
+    case MODE_CALM: bl = calmName(); break;
+    case MODE_ROOMS: bl = "next"; break;
+    default: break;
+  }
+  canvas.setTextColor(hsv565(g_hue, 0.35f, 0.55f));
+  canvas.setCursor(10, H - 10); canvas.print("<");
+  canvas.setTextColor(g_mode == MODE_ROOMS && !roomsSolved() ? rgb565(55, 60, 70) : wire::LIME);   // greyed until solved
+  canvas.setCursor(W / 2 - (int)strlen(bl) * 3, H - 10); canvas.print(bl);
+  canvas.setTextColor(hsv565(g_hue, 0.35f, 0.55f));
+  canvas.setCursor(W - 16, H - 10); canvas.print(">");
+}
+
+static void nextMode(int dir) {
+  if (g_mode == MODE_MEDITATE) medLeave();
+  if (g_mode == MODE_MANTIS) aud::cave(false);
+  int m = ((int)g_mode + dir + MODE_COUNT) % MODE_COUNT;
+  g_mode = (Mode)m;
+  fx::clear(0);
+  hap(100, 25);
+  if (g_mode == MODE_TUNNEL) flightPoseSoon();
+  if (g_mode == MODE_ROOMS) roomsEnter();                 // always starts back at Mantis NRG
+  if (g_mode == MODE_MEDITATE) medEnter();
+  if (g_mode == MODE_MANTIS && g_mantisMode == 2) aud::cave(true);
+  stats::save();
+}
+
+static void btnBShort() {
+  switch (g_mode) {
+    case MODE_SWARM: g_swarmVar = (SwarmVar)((g_swarmVar + 1) % SV_COUNT); break;
+    case MODE_EYE: g_eyeTrack = !g_eyeTrack; break;
+    case MODE_TUNNEL: g_tunnelMode = (TunnelMode)((g_tunnelMode + 1) % TM_COUNT); fx::clear(0); flightPoseSoon(); break;
+    case MODE_PULSE: g_pulsePat = (g_pulsePat + 1) % PP_COUNT; break;
+    case MODE_MANTIS:
+      if (g_mantisMode == 2) { aud::caveRecord(); break; }           // in the cave, B = lean in and speak
+      g_mantisMode = (uint8_t)((g_mantisMode + 1) % 3);
+      g_mantisSing = g_mantisMode == 1;
+      aud::cave(g_mantisMode == 2);
+      if (g_mantisMode >= 1) aud::calibrateAmbient(3000.f);
+      break;
+    case MODE_GARDEN: gardenNext(); break;
+    case MODE_MEDITATE: medButton(); break;
+    case MODE_CALM: calmNext(); break;
+    case MODE_ROOMS: if (roomsSolved()) { roomsNext(); stats::event(stats::EV_ROOM); hapGesture(HG_THREAD); } else hap(35, 12); break;
+    default: break;
+  }
+  hap(90, 20);
+}
+// ============================================================
+//  boot
+// ============================================================
+static void splash() {
+  M5Canvas &c = *s_fb[0];
+  c.fillSprite(rgb565(6, 2, 14));
+  int ox = (W - MANTIS_W) / 2, oy = 18;
+  for (int y = 0; y < MANTIS_H; y++)
+    for (int x = 0; x < MANTIS_W; x++) {
+      uint16_t col = mantis_splash[y * MANTIS_W + x];
+      if (col) c.drawPixel(ox + x, oy + y, col);
+    }
+  c.setTextSize(2); c.setTextColor(hsv565(160, 0.85f, 0.95f));
+  c.setCursor((W - 7 * 12) / 2, oy + MANTIS_H + 8); c.print("SYNAPSE");
+  c.setTextSize(1); c.setTextColor(rgb565(120, 180, 160));
+  c.setCursor((W - 17 * 6) / 2, oy + MANTIS_H + 30); c.print("a small green bug");
+  c.pushSprite(&M5.Display, 0, 0);
+  M5.Speaker.begin();
+  M5.Speaker.setVolume(170);
+  static const int seq[][2] = {{523, 55}, {659, 55}, {784, 55}, {1047, 110}, {0, 35}, {784, 45}, {1047, 150}};
+  for (auto &s : seq) {
+    if (s[0]) M5.Speaker.tone((float)s[0], (uint32_t)s[1]);
+    delay(s[1] + 12);
+  }
+  M5.Speaker.stop();
+  M5.Speaker.end();
+}
+
+#ifdef HOST
+M5Canvas *hostLastFrame() { return s_fb[s_pushIdx]; }
+#endif
+
 void setup() {
   auto cfg = M5.config();
-  cfg.output_power = true;
-  cfg.internal_imu = true;
+  cfg.internal_imu = true; cfg.internal_mic = true; cfg.internal_spk = true;
   M5.begin(cfg);
   M5.Display.setRotation(1);
-  M5.Display.setBrightness(110);
-  cv.setColorDepth(16);
-  cv.setPsram(true);          // the 150 KB frame lives in PSRAM
-  cv.createSprite(W, H);
-  initSin();
-  initBlocks();
-  hx::begin();
-  M5.BtnB.setHoldThresh(600);
-  M5.BtnA.setHoldThresh(600);   // hold A for the map
-  M5.BtnC.setHoldThresh(600);   // hold C: status; hold C again: journal
+  if (M5.Imu.isEnabled()) { M5.Imu.loadOffsetFromNVS(); for (int i = 0; i < 15; i++) { M5.Imu.update(); delay(4); } }
+  loadCal();
 
-  sm::sheetInit();
-  sm::contractsInit();
-  sm::simInit();
-  bool restored = sm::sheetLoad();
-  if (restored) { sm::universeRestoreSeed(sm::sheet().universeSeed); sm::contractsLoad(); sm::atlasLoad(); sm::journalLoad(); }
-  else { sm::atlasClear(); sm::journalClear(); }
-  // SD card: pilot.sav wins. A managed folder with no pilot.sav means the pilot
-  // deleted it on purpose: new game. No folder marker yet: migrate flash to card.
-  Session bootSession{};
-  bool haveSession = false;
-  if (sm::sdBegin()) {
-    if (sm::sdHasSave() && sm::sdLoadGame(&bootSession, sizeof(bootSession))) {
-      restored = true; haveSession = true;
-      sm::universeRestoreSeed(sm::sheet().universeSeed);
-    } else if (sm::sdManaged() && !sm::sdHasSave()) {
-      sm::sheetInit();
-      sm::universeReseed(millis() * 2654435761u ^ (uint32_t)ESP.getEfuseMac());
-      sm::sheet().universeSeed = sm::universeSeed();
-      sm::contractsInit(); sm::atlasClear(); sm::journalClear();
-      restored = false;
-    }
+  for (int i = 0; i < 2; i++) { s_fb[i]->setColorDepth(16); s_fb[i]->setPsram(true); }
+  s_fb[0]->createSprite(W, H);
+  s_double = s_fb[1]->createSprite(W, H) != nullptr;
+  g_cv = s_fb[0];
+  splash();
+  fx::begin();
+  mantisBegin();
+  calmBegin();
+  roomsBegin();
+  stats::begin();
+  gardenBegin();
+  seedParticles();
+  aud::begin();
+  if (s_double) {
+    s_dispIdle = xSemaphoreCreateBinary();
+    xSemaphoreGive(s_dispIdle);
+    xTaskCreatePinnedToCore(displayTask, "lcd", 4096, nullptr, 2, &s_dispTask, 0);
   }
-  if (!haveSession && restored) {
-    Preferences prefs;
-    if (prefs.begin("sm_sess", true)) {
-      if (prefs.getBytesLength("s") == sizeof(bootSession)) { prefs.getBytes("s", &bootSession, sizeof(bootSession)); haveSession = true; }
-      prefs.end();
-    }
-  }
-  rngState = sm::universeSeed() ? sm::universeSeed() : 0xA341316Cu;
-  livesSeen = sm::sheet().lives;
-  initMeshes();
-  if (haveSession && resumeSession(bootSession)) {
-    char b[112]; snprintf(b, sizeof(b), "RESUMED: %s", layer == 0 ? hereName : layerName(layer));
-    setBanner(b, 3000);
-  } else {
-    makeRealScene(nullptr, true);
-    setBanner(restored ? "SHEET RESTORED - STILL LOST" : "LOST IN SPACE. FLY A NAMED GATE, OR DOCK AND ASK AROUND.", 3600);
-    if (!restored) sm::journalAdd("New license issued. Every name ahead is unwritten.");
-  }
-  saveAll();
-  serviceSD(true);   // first boot with a card: the flash save migrates onto it
-  crossFlash = 0.8f;
+  g_cv = s_fb[s_cur];
 }
 
 void loop() {
-  uint32_t now = millis();
-  static uint32_t prev = now;
-  dt = clampf((now - prev) / 1000.f, 0.008f, 0.05f);
-  prev = now;
-  tNow += dt;
-  updateInput();
-  updateWorld();
-  hx::update(dt);
-  draw();
+  static uint32_t last = micros();
+  uint32_t now = micros();
+  g_dt = clampf((now - last) / 1e6f, 0.004f, 0.06f);
+  last = now;
+
+  pollInput();
+  aud::service(g_dt);
+  sampleImu();
+  calService();
+  stats::tick(g_dt, g_mode == MODE_CALM || g_mode == MODE_GARDEN || g_mode == MODE_MEDITATE);
+  g_level = aud::level; g_peak = aud::peak;
+  for (int i = 0; i < MIC_N; i++) g_mic[i] = aud::scope[i * 2];
+
+  g_t += g_dt * (0.9f + g_level * 0.6f);
+  g_hue = fmodf(g_hue + g_dt * (3.6f + g_level * 2.4f), 360.f);
+
+  switch (g_mode) {
+    case MODE_SWARM: modeSwarm(); break;
+    case MODE_EYE: modeEye(); break;
+    case MODE_TUNNEL: modeTunnel(); break;
+    case MODE_PULSE: modePulse(); break;
+    case MODE_CALM: calmDraw(); break;
+    case MODE_MANTIS: if (g_mantisMode == 2) mantisDrawCave(); else mantisDraw(g_mantisSing); break;
+    case MODE_ROOMS: roomsDraw(); break;
+    case MODE_GARDEN: gardenDraw(); break;
+    case MODE_MEDITATE: medDraw(); break;
+    default: break;
+  }
+  g_shakeKick = false;
+  drawChrome();
+  drawCal();
+  if (g_mode == MODE_MANTIS && g_mantisMode == 1 && aud::calibrating()) {
+    canvas.setTextColor(wire::LIME); canvas.setCursor(W / 2 - 51, 20); canvas.print("listening to the room");
+  }
+  present();
 }

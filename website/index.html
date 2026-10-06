@@ -3,146 +3,143 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SpaceMantis — by BasaltSoftWorks</title>
-<meta name="description" content="A roguelike space-career game for M5Stack Core2. Lost in space. No map. Dive deeper.">
-<link rel="icon" href="assets/favicon.ico" sizes="any">
-<link rel="icon" type="image/png" href="assets/favicon.png" sizes="64x64">
-<link rel="icon" type="image/png" href="assets/favicon-32.png" sizes="32x32">
-<link rel="icon" type="image/png" href="assets/favicon-16.png" sizes="16x16">
-<link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+<title>SYNAPSE — Core2 fidget</title>
 <style>
-:root{
-  --bg:#03070a; --panel:#091217; --teal:#36e6c0; --blue:#4e9dff;
-  --lime:#9dff7a; --mag:#e050c8; --text:#e6f3f1; --dim:#79918e; --red:#ff6565;
-}
-*{box-sizing:border-box}
-body{
-  margin:0; color:var(--text); font:16px system-ui,sans-serif; line-height:1.55;
-  background:
-    radial-gradient(ellipse at 70% 10%, #1a0a22 0%, transparent 45%),
-    radial-gradient(ellipse at 20% 0%, #0b2630 0%, transparent 50%),
-    var(--bg);
-}
-header{
-  display:grid; grid-template-columns:1fr auto; gap:18px; align-items:center;
-  max-width:900px; margin:0 auto; padding:28px 18px 20px;
-  border-bottom:1px solid #16434a;
-}
-@media(max-width:640px){ header{ grid-template-columns:1fr; text-align:center } }
-.brand{ display:flex; gap:14px; align-items:center; flex-wrap:wrap }
-@media(max-width:640px){ .brand{ justify-content:center } }
-.brand img.favicon-hero{
-  width:56px; height:56px; image-rendering:pixelated; image-rendering:crisp-edges;
-  filter: drop-shadow(0 0 12px rgba(224,80,200,.35));
-}
-h1{ margin:0; color:var(--teal); letter-spacing:.14em; font-size:1.85rem }
-.tag{ color:var(--dim); margin:6px 0 0; font-size:.95rem }
-.by{ color:var(--mag); font-size:.85rem; margin-top:4px; letter-spacing:.04em }
-.astro{
-  width:120px; height:auto; image-rendering:pixelated; image-rendering:crisp-edges;
-  filter: drop-shadow(0 8px 24px rgba(54,230,192,.2));
-}
-@media(max-width:640px){ .astro{ width:100px; margin:0 auto } }
-
-main{ max-width:900px; margin:auto; padding:22px 15px 50px }
-.hero-row{
-  display:grid; grid-template-columns:140px 1fr; gap:22px; align-items:center;
-  background:linear-gradient(135deg, #0a1520 0%, #120818 100%);
-  border:1px solid #18323a; border-radius:14px; padding:22px 20px; margin-bottom:16px;
-}
-@media(max-width:640px){ .hero-row{ grid-template-columns:1fr; text-align:center } }
-.hero-row .astro-lg{
-  width:130px; height:auto; image-rendering:pixelated;
-  justify-self:center;
-}
-.hero-copy h2{ margin:0 0 8px; color:var(--teal); font-size:1.15rem }
-.hero-copy p{ margin:0; color:#c4d4d2 }
-
-section{
-  background:var(--panel); border:1px solid #18323a; border-radius:12px;
-  padding:18px; margin:0 0 14px;
-}
-h2{ color:var(--teal); font-size:1.1rem; margin:0 0 8px }
-p,li{ color:#c4d4d2 }
-.btn{
-  display:inline-block; border:1px solid var(--teal); border-radius:8px;
-  padding:12px 18px; color:var(--text); background:#0d3439;
-  text-decoration:none; font-weight:700; margin:5px 7px 5px 0;
-}
-.btn:hover{ border-color:var(--mag); background:#1a1230 }
-.grid{ display:grid; grid-template-columns:1fr 1fr; gap:10px }
-.card{ padding:11px; background:#0b1b21; border-left:3px solid var(--teal); border-radius:7px }
-.card b{ color:var(--lime) }
-@media(max-width:560px){ .grid{ grid-template-columns:1fr } }
-footer{
-  text-align:center; color:var(--dim); padding:18px 12px 28px;
-  border-top:1px solid #16434a; max-width:900px; margin:0 auto;
-}
-footer img{ width:28px; height:28px; vertical-align:middle; image-rendering:pixelated; margin-right:8px }
+  :root {
+    --bg: #05020c;
+    --panel: #0e0820;
+    --teal: #1ad4c0;
+    --purp: #c43cff;
+    --pink: #ff4fd8;
+    --text: #f0e8ff;
+    --dim: #8a7aad;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", system-ui, sans-serif;
+    background:
+      radial-gradient(ellipse at 20% 0%, #2a1050 0%, transparent 50%),
+      radial-gradient(ellipse at 80% 100%, #0a3040 0%, transparent 45%),
+      var(--bg);
+    color: var(--text);
+    line-height: 1.55;
+    min-height: 100vh;
+  }
+  header {
+    padding: 28px 20px 18px;
+    border-bottom: 2px solid var(--purp);
+    text-align: center;
+  }
+  h1 {
+    margin: 0;
+    font-size: 2.2rem;
+    letter-spacing: 0.2em;
+    background: linear-gradient(90deg, var(--teal), var(--purp), var(--pink));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .tag { color: var(--dim); margin-top: 8px; }
+  main { max-width: 720px; margin: 0 auto; padding: 24px 16px 48px; }
+  section {
+    background: var(--panel);
+    border: 1px solid #2a1848;
+    border-radius: 12px;
+    padding: 18px 20px;
+    margin-bottom: 16px;
+    box-shadow: 0 0 40px rgba(196, 60, 255, 0.08);
+  }
+  h2 { margin: 0 0 10px; color: var(--teal); font-size: 1.15rem; }
+  p, li { color: #d4c8ec; }
+  .btn {
+    display: inline-block;
+    background: linear-gradient(135deg, #1a4050, #4a1860);
+    color: var(--text);
+    border: 1px solid var(--teal);
+    padding: 12px 20px;
+    border-radius: 8px;
+    font-weight: 700;
+    cursor: pointer;
+    text-decoration: none;
+    margin: 6px 8px 6px 0;
+  }
+  .btn:hover { border-color: var(--pink); }
+  .modes { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  @media (max-width: 560px) { .modes { grid-template-columns: 1fr; } }
+  .mode {
+    background: #120828;
+    border-radius: 8px;
+    padding: 12px;
+    border-left: 3px solid var(--purp);
+  }
+  .mode strong { color: var(--pink); }
+  code { background: #1a1030; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }
+  footer { text-align: center; color: var(--dim); font-size: 0.85rem; padding: 20px; }
 </style>
 <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
 </head>
 <body>
 <header>
-  <div class="brand">
-    <img class="favicon-hero" src="assets/favicon.png" width="56" height="56" alt="SpaceMantis">
-    <div>
-      <h1>SPACEMANTIS</h1>
-      <p class="tag">A roguelike space-career game for M5Stack Core2</p>
-      <p class="by">by BasaltSoftWorks</p>
-    </div>
-  </div>
-  <img class="astro" src="assets/mantis-astronaut.png" alt="Mantis astronaut">
+  <h1>SYNAPSE</h1>
+  <p class="tag">A praying-mantis psychedelic fidget for M5Stack Core2</p>
 </header>
-
 <main>
-  <div class="hero-row">
-    <img class="astro-lg" src="assets/mantis-astronaut.png" alt="">
-    <div class="hero-copy">
-      <h2>Lost in space. No map. Dive deeper.</h2>
-      <p>You fly, encounter ships and giants, commit through gates, and resurface somewhere else. When the hull goes, your escape pod is recovered far away — ranks and fit survive; the sky does not.</p>
-    </div>
+
+<section>
+  <h2>What it is</h2>
+  <p>
+    <strong>SYNAPSE</strong> turns the Core2 into a pocket organism: light, color, and motion
+    driven by your hands, your voice, and the way you tilt the board. No menus to survive —
+    just modes that feed on attention.
+  </p>
+  <p>
+    Built for the people who spin rings, click pens, and chase patterns. This one stares back.
+  </p>
+</section>
+
+<section>
+  <h2>How to play</h2>
+  <ul>
+    <li><strong>Tilt</strong> — steer tunnels and wormholes, pull the swarm, bend the moir&eacute;, explore the fractal.</li>
+    <li><strong>Touch</strong> — poke the eye (it hurts), pet the mantis, splash the pool, pop bubbles, drag through fractals, paint the synesthesia field.</li>
+    <li><strong>Make noise</strong> — everything listens: spectrum, beats, and your voice drive color, shape, speed and the mantis's mouth.</li>
+    <li><strong>Shake</strong> — hue jumps, the eye goes dizzy, the mantis gets woozy, palettes scramble.</li>
+    <li><strong>A / C</strong> — previous / next mode · <strong>B</strong> — the mode's own variation.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Modes</h2>
+  <div class="modes">
+    <div class="mode"><strong>SWARM</strong><br>Living particle flock (flock / orbit / chaos). Touch to drop a tiny mantis in and scatter them.</div>
+    <div class="mode"><strong>EYE</strong><br>A wet, blinking eyeball over hypnotic moir&eacute;: sound rings vs. tilt rings interfering. Poke it and it squirts tears. Shake it dizzy.</div>
+    <div class="mode"><strong>TUNNEL</strong><br>B cycles: <em>dive</em> down a tube built from your sound; <em>recede</em> and sculpt the tube with tilt as it trails away; <em>fractal</em> morphing Julia worlds (tap for a new one); <em>portal</em> warp through wormholes into endless dimensions.</div>
+    <div class="mode"><strong>PULSE</strong><br>Feedback visualizers that get stranger with each B: bloom, kaleido, spectrum star, phase space, synesthesia.</div>
+    <div class="mode"><strong>CALM</strong><br>The physics room: glowing liquids, a splash pool, sand art between glass, a wave tank with a paper boat, and a blacklight aquarium. B changes room, long-press changes its mood.</div>
+    <div class="mode"><strong>MANTIS</strong><br>A charming little mantis that dances to whatever it hears. B: sing mode, close-up, lip-syncing into a mic.</div>
   </div>
+</section>
 
-  <section>
-    <h2>The premise</h2>
-    <p>There is no galaxy map and no plotted course. Gates are things you have heard about — or pure discovery. Deeper subspace gets stranger. Chart a place once and its name can outlive the universe you lost.</p>
-  </section>
+<section>
+  <h2>Calibrate the tilt</h2>
+  <p>Lay the Core2 flat and hold a finger still in the middle of the screen. After 2 seconds a ring closes in;
+  then it calibrates for a second ("hold flat - calibrating") and remembers it, even after a reboot.</p>
+</section>
 
-  <section>
-    <h2>The flight view</h2>
-    <ul>
-      <li><b>Touch drag</b> — look around (yaw / pitch).</li>
-      <li><b>Tilt</b> — aim; twist for roll.</li>
-      <li><b>Gates &amp; portals</b> — thread rings, dive under, climb back.</li>
-      <li><b>Verbs</b> — hail, attack, dock, mine, scoop, chart.</li>
-    </ul>
-  </section>
+<section>
+  <h2>Install on Core2</h2>
+  <p>Chrome or Edge · USB data cable · board powered on.</p>
+  <esp-web-install-button manifest="firmware/manifest.json">
+    <button slot="activate" class="btn">Install SYNAPSE</button>
+    <span slot="unsupported">Use Chrome or Edge for USB install.</span>
+  </esp-web-install-button>
+  <p style="margin-top:12px">
+    <a class="btn" href="firmware/firmware-merged.bin" download>Download .bin</a>
+  </p>
+</section>
 
-  <section>
-    <h2>The verbs</h2>
-    <div class="grid">
-      <div class="card"><b>HAIL</b><br>Parley, trade, bluff, rumors.</div>
-      <div class="card"><b>ATTACK</b><br>Short combat resolve.</div>
-      <div class="card"><b>DOCK</b><br>Station board, work, gear.</div>
-      <div class="card"><b>CHART</b><br>Deep landmarks that can persist.</div>
-    </div>
-  </section>
-
-  <section>
-    <h2>Install on Core2</h2>
-    <p>Chrome or Edge with a USB data cable.</p>
-    <esp-web-install-button manifest="firmware/manifest.json">
-      <button slot="activate" class="btn">Install SpaceMantis</button>
-      <span slot="unsupported">Use Chrome or Edge for USB install.</span>
-    </esp-web-install-button>
-    <a class="btn" href="firmware/firmware-merged.bin" download>Download firmware</a>
-  </section>
 </main>
-
-<footer>
-  <img src="assets/favicon-32.png" width="28" height="28" alt="">
-  SpaceMantis · by BasaltSoftWorks · M5Stack Core2
-</footer>
+<footer>SYNAPSE · M5Stack Core2</footer>
 </body>
 </html>
