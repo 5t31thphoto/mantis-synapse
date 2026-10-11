@@ -117,6 +117,23 @@ enum Move { M_IDLE, M_BOB, M_SWAY, M_WAVE_L, M_WAVE_R, M_CHEER, M_BANG, M_SPREAD
             M_TRILL, M_FREEZE,                                               // flourish, freeze
             M_E_HORNS, M_E_LASSO, M_E_OVERCLAP, M_E_STRIKE, M_E_GROOM, M_E_SWIVEL, M_E_THREAT, M_E_SHRUG, M_E_DROP,
             M_COUNT };
+#include "dance_net.h"
+// Synapse move -> MantisNow DANCE move id (MANTISNOW.md decision 6):
+// 0 bob 1 sway 2 arms-up 3 spin 4 jump 5 wave 6 robot 7 shuffle 8 head-bang 9 pose
+static uint8_t mnMoveOf(int m) {
+  switch (m) {
+    case M_IDLE: case M_BOB: case M_NOD: case M_TWOSTEP: case M_SING: case M_TALK: case M_LISTEN: return 0;
+    case M_SWAY: case M_SWAYUP: case M_LEAN: case M_BODYWAVE: case M_LIQUID: case M_SLOWMO: case M_SWAGGER: case M_SHLEAN: return 1;
+    case M_CHEER: case M_SPREAD: case M_HYPE: case M_PUMP: case M_ARMWAVE: case M_E_PEACE: case M_E_CLAP: case M_E_OVERCLAP: return 2;
+    case M_WINDMILL: case M_TRILL: case M_E_SWIVEL: case M_TOPROCK: return 3;
+    case M_JUMPUP: case M_STOMP: case M_HOEDOWN: case M_E_DROP: return 4;
+    case M_WAVE_L: case M_WAVE_R: case M_E_POINT: case M_E_LASSO: case M_E_SNAP: return 5;
+    case M_ROBOT: case M_POP: case M_TUT: case M_GLITCH: case M_FREEZE: return 6;
+    case M_SHUFFLE: case M_SHUFFLE2: case M_RUNMAN: case M_TSTEP: case M_MOON: case M_HEELTOE: case M_GRAPEVINE: case M_CABBAGE: return 7;
+    case M_BANG: case M_MOSH: case M_WOBBLE: case M_E_HORNS: case M_E_GUITAR: return 8;
+    default: return 9;
+  }
+}
 static int s_freezeVar = 0;
 static bool s_cave = false;                 // the echo cave scene
 #ifdef HOST
@@ -766,6 +783,7 @@ static void setMove(int m) {
 #endif
   if (m == s_move) return;
   s_prevMove = s_move; s_move = m; s_blend = 0.f;
+  danceNetMove(mnMoveOf(m), 200);
 }
 
 void mantisDrawCave() { s_cave = true; mantisDraw(true); s_cave = false; }
@@ -1021,6 +1039,7 @@ void mantisDraw(bool sing) {
     s_beatAcc = fmaxf(s_beatAcc, aud::onset);
     int bi = (int)floorf(b);
     if (bi != s_lastBeatI && !s_frozen) {
+      if (grooving) danceNetBeat((uint16_t)aud::bpm(), (uint8_t)(bi & 3));   // real music beats only, never the idle counter
       feelBeat(bi);
       s_strong = s_beatAcc > 0.45f ? s_strong + 1 : 0;
       s_beatAcc = 0; s_lastBeatI = bi;
