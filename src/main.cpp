@@ -41,6 +41,7 @@ static TunnelMode g_tunnelMode = TM_DIVE;
 static int g_pulsePat = 0;
 static bool g_eyeTrack = true;
 static bool g_mantisSing = false;
+static bool s_party = false;      // Dance Party broadcast: hold C in mantis mode
 static uint8_t g_mantisMode = 0;              // 0 dance, 1 sing, 2 echo (yakback)
 
 // ---------------- haptics: an expressive little mixer for the vibration motor ----------------
@@ -187,6 +188,8 @@ static void btnBShort();
 static void eyePoke(int x, int y);
 static uint32_t s_bDown = 0;
 static bool s_bLong = false;
+static uint32_t s_cDown = 0;
+static bool s_cLong = false;
 static uint8_t s_eyeStyle = 0;                 // 0 basic, 1 cat, 2 dragon (long-press B in EYE)
 static uint32_t s_touchDown = 0;
 static int s_touchX0 = 0, s_touchY0 = 0;
@@ -208,7 +211,11 @@ static void pollInput() {
   hapService();
   uint32_t now = millis();
   if (M5.BtnA.wasPressed()) nextMode(-1);
-  if (M5.BtnC.wasPressed()) nextMode(1);
+  if (M5.BtnC.wasPressed()) { s_cDown = now; s_cLong = false; }
+  if (M5.BtnC.isPressed() && s_cDown && !s_cLong && g_mode == MODE_MANTIS && now - s_cDown > 650) {
+    s_cLong = true; s_party = !s_party; hapGesture(HG_SETTLE);   // hold C in mantis mode: Dance Party on/off
+  }
+  if (M5.BtnC.wasReleased() && s_cDown) { if (!s_cLong) nextMode(1); s_cDown = 0; }
   if (M5.BtnB.wasPressed()) { s_bDown = now; s_bLong = false; }
   if (M5.BtnB.isPressed() && s_bDown && !s_bLong && g_mode == MODE_EYE && now - s_bDown > 650) {
     s_bLong = true; s_eyeStyle = (uint8_t)((s_eyeStyle + 1) % 3); hapGesture(HG_SETTLE);
@@ -1948,7 +1955,8 @@ void setup() {
 }
 
 void loop() {
-  danceNetService(g_mode == MODE_MANTIS);   // MantisNow DANCE sender (dance_net.cpp)
+  if (g_mode != MODE_MANTIS) s_party = false;   // party mode is per visit, default off
+  danceNetService(s_party);                     // MantisNow DANCE sender (dance_net.cpp)
   static uint32_t last = micros();
   uint32_t now = micros();
   g_dt = clampf((now - last) / 1e6f, 0.004f, 0.06f);
