@@ -4,6 +4,7 @@
 //  audio.cpp: always-on listening. calm.cpp: the physics room.
 //  fx.cpp: indexed-colour demo engine. mantis.cpp: the puppet.
 // ============================================================
+#include "dance_net.h"
 #include "app.h"
 #include "audio.h"
 #include "fx.h"
@@ -1947,6 +1948,7 @@ void setup() {
 }
 
 void loop() {
+  danceNetService(g_mode == MODE_MANTIS);   // MantisNow DANCE sender (dance_net.cpp)
   static uint32_t last = micros();
   uint32_t now = micros();
   g_dt = clampf((now - last) / 1e6f, 0.004f, 0.06f);
