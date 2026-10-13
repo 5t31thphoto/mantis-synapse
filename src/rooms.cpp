@@ -10,6 +10,7 @@
 //    hum     hum a steady note at the crystal        hush    be silent until the firefly lands
 // ============================================================
 #include "app.h"
+#include "dance_net.h"   // DN_BOOT_ARRAY
 #include "audio.h"
 #include "wire.h"
 #include <string.h>
@@ -53,7 +54,7 @@ bool clapSpike(float dt) {
 
 // ---- sparkles / confetti ----
 struct Spark { float x, y, vx, vy, life; uint16_t c; bool live; };
-Spark s_sp[120];
+DN_BOOT_ARRAY(Spark, s_sp, 120);   // see dance_net.h
 void spark(float x, float y, float vx, float vy, uint16_t c, float life) {
   for (auto &p : s_sp) if (!p.live) { p = {x, y, vx, vy, life, c, true}; return; }
 }
@@ -106,9 +107,9 @@ namespace nrg {
 float p = 0, level = 1, capY = 0, capVY = 0, capVX = 0, capX = 0, capRot = 0, fount = 0, lidBack = 0, wob = 0;
 int phase = 0;                                   // 0 capped, 1 fountain, 2 aftermath, 3 lid returning
 struct Drop { float x, y, vx, vy; bool live; };
-Drop dr[140];
+DN_BOOT_ARRAY(Drop, dr, 140);
 struct Bub { float x, y, vx, vy, r, life, ph; bool live; };
-Bub bb[120];
+DN_BOOT_ARRAY(Bub, bb, 120);
 struct Drip { float x, y, vy, life; float tx[10], ty[10]; int n; bool live; };
 Drip dp[26];
 struct In { float x, y, sp; };
@@ -641,7 +642,7 @@ void tap(int x, int y) { if ((x - 160) * (x - 160) + (y - 150) * (y - 150) < 56 
 // ============================================================
 namespace globe {
 struct F { float x, y, vx, vy; bool up; };
-F f[150];
+DN_BOOT_ARRAY(F, f, 150);
 float stillT = 0, reveal = 0; bool shaken = false;
 const float GX = 160, GY = 112, GR = 80;
 void enter() { stillT = 0; reveal = 0; shaken = false; for (auto &q : f) { q.x = GX + (fr() - 0.5f) * 120.f; q.y = GY + GR - 6 - fr() * 26.f; q.vx = q.vy = 0; q.up = false; } }
