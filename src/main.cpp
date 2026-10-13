@@ -974,7 +974,7 @@ static void modeEye() {
 //  TUNNEL — dive / recede (audio-sliced, bendable), fractal, portal
 // ============================================================
 struct Slice { uint8_t b[16]; int8_t ox, oy; uint8_t en; };
-static Slice s_sl[256];
+static DN_BOOT_ARRAY(Slice, s_sl, 256);   // see dance_net.h
 static float s_tz = 0, s_camX = 0, s_camY = 0, s_bendX = 0, s_bendY = 0, s_scrape = 0;
 static int s_zi = 0;
 static int16_t s_offX[256], s_offY[256];
@@ -1246,7 +1246,7 @@ static void fractalRender() {
 
 // ---- portal: fly the ether; thread 3 hoops to summon a portal; fly INTO the next dimension ----
 struct Star { float x, y, z, pz; };
-static Star s_st[200];
+static DN_BOOT_ARRAY(Star, s_st, 200);
 static float s_pcx = 0, s_pcy = 0, s_emerge = 0;
 static int s_dim = 0;
 static float s_dimP[12], s_nextP[12];
