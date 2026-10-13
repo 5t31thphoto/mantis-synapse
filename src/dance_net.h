@@ -10,9 +10,15 @@
 // the radio driver ESP-NOW needs - into heap that Bluetooth would otherwise
 // reserve (the Arduino core releases it to the heap when BT is never started).
 // Same internal RAM, same speed, allocated once, never freed.
+// The type is only ever written as a template argument (followed by ',' or
+// '>'), never followed by '(' - so a type named like a function-like macro
+// (rooms.cpp has `struct F`, and Arduino defines F(...)) can never expand.
+#include <stddef.h>
 #include <esp_heap_caps.h>
+template <class T, size_t N> struct dn_arr { typedef T (&ref)[N]; typedef T (*ptr)[N]; };
 #define DN_BOOT_ARRAY(T, name, N) \
-    T (&name)[N] = *reinterpret_cast<T(*)[N]>(heap_caps_calloc(1, sizeof(T[N]), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT))
+    dn_arr<T, (N)>::ref name = *reinterpret_cast<dn_arr<T, (N)>::ptr>( \
+        heap_caps_calloc((N), sizeof(dn_arr<T, (N)>::ref) / (N), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT))
 
 void danceNetService(bool partyOn);            // call every loop: radio up only while partying
 void danceNetBeat(uint16_t bpm, uint8_t beatInBar);
