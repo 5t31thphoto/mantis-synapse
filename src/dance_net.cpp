@@ -12,7 +12,6 @@
 // cannot preempt either; the main loop on core 1 is never touched. Sending a
 // beat is a non-blocking queue call (microseconds), and happens only once the
 // radio reports ready.
-#ifdef MANTIS_DANCE_NET
 #include <Arduino.h>
 #include <esp_wifi.h>
 #include <esp_now.h>
@@ -122,4 +121,3 @@ void danceNetMove(uint8_t moveId, uint8_t intensity) {
     uint8_t pl[4] = { moveId, intensity, 0, 0 };
     send(1, pl, 4);
 }
-#endif  // MANTIS_DANCE_NET
